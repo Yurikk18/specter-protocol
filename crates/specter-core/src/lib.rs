@@ -1,3 +1,4 @@
+pub mod deterrence;
 pub mod mint;
 pub mod networked;
 pub mod nullifier;
