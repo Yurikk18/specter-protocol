@@ -59,7 +59,8 @@ pub fn dealer_keygen(threshold: usize, total: usize) -> ThresholdKeyset {
     let group_secret = random_scalar();
     let group_public = group_secret * G;
 
-    let shamir_shares = shamir::split_secret(&group_secret, threshold, total);
+    let shamir_shares = shamir::split_secret(&group_secret, threshold, total)
+        .expect("invalid threshold/total parameters");
 
     let mut shares = HashMap::new();
     let mut public_shares = HashMap::new();

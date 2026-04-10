@@ -1,18 +1,44 @@
 use curve25519_dalek::{RistrettoPoint, Scalar};
 
 /// A signer's keypair for blind Schnorr signatures.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SignerKeypair {
-    /// Secret signing key.
-    pub secret: Scalar,
+    /// Secret signing key (private — never exposed).
+    secret: Scalar,
     /// Public verification key (secret * G).
     pub public: RistrettoPoint,
 }
 
+impl SignerKeypair {
+    /// Create a keypair from a secret and public key.
+    pub(crate) fn from_parts(secret: Scalar, public: RistrettoPoint) -> Self {
+        Self { secret, public }
+    }
+
+    /// Access the secret key (crate-internal only).
+    #[allow(dead_code)]
+    pub(crate) fn secret(&self) -> &Scalar {
+        &self.secret
+    }
+}
+
+impl std::fmt::Debug for SignerKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerKeypair")
+            .field("secret", &"[REDACTED]")
+            .field("public", &self.public)
+            .finish()
+    }
+}
+
+impl Drop for SignerKeypair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+    }
+}
+
 /// A blind Schnorr signature.
-///
-/// The signer produces this without knowing the message.
-/// The verifier can verify it against the signer's public key and the message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlindSignature {
     /// Response scalar.

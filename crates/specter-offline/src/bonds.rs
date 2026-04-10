@@ -45,10 +45,15 @@ impl BondRegistry {
     pub fn deposit(&mut self, owner_id: [u8; 32], amount: u64) -> Bond {
         let mut bond_id = [0u8; 32];
         use sha2::{Digest, Sha256};
+        // Include random nonce to prevent bond_id collisions on identical deposits
+        let mut nonce = [0u8; 16];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce);
         let hash = Sha256::new()
             .chain_update(b"specter-bond:")
             .chain_update(owner_id)
             .chain_update(amount.to_le_bytes())
+            .chain_update(nonce)
             .finalize();
         bond_id.copy_from_slice(&hash);
 

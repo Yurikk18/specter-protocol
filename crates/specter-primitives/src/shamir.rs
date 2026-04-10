@@ -17,16 +17,24 @@ pub struct Share {
     pub y: Scalar,
 }
 
+/// Errors for Shamir secret sharing.
+#[derive(Debug, thiserror::Error)]
+pub enum ShamirError {
+    #[error("threshold must be > 0")]
+    ZeroThreshold,
+    #[error("threshold ({threshold}) must be <= total shares ({total})")]
+    ThresholdExceedsTotal { threshold: usize, total: usize },
+    #[error("total shares must be > 0")]
+    ZeroShares,
+}
+
 /// Split a secret into `n` shares with threshold `t`.
 ///
 /// Any `t` shares can reconstruct the secret; fewer reveal nothing.
-///
-/// # Panics
-/// Panics if `t == 0`, `t > n`, or `n == 0`.
-pub fn split_secret(secret: &Scalar, t: usize, n: usize) -> Vec<Share> {
-    assert!(t > 0, "threshold must be > 0");
-    assert!(t <= n, "threshold must be <= total shares");
-    assert!(n > 0, "total shares must be > 0");
+pub fn split_secret(secret: &Scalar, t: usize, n: usize) -> Result<Vec<Share>, ShamirError> {
+    if t == 0 { return Err(ShamirError::ZeroThreshold); }
+    if n == 0 { return Err(ShamirError::ZeroShares); }
+    if t > n { return Err(ShamirError::ThresholdExceedsTotal { threshold: t, total: n }); }
 
     // Build a random polynomial of degree t-1 with constant term = secret
     // p(x) = secret + a1*x + a2*x^2 + ... + a_{t-1}*x^{t-1}
@@ -37,13 +45,14 @@ pub fn split_secret(secret: &Scalar, t: usize, n: usize) -> Vec<Share> {
     }
 
     // Evaluate the polynomial at x = 1, 2, ..., n
-    (1..=n)
+    let shares: Vec<Share> = (1..=n)
         .map(|i| {
             let x = Scalar::from(i as u64);
             let y = evaluate_polynomial(&coefficients, &x);
             Share { x, y }
         })
-        .collect()
+        .collect();
+    Ok(shares)
 }
 
 /// Reconstruct the secret from `t` or more shares using Lagrange interpolation.
@@ -117,7 +126,7 @@ mod tests {
     #[test]
     fn test_split_and_reconstruct_2_of_3() {
         let secret = scalar_from_u64(42);
-        let shares = split_secret(&secret, 2, 3);
+        let shares = split_secret(&secret, 2, 3).unwrap();
         assert_eq!(shares.len(), 3);
 
         // Any 2 shares should reconstruct
@@ -134,7 +143,7 @@ mod tests {
     #[test]
     fn test_split_and_reconstruct_3_of_5() {
         let secret = scalar_from_u64(12345);
-        let shares = split_secret(&secret, 3, 5);
+        let shares = split_secret(&secret, 3, 5).unwrap();
         assert_eq!(shares.len(), 5);
 
         let recovered = reconstruct_secret(&shares[0..3]).unwrap();
@@ -147,7 +156,7 @@ mod tests {
     #[test]
     fn test_all_shares_reconstruct() {
         let secret = random_scalar();
-        let shares = split_secret(&secret, 3, 5);
+        let shares = split_secret(&secret, 3, 5).unwrap();
 
         let recovered = reconstruct_secret(&shares).unwrap();
         assert_eq!(recovered, secret);
@@ -156,7 +165,7 @@ mod tests {
     #[test]
     fn test_1_of_1() {
         let secret = scalar_from_u64(99);
-        let shares = split_secret(&secret, 1, 1);
+        let shares = split_secret(&secret, 1, 1).unwrap();
         assert_eq!(shares.len(), 1);
 
         let recovered = reconstruct_secret(&shares).unwrap();
@@ -166,7 +175,7 @@ mod tests {
     #[test]
     fn test_insufficient_shares_wrong_result() {
         let secret = scalar_from_u64(42);
-        let shares = split_secret(&secret, 3, 5);
+        let shares = split_secret(&secret, 3, 5).unwrap();
 
         // Only 2 shares for a threshold-3 scheme: result should (almost certainly) be wrong
         let recovered = reconstruct_secret(&shares[0..2]).unwrap();
@@ -193,9 +202,27 @@ mod tests {
     fn test_random_secrets() {
         for _ in 0..20 {
             let secret = random_scalar();
-            let shares = split_secret(&secret, 3, 5);
+            let shares = split_secret(&secret, 3, 5).unwrap();
             let recovered = reconstruct_secret(&shares[0..3]).unwrap();
             assert_eq!(recovered, secret);
         }
+    }
+
+    #[test]
+    fn test_zero_threshold_rejected() {
+        let secret = scalar_from_u64(42);
+        assert!(split_secret(&secret, 0, 3).is_err());
+    }
+
+    #[test]
+    fn test_threshold_exceeds_total_rejected() {
+        let secret = scalar_from_u64(42);
+        assert!(split_secret(&secret, 5, 3).is_err());
+    }
+
+    #[test]
+    fn test_zero_shares_rejected() {
+        let secret = scalar_from_u64(42);
+        assert!(split_secret(&secret, 0, 0).is_err());
     }
 }

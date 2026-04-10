@@ -33,7 +33,7 @@ impl SignerKeypair {
     pub fn generate() -> Self {
         let secret = random_scalar();
         let public = secret * G;
-        Self { secret, public }
+        Self::from_parts(secret, public)
     }
 
     /// Start a new blind signing session.
@@ -171,7 +171,7 @@ mod tests {
         let (factors, blinded_challenge) = blind_challenge(&r, &signer.public, message);
 
         // Step 3: Signer responds
-        let s_prime = session.respond(&blinded_challenge, &signer.secret);
+        let s_prime = session.respond(&blinded_challenge, signer.secret());
 
         // Step 4: Requester unblinds
         let sig = unblind_signature(&s_prime, &factors, &r, &signer.public, message);
@@ -187,7 +187,7 @@ mod tests {
 
         let (session, r) = signer.new_session();
         let (factors, blinded_challenge) = blind_challenge(&r, &signer.public, message);
-        let s_prime = session.respond(&blinded_challenge, &signer.secret);
+        let s_prime = session.respond(&blinded_challenge, signer.secret());
         let sig = unblind_signature(&s_prime, &factors, &r, &signer.public, message);
 
         // Verification with wrong message must fail
@@ -202,7 +202,7 @@ mod tests {
 
         let (session, r) = signer.new_session();
         let (factors, blinded_challenge) = blind_challenge(&r, &signer.public, message);
-        let s_prime = session.respond(&blinded_challenge, &signer.secret);
+        let s_prime = session.respond(&blinded_challenge, signer.secret());
         let sig = unblind_signature(&s_prime, &factors, &r, &signer.public, message);
 
         // Verification against a different public key must fail
@@ -217,12 +217,12 @@ mod tests {
         // Two different signing sessions on the same message
         let (session1, r1) = signer.new_session();
         let (factors1, bc1) = blind_challenge(&r1, &signer.public, message);
-        let s1 = session1.respond(&bc1, &signer.secret);
+        let s1 = session1.respond(&bc1, signer.secret());
         let sig1 = unblind_signature(&s1, &factors1, &r1, &signer.public, message);
 
         let (session2, r2) = signer.new_session();
         let (factors2, bc2) = blind_challenge(&r2, &signer.public, message);
-        let s2 = session2.respond(&bc2, &signer.secret);
+        let s2 = session2.respond(&bc2, signer.secret());
         let sig2 = unblind_signature(&s2, &factors2, &r2, &signer.public, message);
 
         // Both signatures are valid
@@ -240,13 +240,13 @@ mod tests {
         let msg1 = b"message one";
         let (s1, r1) = signer.new_session();
         let (f1, bc1) = blind_challenge(&r1, &signer.public, msg1);
-        let sp1 = s1.respond(&bc1, &signer.secret);
+        let sp1 = s1.respond(&bc1, signer.secret());
         let sig1 = unblind_signature(&sp1, &f1, &r1, &signer.public, msg1);
 
         let msg2 = b"message two";
         let (s2, r2) = signer.new_session();
         let (f2, bc2) = blind_challenge(&r2, &signer.public, msg2);
-        let sp2 = s2.respond(&bc2, &signer.secret);
+        let sp2 = s2.respond(&bc2, signer.secret());
         let sig2 = unblind_signature(&sp2, &f2, &r2, &signer.public, msg2);
 
         assert!(verify(&signer.public, msg1, &sig1));
@@ -264,7 +264,7 @@ mod tests {
             let message = format!("token-{}", i);
             let (session, r) = signer.new_session();
             let (factors, bc) = blind_challenge(&r, &signer.public, message.as_bytes());
-            let sp = session.respond(&bc, &signer.secret);
+            let sp = session.respond(&bc, signer.secret());
             let sig = unblind_signature(&sp, &factors, &r, &signer.public, message.as_bytes());
             assert!(verify(&signer.public, message.as_bytes(), &sig), "failed at i={}", i);
         }
