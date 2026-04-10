@@ -17,6 +17,10 @@ pub struct TransferResult {
 /// Updates: owner secret, hash chain, transfer count, fold proof.
 /// Returns the nullifier to publish for double-spend detection.
 pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferError> {
+    if token.value == 0 {
+        return Err(TransferError::InvalidTokenValue);
+    }
+
     if token.needs_renewal() {
         return Err(TransferError::NeedsRenewal {
             transfer_count: token.transfer_count,
@@ -95,6 +99,9 @@ pub enum TransferError {
 
     #[error("double-spend detected for nullifier {nullifier:?}")]
     DoubleSpend { nullifier: [u8; 32] },
+
+    #[error("invalid token value: must be > 0")]
+    InvalidTokenValue,
 
     #[error("fold failed: {0}")]
     FoldFailed(String),

@@ -86,6 +86,8 @@ pub struct ConsensusState {
     pub pending_nullifiers: Vec<[u8; 32]>,
     /// Votes for the current proposal.
     votes: HashMap<[u8; 32], Vec<Vote>>,
+    /// Current view number (incremented on view change / leader timeout).
+    pub view: u64,
 }
 
 impl ConsensusState {
@@ -110,12 +112,13 @@ impl ConsensusState {
             committed_nullifiers: HashSet::new(),
             pending_nullifiers: Vec::new(),
             votes: HashMap::new(),
+            view: 0,
         }
     }
 
-    /// Get the current leader (round-robin).
+    /// Get the current leader (round-robin with view offset).
     pub fn current_leader(&self) -> NodeId {
-        let idx = (self.current_height as usize) % self.validators.len();
+        let idx = (self.current_height as usize + self.view as usize) % self.validators.len();
         self.validators[idx]
     }
 
@@ -202,6 +205,21 @@ impl ConsensusState {
     /// Total committed nullifiers.
     pub fn nullifier_count(&self) -> usize {
         self.committed_nullifiers.len()
+    }
+
+    /// Trigger a view change — rotate leader when current leader fails.
+    ///
+    /// This increments the view number, which changes the leader
+    /// selection without advancing the block height. Pending nullifiers
+    /// are preserved for the next leader to propose.
+    pub fn trigger_view_change(&mut self) {
+        self.view += 1;
+        self.votes.clear(); // discard votes from failed view
+    }
+
+    /// Get the current view number.
+    pub fn current_view(&self) -> u64 {
+        self.view
     }
 }
 

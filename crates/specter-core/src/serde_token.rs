@@ -350,6 +350,33 @@ fn read_scalar(data: &[u8], pos: &mut usize) -> Result<Scalar, SerdeError> {
         .ok_or(SerdeError::InvalidScalar { offset: *pos - 32 })
 }
 
+// ─── Encrypted serialization ───────────────────────────────────────────
+
+/// Serialize and encrypt a token with a passphrase.
+///
+/// The output is fully encrypted — owner_secret and all other sensitive
+/// data are protected. An HMAC verifies integrity before decryption.
+pub fn serialize_encrypted(
+    token: &ProofCarryingToken,
+    passphrase: &[u8],
+) -> crate::secure_store::EncryptedData {
+    let plaintext = serialize_token(token);
+    crate::secure_store::encrypt(&plaintext, passphrase)
+}
+
+/// Decrypt and deserialize a token with a passphrase.
+///
+/// Verifies integrity (wrong passphrase or tampered data = error)
+/// before deserializing.
+pub fn deserialize_encrypted(
+    encrypted: &crate::secure_store::EncryptedData,
+    passphrase: &[u8],
+) -> Result<ProofCarryingToken, SerdeError> {
+    let plaintext = crate::secure_store::decrypt(encrypted, passphrase)
+        .map_err(|e| SerdeError::Io(e.to_string()))?;
+    deserialize_token(&plaintext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,7 +427,7 @@ mod tests {
 
         assert!(recovered.credential.is_some());
         assert!(recovered.presentation.is_some());
-        let cred = recovered.credential.unwrap();
+        let cred = recovered.credential.as_ref().unwrap();
         assert!(cred.attributes.kyc_passed);
         assert!(cred.attributes.not_sanctioned);
         assert_eq!(cred.attributes.jurisdiction, "EU");
@@ -419,7 +446,7 @@ mod tests {
 
         assert!(recovered.vdf_proof.is_some());
         assert_eq!(recovered.bond_owner_id, Some([99u8; 32]));
-        let vdf = recovered.vdf_proof.unwrap();
+        let vdf = recovered.vdf_proof.as_ref().unwrap();
         assert_eq!(vdf.iterations, 50);
     }
 
@@ -541,5 +568,80 @@ mod tests {
         println!("After 10 transfers: {} bytes", transferred_size);
         // Size should be approximately the same (constant-size proof)
         assert!((transferred_size as i64 - full_size as i64).unsigned_abs() < 50);
+    }
+
+    // ─── Encrypted serialization tests ──────────────────────────────
+
+    #[test]
+    fn test_encrypted_roundtrip() {
+        let mint = test_mint();
+        let token = mint.issue(1000, &[1, 2], Some(&test_attrs())).unwrap();
+        let passphrase = b"strong-passphrase-123";
+
+        let encrypted = serialize_encrypted(&token, passphrase);
+        let recovered = deserialize_encrypted(&encrypted, passphrase).unwrap();
+
+        assert_eq!(recovered.token_id, token.token_id);
+        assert_eq!(recovered.value, token.value);
+        assert_eq!(recovered.transfer_count, token.transfer_count);
+    }
+
+    #[test]
+    fn test_encrypted_wrong_passphrase_fails() {
+        let mint = test_mint();
+        let token = mint.issue(1000, &[1, 2], None).unwrap();
+
+        let encrypted = serialize_encrypted(&token, b"correct");
+        let result = deserialize_encrypted(&encrypted, b"wrong");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypted_tampered_ciphertext_fails() {
+        let mint = test_mint();
+        let token = mint.issue(1000, &[1, 2], None).unwrap();
+
+        let mut encrypted = serialize_encrypted(&token, b"pass");
+        if !encrypted.ciphertext.is_empty() {
+            encrypted.ciphertext[0] ^= 0xFF;
+        }
+        let result = deserialize_encrypted(&encrypted, b"pass");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypted_token_verifies_after_decrypt() {
+        let mint = test_mint();
+        let token = mint.issue(500, &[1, 3], Some(&test_attrs())).unwrap();
+
+        let encrypted = serialize_encrypted(&token, b"passphrase");
+        let recovered = deserialize_encrypted(&encrypted, b"passphrase").unwrap();
+
+        let result = crate::verify::verify_token(
+            &recovered,
+            &mint.group_public_key(),
+            &mint.pedersen,
+            &mint.credential_issuer.pedersen,
+        );
+        assert!(result.all_valid());
+    }
+
+    #[test]
+    fn test_encrypted_owner_secret_not_visible() {
+        let mint = test_mint();
+        let token = mint.issue(1000, &[1, 2], None).unwrap();
+        let owner_secret = token.owner_secret;
+
+        let encrypted = serialize_encrypted(&token, b"pass");
+
+        // The owner_secret should NOT appear in the ciphertext
+        let secret_in_ciphertext = encrypted
+            .ciphertext
+            .windows(32)
+            .any(|window| window == owner_secret);
+        assert!(
+            !secret_in_ciphertext,
+            "owner_secret found in ciphertext — encryption failed"
+        );
     }
 }

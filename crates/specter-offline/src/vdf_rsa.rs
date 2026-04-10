@@ -36,30 +36,27 @@ pub struct RsaVdfProof {
 }
 
 impl RsaVdfParams {
-    /// Create VDF params with a fixed RSA-2048 modulus.
+    /// Create VDF params with the RSA-2048 challenge modulus.
     ///
-    /// In production, this would use a modulus from a trusted setup ceremony
-    /// (e.g., RSA-2048 challenge number) or a class group of unknown order.
-    /// For this prototype, we use a product of two safe primes.
+    /// This is the RSA-2048 number from the RSA Factoring Challenge
+    /// (published 1991). Its factorization is unknown, making it safe
+    /// for use as a VDF group modulus.
     pub fn default_2048() -> Self {
-        // Using a well-known RSA modulus for testing.
-        // This is NOT suitable for production — the factors must be unknown.
-        // In production, use the RSA-2048 challenge modulus or generate via MPC.
-        let p = BigUint::parse_bytes(
-            b"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74\
-              020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437\
-              4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
-              EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF05",
-            16,
-        ).unwrap();
-        let q = BigUint::parse_bytes(
-            b"98AF7E6B2A3E6FA4590C8B267753DC7848F0C3455ED0E35CEBB34E4D0DB50B85\
-              D6A719D0E23D02D0E08DC98FE7700D077CC7B218D8655F5E4E6577DDAD7D8F6E\
-              EEB84EC2B25E2889B4C98FF0CF64BBE2D7DC529C5F21F3BBFB2D7B5F0E3E1B7C\
-              A85F3B8DB13BE6B4E4F5C8E24C59B1B1E8CFC14441A48DC87E31EFAE43CB517F",
-            16,
-        ).unwrap();
-        let modulus = &p * &q;
+        // RSA-2048 challenge number — factorization UNKNOWN.
+        // Source: RSA Laboratories, published in the RSA Factoring Challenge.
+        // 617 decimal digits, 2048 bits.
+        let modulus = BigUint::parse_bytes(
+            b"25195908475657893494027183240048398571429282126204032027777137836\
+              04366202070759555626401852588078440691829064124951508218929855914\
+              91761845028084891200728449926873928072877677359714183472702618963\
+              75014971824691165077613379859095700097330459748808428401797429100\
+              64245869181719511874612151517265463228221686998754918242243363725\
+              90851418654620435767984233871847744792073993423658482382428119816\
+              38150106748104516603773060562016196762561338441436038339044149526\
+              34432190114657544454178424020924616515723350778707749817125772467\
+              96292638635637328991215483143816789988504044536402352738195137863\
+              65643912120103971228221207203578", 10,
+        ).expect("RSA-2048 challenge number");
 
         Self {
             modulus,

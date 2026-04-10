@@ -9,6 +9,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::protocol::{Message, NodeId};
 
+/// Maximum outbound messages queued per peer before rejecting.
+const MAX_OUTBOX_PER_PEER: usize = 10_000;
+
+/// Maximum known nullifiers before oldest are evicted.
+const MAX_KNOWN_NULLIFIERS: usize = 1_000_000;
+
 /// A gossip layer that propagates nullifiers across the network.
 pub struct GossipProtocol {
     /// This node's ID.
@@ -38,17 +44,23 @@ impl GossipProtocol {
     /// Returns true if the nullifier was new (first time seen).
     /// Returns false if it was already known (duplicate).
     pub fn broadcast_nullifier(&mut self, nullifier: [u8; 32]) -> bool {
+        if self.seen_nullifiers.len() >= MAX_KNOWN_NULLIFIERS {
+            return false; // memory protection
+        }
         if !self.seen_nullifiers.insert(nullifier) {
             return false; // already seen
         }
 
-        // Queue broadcast to all peers
+        // Queue broadcast to all peers (with rate limiting)
         let msg = Message::NullifierBroadcast {
             nullifier,
             sender: self.node_id,
         };
         for peer_id in &self.peers {
             if let Some(queue) = self.outbox.get_mut(peer_id) {
+                if queue.len() >= MAX_OUTBOX_PER_PEER {
+                    continue; // drop message for this peer (rate limited)
+                }
                 queue.push_back(msg.clone());
             }
         }
@@ -59,11 +71,14 @@ impl GossipProtocol {
     ///
     /// If new, re-broadcasts to other peers (excluding the sender).
     pub fn handle_nullifier_broadcast(&mut self, nullifier: [u8; 32], from: NodeId) -> bool {
+        if self.seen_nullifiers.len() >= MAX_KNOWN_NULLIFIERS {
+            return false;
+        }
         if !self.seen_nullifiers.insert(nullifier) {
             return false; // already known
         }
 
-        // Re-broadcast to peers except the sender
+        // Re-broadcast to peers except the sender (with rate limiting)
         let msg = Message::NullifierBroadcast {
             nullifier,
             sender: self.node_id,
@@ -71,6 +86,9 @@ impl GossipProtocol {
         for peer_id in &self.peers {
             if *peer_id != from {
                 if let Some(queue) = self.outbox.get_mut(peer_id) {
+                    if queue.len() >= MAX_OUTBOX_PER_PEER {
+                        continue;
+                    }
                     queue.push_back(msg.clone());
                 }
             }

@@ -82,6 +82,109 @@ impl Wallet {
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
     }
+
+    /// Save the wallet to encrypted bytes.
+    ///
+    /// All tokens are serialized and then encrypted with the passphrase
+    /// using Argon2id + ChaCha20-Poly1305. The output is safe to write to disk.
+    pub fn save(&self, passphrase: &[u8]) -> Vec<u8> {
+        // Serialize all tokens
+        let mut payload = Vec::new();
+        let count = self.tokens.len() as u32;
+        payload.extend_from_slice(&count.to_le_bytes());
+
+        for token in &self.tokens {
+            let token_bytes = crate::serde_token::serialize_token(token);
+            let len = token_bytes.len() as u32;
+            payload.extend_from_slice(&len.to_le_bytes());
+            payload.extend_from_slice(&token_bytes);
+        }
+
+        // Encrypt the entire payload
+        let encrypted = crate::secure_store::encrypt(&payload, passphrase);
+
+        // Pack EncryptedData into a single byte vector
+        let mut output = Vec::new();
+        output.extend_from_slice(b"SWLT"); // Specter WaLleT magic
+        output.extend_from_slice(&encrypted.salt);
+        output.extend_from_slice(&encrypted.nonce);
+        let ct_len = encrypted.ciphertext.len() as u32;
+        output.extend_from_slice(&ct_len.to_le_bytes());
+        output.extend_from_slice(&encrypted.ciphertext);
+        output
+    }
+
+    /// Load a wallet from encrypted bytes.
+    ///
+    /// Decrypts with the passphrase and deserializes all tokens.
+    /// Returns an error if the passphrase is wrong or data is corrupted.
+    pub fn load(data: &[u8], passphrase: &[u8]) -> Result<Self, WalletError> {
+        if data.len() < 36 || &data[0..4] != b"SWLT" {
+            return Err(WalletError::InvalidFormat);
+        }
+
+        let mut pos = 4;
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&data[pos..pos + 16]);
+        pos += 16;
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&data[pos..pos + 12]);
+        pos += 12;
+        let ct_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        if pos + ct_len > data.len() {
+            return Err(WalletError::InvalidFormat);
+        }
+        let ciphertext = data[pos..pos + ct_len].to_vec();
+
+        let encrypted = crate::secure_store::EncryptedData {
+            salt,
+            nonce,
+            ciphertext,
+        };
+
+        let payload = crate::secure_store::decrypt(&encrypted, passphrase)
+            .map_err(|_| WalletError::WrongPassphrase)?;
+
+        // Parse tokens from payload
+        if payload.len() < 4 {
+            return Err(WalletError::InvalidFormat);
+        }
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut offset = 4;
+        let mut tokens = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if offset + 4 > payload.len() {
+                return Err(WalletError::InvalidFormat);
+            }
+            let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > payload.len() {
+                return Err(WalletError::InvalidFormat);
+            }
+            let token = crate::serde_token::deserialize_token(&payload[offset..offset + len])
+                .map_err(|e| WalletError::TokenError(e.to_string()))?;
+            tokens.push(token);
+            offset += len;
+        }
+
+        Ok(Self { tokens })
+    }
+}
+
+/// Errors for wallet operations.
+#[derive(Debug, thiserror::Error)]
+pub enum WalletError {
+    #[error("invalid wallet file format")]
+    InvalidFormat,
+
+    #[error("wrong passphrase or corrupted data")]
+    WrongPassphrase,
+
+    #[error("token deserialization failed: {0}")]
+    TokenError(String),
 }
 
 impl Default for Wallet {
@@ -238,5 +341,72 @@ mod tests {
         wallet.add_token(mint.issue(200, &[1, 2], None).unwrap());
 
         assert!(wallet.total_storage_bytes() > 0);
+    }
+
+    // ─── Save/Load tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let mint = setup_mint();
+        let mut wallet = Wallet::new();
+        wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
+        wallet.add_token(mint.issue(500, &[1, 2], None).unwrap());
+
+        let data = wallet.save(b"my-passphrase");
+        let loaded = Wallet::load(&data, b"my-passphrase").unwrap();
+
+        assert_eq!(loaded.balance(), 600);
+        assert_eq!(loaded.token_count(), 2);
+    }
+
+    #[test]
+    fn test_save_load_wrong_passphrase() {
+        let mint = setup_mint();
+        let mut wallet = Wallet::new();
+        wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
+
+        let data = wallet.save(b"correct");
+        let result = Wallet::load(&data, b"wrong");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_load_empty_wallet() {
+        let wallet = Wallet::new();
+        let data = wallet.save(b"pass");
+        let loaded = Wallet::load(&data, b"pass").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_save_load_preserves_token_values() {
+        let mint = setup_mint();
+        let mut wallet = Wallet::new();
+
+        let token = mint.issue(999, &[1, 2], None).unwrap();
+        let original_id = token.token_id;
+        wallet.add_token(token);
+
+        let data = wallet.save(b"pass");
+        let loaded = Wallet::load(&data, b"pass").unwrap();
+
+        let info = loaded.list_tokens();
+        assert_eq!(info[0].value, 999);
+        assert_eq!(info[0].token_id, original_id);
+    }
+
+    #[test]
+    fn test_save_load_tampered_data_fails() {
+        let mint = setup_mint();
+        let mut wallet = Wallet::new();
+        wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
+
+        let mut data = wallet.save(b"pass");
+        // Tamper with encrypted data
+        if data.len() > 40 {
+            data[40] ^= 0xFF;
+        }
+        let result = Wallet::load(&data, b"pass");
+        assert!(result.is_err());
     }
 }

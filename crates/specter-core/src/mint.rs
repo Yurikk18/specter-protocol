@@ -64,6 +64,10 @@ impl Mint {
         vdf_iterations: Option<u64>,
         bond_owner_id: Option<[u8; 32]>,
     ) -> Result<ProofCarryingToken, MintError> {
+        if value == 0 {
+            return Err(MintError::InvalidValue);
+        }
+
         // Generate random token ID and owner secret
         let mut token_id = [0u8; 32];
         let mut owner_secret = [0u8; 32];
@@ -149,6 +153,9 @@ pub fn build_signed_message(token_id: &[u8; 32], value_commitment: &RistrettoPoi
 pub enum MintError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
+
+    #[error("invalid value: token value must be > 0")]
+    InvalidValue,
 }
 
 #[cfg(test)]

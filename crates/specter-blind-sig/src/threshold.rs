@@ -126,10 +126,14 @@ pub fn threshold_blind_sign(
         });
     }
 
-    // Verify all signer IDs are valid
+    // Verify all signer IDs are valid and unique
+    let mut seen = std::collections::HashSet::new();
     for &id in signer_ids {
         if !keyset.shares.contains_key(&id) {
             return Err(ThresholdError::UnknownSigner(id));
+        }
+        if !seen.insert(id) {
+            return Err(ThresholdError::DuplicateSigner(id));
         }
     }
 
@@ -245,6 +249,9 @@ pub enum ThresholdError {
 
     #[error("unknown signer ID: {0}")]
     UnknownSigner(SignerId),
+
+    #[error("duplicate signer ID: {0}")]
+    DuplicateSigner(SignerId),
 }
 
 #[cfg(test)]

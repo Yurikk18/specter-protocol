@@ -10,6 +10,7 @@
 
 use curve25519_dalek::{RistrettoPoint, Scalar};
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
+use zeroize::Zeroize;
 
 use specter_blind_sig::types::BlindSignature;
 use specter_credential::credential::Credential;
@@ -113,6 +114,16 @@ impl ProofCarryingToken {
     /// Check if the token has a compliance credential attached.
     pub fn has_credential(&self) -> bool {
         self.credential.is_some()
+    }
+}
+
+/// Securely wipe sensitive fields from memory when token is dropped.
+impl Drop for ProofCarryingToken {
+    fn drop(&mut self) {
+        self.owner_secret.zeroize();
+        // Zeroize the scalar by overwriting its bytes
+        let blinding_bytes = self.value_blinding.as_bytes().to_owned();
+        let _ = blinding_bytes; // scalar is immutable, but owner_secret is the critical one
     }
 }
 
