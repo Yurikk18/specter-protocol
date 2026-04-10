@@ -8,6 +8,7 @@ description = "CLI for the Specter protocol"
 specter-core = { path = "../specter-core" }
 specter-primitives = { path = "../specter-primitives" }
 specter-blind-sig = { path = "../specter-blind-sig" }
+specter-credential = { path = "../specter-credential" }
 curve25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"

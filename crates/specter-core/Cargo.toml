@@ -7,6 +7,8 @@ description = "Proof-Carrying Token lifecycle for the Specter protocol"
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
 specter-blind-sig = { path = "../specter-blind-sig" }
+specter-fold = { path = "../specter-fold" }
+specter-credential = { path = "../specter-credential" }
 curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }

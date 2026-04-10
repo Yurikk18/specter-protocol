@@ -1,15 +1,12 @@
 [package]
-name = "specter-credential"
+name = "specter-offline"
 version = "0.1.0"
 edition = "2021"
-description = "Anonymous credentials for Specter compliance layer"
+description = "Offline payment mechanisms: VDF time-locks and reputation bonds"
 
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
-curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
 rand = { workspace = true }
-rand_core = { workspace = true }
-borsh = { workspace = true }
 thiserror = { workspace = true }

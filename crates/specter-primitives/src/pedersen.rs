@@ -7,6 +7,7 @@ use sha2::{Digest, Sha512};
 /// Uses two independent generators G and H, derived via "nothing up my sleeve"
 /// hashing of distinct byte strings, ensuring no party knows the discrete log
 /// relationship between them.
+#[derive(Clone, Debug)]
 pub struct PedersenParams {
     pub g: RistrettoPoint,
     pub h: RistrettoPoint,

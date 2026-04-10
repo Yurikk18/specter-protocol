@@ -1,1 +1,3 @@
-// Phase 1: Anonymous credentials (BBS+ selective disclosure)
+pub mod credential;
+pub mod presentation;
+pub mod issuer;

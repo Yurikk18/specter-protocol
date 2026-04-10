@@ -6,6 +6,8 @@ members = [
     "crates/specter-fold",
     "crates/specter-credential",
     "crates/specter-core",
+    "crates/specter-offline",
+    "crates/specter-net",
     "crates/specter-cli",
 ]
 

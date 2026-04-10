@@ -1,14 +1,13 @@
 [package]
-name = "specter-fold"
+name = "specter-net"
 version = "0.1.0"
 edition = "2021"
-description = "Recursive proof accumulation for Specter PCT tokens"
+description = "P2P network protocol and BFT consensus for Specter"
 
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
-curve25519-dalek = { workspace = true }
+specter-core = { path = "../specter-core" }
 sha2 = { workspace = true }
-sha3 = { workspace = true }
 rand = { workspace = true }
-rand_core = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }

@@ -1,1 +1,2 @@
-// Phase 1: Recursive proof folding via Nova IVC
+pub mod accumulator;
+pub mod transcript;

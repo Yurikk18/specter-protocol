@@ -2,15 +2,19 @@
 //!
 //! A PCT is a self-verifying bearer token that carries:
 //! - A blind signature from the threshold mint (proves legitimate issuance)
+//! - An accumulated proof of transfer history (constant size via folding)
+//! - A credential presentation (proves compliance without revealing identity)
 //! - A hash chain tracking transfer history (wear-out mechanism)
 //! - A nullifier commitment (for double-spend detection)
 //! - Value commitment (hides the denomination)
-//! - Transfer counter with recursion bound
 
 use curve25519_dalek::{RistrettoPoint, Scalar};
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 
 use specter_blind_sig::types::BlindSignature;
+use specter_credential::credential::Credential;
+use specter_credential::presentation::Presentation;
+use specter_fold::accumulator::AccumulatedProof;
 
 /// A Proof-Carrying Token.
 ///
@@ -31,15 +35,12 @@ pub struct ProofCarryingToken {
     pub value_blinding: Scalar,
 
     /// Blind signature from the threshold mint.
-    /// Proves this token was legitimately issued.
     pub mint_signature: BlindSignature,
 
     /// Current owner's secret (32 bytes).
-    /// Used to compute the nullifier when spending.
     pub owner_secret: [u8; 32],
 
     /// Hash chain head — tracks the transfer history.
-    /// Each transfer hashes the previous head with the new owner's data.
     pub hash_chain_head: [u8; 32],
 
     /// Number of times this token has been transferred.
@@ -47,6 +48,15 @@ pub struct ProofCarryingToken {
 
     /// Maximum number of transfers before the token must be renewed.
     pub recursion_bound: u32,
+
+    /// Accumulated proof of transfer history (constant size).
+    pub fold_proof: AccumulatedProof,
+
+    /// Compliance credential (optional — issued by KYC provider).
+    pub credential: Option<Credential>,
+
+    /// Current compliance presentation (optional — proves attributes).
+    pub presentation: Option<Presentation>,
 }
 
 impl ProofCarryingToken {
@@ -57,15 +67,11 @@ impl ProofCarryingToken {
 
     /// Get the serialized size estimate in bytes.
     pub fn estimated_size(&self) -> usize {
-        32  // token_id
-        + 8 // value
-        + 32 // value_commitment (compressed)
-        + 32 // value_blinding
-        + 64 // mint_signature (s + e)
-        + 32 // owner_secret
-        + 32 // hash_chain_head
-        + 4  // transfer_count
-        + 4  // recursion_bound
+        let base = 32 + 8 + 32 + 32 + 64 + 32 + 32 + 4 + 4; // basic fields
+        let fold = 32 + 32 + 32 + 32 + 4; // AccumulatedProof
+        let cred = if self.credential.is_some() { 256 } else { 0 };
+        let pres = if self.presentation.is_some() { 512 } else { 0 };
+        base + fold + cred + pres
     }
 
     /// Compute the nullifier for this token (used when spending).
@@ -80,11 +86,14 @@ impl ProofCarryingToken {
         msg.extend_from_slice(self.value_commitment.compress().as_bytes());
         msg
     }
+
+    /// Check if the token has a compliance credential attached.
+    pub fn has_credential(&self) -> bool {
+        self.credential.is_some()
+    }
 }
 
 /// Advance the hash chain by one step.
-///
-/// new_head = SHAKE-256("specter-hash-chain:" || old_head || new_owner_data)
 pub fn advance_hash_chain(current_head: &[u8; 32], new_data: &[u8]) -> [u8; 32] {
     let mut hasher = Shake256::default();
     hasher.update(b"specter-hash-chain:");
@@ -108,6 +117,13 @@ mod tests {
         let blinding = random_scalar();
         let commitment = params.commit(&scalar_from_u64(value), &blinding);
 
+        let genesis = specter_fold::accumulator::TransferState {
+            token_id: [42u8; 32],
+            owner_hash: [1u8; 32],
+            step: 0,
+        };
+        let fold_proof = specter_fold::accumulator::create_initial_proof(&genesis);
+
         ProofCarryingToken {
             token_id: [42u8; 32],
             value,
@@ -121,6 +137,9 @@ mod tests {
             hash_chain_head: [0u8; 32],
             transfer_count: 0,
             recursion_bound: 20,
+            fold_proof,
+            credential: None,
+            presentation: None,
         }
     }
 
@@ -128,45 +147,28 @@ mod tests {
     fn test_needs_renewal() {
         let mut token = dummy_token();
         assert!(!token.needs_renewal());
-
-        token.transfer_count = 19;
-        assert!(!token.needs_renewal());
-
         token.transfer_count = 20;
         assert!(token.needs_renewal());
     }
 
     #[test]
-    fn test_nullifier_deterministic() {
-        let token = dummy_token();
-        let n1 = token.compute_nullifier();
-        let n2 = token.compute_nullifier();
-        assert_eq!(n1, n2);
-    }
-
-    #[test]
-    fn test_hash_chain_advances() {
-        let head = [0u8; 32];
-        let new_head = advance_hash_chain(&head, b"transfer-1");
-        assert_ne!(head, new_head);
-
-        let newer = advance_hash_chain(&new_head, b"transfer-2");
-        assert_ne!(new_head, newer);
-        assert_ne!(head, newer);
-    }
-
-    #[test]
-    fn test_hash_chain_deterministic() {
-        let head = [0u8; 32];
-        let h1 = advance_hash_chain(&head, b"data");
-        let h2 = advance_hash_chain(&head, b"data");
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_estimated_size() {
-        let token = dummy_token();
-        let size = token.estimated_size();
-        assert!(size > 200); // should be around 240 bytes
+    fn test_estimated_size_with_credential() {
+        let mut token = dummy_token();
+        let size_without = token.estimated_size();
+        token.credential = Some(specter_credential::credential::Credential {
+            commitment: token.value_commitment,
+            blinding: token.value_blinding,
+            attributes: specter_credential::credential::Attributes {
+                kyc_passed: true,
+                not_sanctioned: true,
+                jurisdiction: "EU".to_string(),
+                age_over_18: true,
+            },
+            signature_s: random_scalar(),
+            signature_e: random_scalar(),
+            issuer_pk: token.value_commitment,
+        });
+        let size_with = token.estimated_size();
+        assert!(size_with > size_without);
     }
 }

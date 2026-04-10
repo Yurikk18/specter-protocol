@@ -1,11 +1,8 @@
 //! Specter CLI — demo tool for the Proof-Carrying Token protocol.
-//!
-//! Usage:
-//!   specter-cli demo          Run a full demonstration of the protocol
-//!   specter-cli benchmark     Run basic timing measurements
 
 use std::time::Instant;
 
+use specter_credential::credential::Attributes;
 use specter_core::mint::{Mint, MintConfig};
 use specter_core::nullifier::NullifierSet;
 use specter_core::transfer;
@@ -37,12 +34,21 @@ fn print_help() {
     println!("  help        Show this help message");
 }
 
+fn default_attrs() -> Attributes {
+    Attributes {
+        kyc_passed: true,
+        not_sanctioned: true,
+        jurisdiction: "EU".to_string(),
+        age_over_18: true,
+    }
+}
+
 fn run_demo() {
     println!("=== Specter Protocol Demo ===");
     println!();
 
     // Setup
-    println!("[1/5] Setting up threshold mint (2-of-3)...");
+    println!("[1/6] Setting up threshold mint (2-of-3)...");
     let mint = Mint::setup(MintConfig {
         threshold: 2,
         total_signers: 3,
@@ -51,26 +57,30 @@ fn run_demo() {
     println!("  Group public key: {}", hex::encode(mint.group_public_key().compress().as_bytes()));
     println!();
 
-    // Mint a token
-    println!("[2/5] Minting token (value: 1000, signers: [1, 3])...");
-    let token = mint.issue(1000, &[1, 3]).unwrap();
-    println!("  Token ID:         {}", hex::encode(&token.token_id));
-    println!("  Value:            {}", token.value);
-    println!("  Transfer count:   {}/{}", token.transfer_count, token.recursion_bound);
-    println!("  Estimated size:   {} bytes", token.estimated_size());
+    // Mint with credential
+    println!("[2/6] Minting token with compliance credential...");
+    let token = mint.issue(1000, &[1, 3], Some(&default_attrs())).unwrap();
+    println!("  Token ID:          {}", hex::encode(&token.token_id));
+    println!("  Value:             {}", token.value);
+    println!("  Has credential:    {}", token.has_credential());
+    println!("  Fold proof steps:  {}", token.fold_proof.steps);
+    println!("  Transfer count:    {}/{}", token.transfer_count, token.recursion_bound);
+    println!("  Estimated size:    {} bytes", token.estimated_size());
     println!();
 
     // Verify
-    println!("[3/5] Verifying freshly minted token...");
-    let result = verify::verify_token(&token, &mint.group_public_key(), &mint.pedersen);
-    println!("  Signature valid:  {}", result.signature_valid);
-    println!("  Value valid:      {}", result.value_valid);
-    println!("  Within bound:     {}", result.within_bound);
-    println!("  ALL VALID:        {}", result.all_valid());
+    println!("[3/6] Verifying freshly minted token...");
+    let result = verify::verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+    println!("  Signature valid:   {}", result.signature_valid);
+    println!("  Value valid:       {}", result.value_valid);
+    println!("  Within bound:      {}", result.within_bound);
+    println!("  Fold valid:        {}", result.fold_valid);
+    println!("  Credential valid:  {:?}", result.credential_valid);
+    println!("  ALL VALID:         {}", result.all_valid());
     println!();
 
     // Transfer chain
-    println!("[4/5] Transferring token 5 times...");
+    println!("[4/6] Transferring token 5 times (with fold accumulation)...");
     let mut current = token;
     let mut nullifier_set = NullifierSet::new();
 
@@ -78,12 +88,13 @@ fn run_demo() {
         let tr = transfer::transfer(&current).unwrap();
         transfer::check_double_spend(&mut nullifier_set, &tr.spent_nullifier).unwrap();
 
-        let vr = verify::verify_token(&tr.token, &mint.group_public_key(), &mint.pedersen);
+        let vr = verify::verify_token(&tr.token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
         println!(
-            "  Transfer {}: count={}/{}, valid={}, nullifier={}...",
+            "  Transfer {}: count={}/{}, fold_steps={}, valid={}, nullifier={}...",
             i,
             tr.token.transfer_count,
             tr.token.recursion_bound,
+            tr.token.fold_proof.steps,
             vr.all_valid(),
             hex::encode(&tr.spent_nullifier[..8]),
         );
@@ -92,11 +103,10 @@ fn run_demo() {
     println!();
 
     // Double-spend detection
-    println!("[5/5] Demonstrating double-spend detection...");
-    let original_token = mint.issue(500, &[2, 3]).unwrap();
-
-    let spend1 = transfer::transfer(&original_token).unwrap();
-    let spend2 = transfer::transfer(&original_token).unwrap();
+    println!("[5/6] Demonstrating double-spend detection...");
+    let original = mint.issue(500, &[2, 3], None).unwrap();
+    let spend1 = transfer::transfer(&original).unwrap();
+    let spend2 = transfer::transfer(&original).unwrap();
 
     println!("  Spend 1 nullifier: {}", hex::encode(&spend1.spent_nullifier[..16]));
     println!("  Spend 2 nullifier: {}", hex::encode(&spend2.spent_nullifier[..16]));
@@ -105,8 +115,19 @@ fn run_demo() {
     let mut ds_set = NullifierSet::new();
     let first_ok = transfer::check_double_spend(&mut ds_set, &spend1.spent_nullifier).is_ok();
     let second_ok = transfer::check_double_spend(&mut ds_set, &spend2.spent_nullifier).is_ok();
-    println!("  First spend:       {} (should be true)", first_ok);
-    println!("  Second spend:      {} (should be false - DOUBLE SPEND!)", second_ok);
+    println!("  First spend:       {} (valid)", first_ok);
+    println!("  Second spend:      {} (DOUBLE SPEND DETECTED)", second_ok);
+    println!();
+
+    // Credential selective disclosure
+    println!("[6/6] Credential properties...");
+    if let Some(cred) = &current.credential {
+        println!("  KYC passed:        {}", cred.attributes.kyc_passed);
+        println!("  Not sanctioned:    {}", cred.attributes.not_sanctioned);
+        println!("  Jurisdiction:      {}", cred.attributes.jurisdiction);
+        println!("  Age over 18:       {}", cred.attributes.age_over_18);
+        println!("  (Verifier sees ONLY the ZK proof, not these values)");
+    }
     println!();
 
     println!("=== Demo Complete ===");
@@ -115,74 +136,47 @@ fn run_demo() {
 fn run_benchmark() {
     println!("=== Specter Protocol Benchmark ===");
     println!();
+    let n = 50;
 
-    let iterations = 50;
-
-    // Benchmark mint setup
     let start = Instant::now();
-    let mint = Mint::setup(MintConfig {
-        threshold: 2,
-        total_signers: 3,
-        recursion_bound: 20,
-    });
-    let setup_time = start.elapsed();
-    println!("Mint setup (2-of-3): {:?}", setup_time);
+    let mint = Mint::setup(MintConfig { threshold: 2, total_signers: 3, recursion_bound: 20 });
+    println!("Mint setup (2-of-3):           {:?}", start.elapsed());
 
-    // Benchmark token issuance
+    // Issuance without credential
     let start = Instant::now();
     let mut tokens = Vec::new();
-    for _ in 0..iterations {
-        tokens.push(mint.issue(1000, &[1, 2]).unwrap());
-    }
-    let issue_time = start.elapsed();
-    println!(
-        "Token issuance:      {:?} avg ({} iterations)",
-        issue_time / iterations as u32,
-        iterations
-    );
+    for _ in 0..n { tokens.push(mint.issue(1000, &[1, 2], None).unwrap()); }
+    println!("Issue (no cred):               {:?} avg", start.elapsed() / n as u32);
 
-    // Benchmark verification
+    // Issuance with credential
+    let attrs = default_attrs();
     let start = Instant::now();
-    for token in &tokens {
-        let _ = verify::verify_token(token, &mint.group_public_key(), &mint.pedersen);
-    }
-    let verify_time = start.elapsed();
-    println!(
-        "Token verification:  {:?} avg ({} iterations)",
-        verify_time / iterations as u32,
-        iterations
-    );
+    let mut cred_tokens = Vec::new();
+    for _ in 0..n { cred_tokens.push(mint.issue(1000, &[1, 2], Some(&attrs)).unwrap()); }
+    println!("Issue (with cred):             {:?} avg", start.elapsed() / n as u32);
 
-    // Benchmark transfer
+    // Verification
     let start = Instant::now();
-    for token in &tokens {
-        let _ = transfer::transfer(token).unwrap();
-    }
-    let transfer_time = start.elapsed();
-    println!(
-        "Token transfer:      {:?} avg ({} iterations)",
-        transfer_time / iterations as u32,
-        iterations
-    );
+    for t in &cred_tokens { let _ = verify::verify_token(t, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen); }
+    println!("Verify (with cred):            {:?} avg", start.elapsed() / n as u32);
 
-    // Benchmark chain of 20 transfers
-    let token = mint.issue(1000, &[1, 2]).unwrap();
+    // Transfer
+    let start = Instant::now();
+    for t in &tokens { let _ = transfer::transfer(t).unwrap(); }
+    println!("Transfer:                      {:?} avg", start.elapsed() / n as u32);
+
+    // 20-transfer chain
+    let token = mint.issue(1000, &[1, 2], Some(&attrs)).unwrap();
     let start = Instant::now();
     let mut current = token;
-    for _ in 0..20 {
-        let result = transfer::transfer(&current).unwrap();
-        current = result.token;
-    }
-    let chain_time = start.elapsed();
-    println!("20-transfer chain:   {:?} total", chain_time);
+    for _ in 0..20 { current = transfer::transfer(&current).unwrap().token; }
+    println!("20-transfer chain:             {:?} total", start.elapsed());
 
-    // Verify the final token
     let start = Instant::now();
-    let result = verify::verify_token(&current, &mint.group_public_key(), &mint.pedersen);
-    let final_verify = start.elapsed();
-    println!("Final verification:  {:?} (valid={})", final_verify, result.all_valid());
+    let r = verify::verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+    println!("Final verify (20 transfers):   {:?} (valid={})", start.elapsed(), r.all_valid());
 
-    println!();
-    println!("Token estimated size: {} bytes", current.estimated_size());
+    println!("\nToken size (no cred):          {} bytes", tokens[0].estimated_size());
+    println!("Token size (with cred):        {} bytes", cred_tokens[0].estimated_size());
     println!("=== Benchmark Complete ===");
 }

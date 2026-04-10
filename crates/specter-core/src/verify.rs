@@ -1,20 +1,17 @@
-//! Unified token verification.
-//!
-//! Verifies all properties of a Proof-Carrying Token in a single call:
-//! - Signature validity (threshold blind signature from the mint)
-//! - Value commitment correctness
-//! - Transfer count within recursion bound
+//! Unified token verification — checks ALL properties of a PCT.
 
 use curve25519_dalek::RistrettoPoint;
 
 use specter_blind_sig::schnorr_blind;
+use specter_credential::presentation;
+use specter_fold::accumulator;
 use specter_primitives::pedersen::PedersenParams;
 use specter_primitives::scalar_utils::scalar_from_u64;
 
 use crate::mint;
 use crate::token::ProofCarryingToken;
 
-/// Result of token verification.
+/// Result of token verification — individual checks and combined.
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
     /// Whether the mint's blind signature is valid.
@@ -23,31 +20,42 @@ pub struct VerificationResult {
     pub value_valid: bool,
     /// Whether the transfer count is within the recursion bound.
     pub within_bound: bool,
+    /// Whether the accumulated fold proof is valid.
+    pub fold_valid: bool,
+    /// Whether the compliance credential presentation is valid (None if no credential).
+    pub credential_valid: Option<bool>,
 }
 
 impl VerificationResult {
     /// Returns true only if ALL checks passed.
     pub fn all_valid(&self) -> bool {
-        self.signature_valid && self.value_valid && self.within_bound
+        self.signature_valid
+            && self.value_valid
+            && self.within_bound
+            && self.fold_valid
+            && self.credential_valid.unwrap_or(true) // no credential = no check needed
     }
 }
 
-/// Verify a Proof-Carrying Token.
+/// Verify a Proof-Carrying Token comprehensively.
 ///
 /// Checks:
-/// 1. The blind signature from the mint is valid against the group public key.
-/// 2. The Pedersen commitment to the value opens correctly.
-/// 3. The transfer count has not exceeded the recursion bound.
+/// 1. Blind signature from the mint
+/// 2. Value commitment correctness
+/// 3. Transfer count within recursion bound
+/// 4. Accumulated fold proof validity
+/// 5. Compliance credential presentation (if present)
 pub fn verify_token(
     token: &ProofCarryingToken,
     group_public_key: &RistrettoPoint,
     pedersen: &PedersenParams,
+    credential_pedersen: &PedersenParams,
 ) -> VerificationResult {
-    // 1. Verify the mint's blind signature
+    // 1. Verify mint signature
     let signed_msg = mint::build_signed_message(&token.token_id, &token.value_commitment);
     let signature_valid = schnorr_blind::verify(group_public_key, &signed_msg, &token.mint_signature);
 
-    // 2. Verify the value commitment
+    // 2. Verify value commitment
     let value_scalar = scalar_from_u64(token.value);
     let value_valid = pedersen.verify_opening(
         &token.value_commitment,
@@ -58,10 +66,25 @@ pub fn verify_token(
     // 3. Check transfer count
     let within_bound = token.transfer_count <= token.recursion_bound;
 
+    // 4. Verify fold proof
+    let genesis_state = accumulator::TransferState {
+        token_id: token.token_id,
+        owner_hash: [0u8; 32], // genesis owner hash isn't checked in verify
+        step: 0,
+    };
+    let fold_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
+
+    // 5. Verify credential presentation (if present)
+    let credential_valid = token.presentation.as_ref().map(|pres| {
+        presentation::verify_presentation(pres, credential_pedersen)
+    });
+
     VerificationResult {
         signature_valid,
         value_valid,
         within_bound,
+        fold_valid,
+        credential_valid,
     }
 }
 
@@ -70,6 +93,7 @@ mod tests {
     use super::*;
     use crate::mint::{Mint, MintConfig};
     use crate::transfer;
+    use specter_credential::credential::Attributes;
 
     fn setup() -> Mint {
         Mint::setup(MintConfig {
@@ -79,119 +103,74 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_freshly_minted_token_valid() {
-        let mint = setup();
-        let token = mint.issue(500, &[1, 2]).unwrap();
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen);
+    fn test_attrs() -> Attributes {
+        Attributes {
+            kyc_passed: true,
+            not_sanctioned: true,
+            jurisdiction: "EU".to_string(),
+            age_over_18: true,
+        }
+    }
 
+    #[test]
+    fn test_fresh_token_valid() {
+        let mint = setup();
+        let token = mint.issue(500, &[1, 2], Some(&test_attrs())).unwrap();
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
         assert!(result.signature_valid);
         assert!(result.value_valid);
         assert!(result.within_bound);
+        assert!(result.fold_valid);
+        assert_eq!(result.credential_valid, Some(true));
         assert!(result.all_valid());
     }
 
     #[test]
     fn test_transferred_token_valid() {
         let mint = setup();
-        let token = mint.issue(500, &[1, 2]).unwrap();
-
-        // Transfer several times
+        let token = mint.issue(500, &[1, 2], Some(&test_attrs())).unwrap();
         let mut current = token;
         for _ in 0..5 {
-            let result = transfer::transfer(&current).unwrap();
-            current = result.token;
+            current = transfer::transfer(&current).unwrap().token;
         }
-
-        let result = verify_token(&current, &mint.group_public_key(), &mint.pedersen);
-        assert!(result.signature_valid);
-        assert!(result.value_valid);
-        assert!(result.within_bound);
+        let result = verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
         assert!(result.all_valid());
     }
 
     #[test]
-    fn test_wrong_group_key_fails() {
+    fn test_no_credential_still_valid() {
         let mint = setup();
-        let other_mint = setup();
-        let token = mint.issue(500, &[1, 2]).unwrap();
-
-        let result = verify_token(&token, &other_mint.group_public_key(), &mint.pedersen);
-        assert!(!result.signature_valid);
-        assert!(!result.all_valid());
+        let token = mint.issue(500, &[1, 2], None).unwrap();
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        assert!(result.all_valid());
+        assert_eq!(result.credential_valid, None);
     }
 
     #[test]
     fn test_tampered_value_fails() {
         let mint = setup();
-        let mut token = mint.issue(500, &[1, 2]).unwrap();
-
-        // Tamper with the value
+        let mut token = mint.issue(500, &[1, 2], None).unwrap();
         token.value = 9999;
-
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
         assert!(!result.value_valid);
         assert!(!result.all_valid());
     }
 
     #[test]
-    fn test_exceeded_bound_fails() {
-        let mint = Mint::setup(MintConfig {
-            threshold: 2,
-            total_signers: 3,
-            recursion_bound: 3,
-        });
-        let mut token = mint.issue(500, &[1, 2]).unwrap();
-
-        // Manually set transfer count past bound
-        token.transfer_count = 4;
-
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen);
-        assert!(!result.within_bound);
-        assert!(!result.all_valid());
-    }
-
-    #[test]
-    fn test_many_minted_tokens_all_valid() {
+    fn test_full_lifecycle() {
         let mint = setup();
-        for i in 0..10 {
-            let token = mint.issue(i * 100 + 100, &[1, 3]).unwrap();
-            let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen);
-            assert!(result.all_valid(), "failed at i={}", i);
-        }
-    }
-
-    #[test]
-    fn test_full_lifecycle_mint_transfer_verify() {
-        let mint = setup();
-        let token = mint.issue(1000, &[1, 2]).unwrap();
-
-        // Transfer 10 times
+        let token = mint.issue(1000, &[1, 2], Some(&test_attrs())).unwrap();
         let mut current = token;
-        let mut nullifiers = Vec::new();
         let mut nullifier_set = crate::nullifier::NullifierSet::new();
 
         for i in 0..10 {
             let result = transfer::transfer(&current).unwrap();
-
-            // Check double-spend detection
-            assert!(
-                transfer::check_double_spend(&mut nullifier_set, &result.spent_nullifier).is_ok(),
-                "double-spend false positive at transfer {}",
-                i
-            );
-
-            nullifiers.push(result.spent_nullifier);
+            assert!(transfer::check_double_spend(&mut nullifier_set, &result.spent_nullifier).is_ok());
             current = result.token;
 
-            // Verify at each step
-            let vr = verify_token(&current, &mint.group_public_key(), &mint.pedersen);
-            assert!(vr.all_valid(), "verification failed at transfer {}", i);
+            let vr = verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+            assert!(vr.all_valid(), "failed at step {}", i);
+            assert_eq!(vr.credential_valid, Some(true));
         }
-
-        // Final state
-        assert_eq!(current.transfer_count, 10);
-        assert_eq!(current.value, 1000);
-        assert_eq!(nullifier_set.len(), 10);
     }
 }

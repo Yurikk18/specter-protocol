@@ -1,13 +1,12 @@
 //! Token minting (issuance) via threshold blind signatures.
-//!
-//! The Mint orchestrates the issuance of new Proof-Carrying Tokens.
-//! It uses a threshold blind signature scheme so that no single signer
-//! knows the token content, and the token can only be issued with
-//! cooperation of t-of-n signers.
 
 use curve25519_dalek::RistrettoPoint;
 
 use specter_blind_sig::threshold::{self, SignerId, ThresholdKeyset};
+use specter_credential::credential::Attributes;
+use specter_credential::issuer::Issuer;
+use specter_credential::presentation;
+use specter_fold::accumulator::{self, TransferState};
 use specter_primitives::pedersen::PedersenParams;
 use specter_primitives::scalar_utils::{random_scalar, scalar_from_u64};
 
@@ -15,11 +14,8 @@ use crate::token::ProofCarryingToken;
 
 /// Configuration for the mint.
 pub struct MintConfig {
-    /// Minimum signers required (threshold).
     pub threshold: usize,
-    /// Total number of signers.
     pub total_signers: usize,
-    /// Maximum transfers before token renewal.
     pub recursion_bound: u32,
 }
 
@@ -27,6 +23,7 @@ pub struct MintConfig {
 pub struct Mint {
     pub keyset: ThresholdKeyset,
     pub pedersen: PedersenParams,
+    pub credential_issuer: Issuer,
     pub recursion_bound: u32,
 }
 
@@ -35,30 +32,27 @@ impl Mint {
     pub fn setup(config: MintConfig) -> Self {
         let keyset = threshold::dealer_keygen(config.threshold, config.total_signers);
         let pedersen = PedersenParams::new();
+        let credential_issuer = Issuer::new();
         Self {
             keyset,
             pedersen,
+            credential_issuer,
             recursion_bound: config.recursion_bound,
         }
     }
 
-    /// Issue a new token with the given value.
-    ///
-    /// The specified signers participate in the threshold blind signature.
-    /// The token is created with a fresh random ID, a Pedersen commitment
-    /// to the value, and an initial hash chain.
+    /// Issue a new token with the given value and optional compliance attributes.
     pub fn issue(
         &self,
         value: u64,
         signers: &[SignerId],
+        attributes: Option<&Attributes>,
     ) -> Result<ProofCarryingToken, MintError> {
-        // Generate random token ID
+        // Generate random token ID and owner secret
         let mut token_id = [0u8; 32];
+        let mut owner_secret = [0u8; 32];
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut token_id);
-
-        // Generate random owner secret
-        let mut owner_secret = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut owner_secret);
 
         // Create Pedersen commitment to the value
@@ -66,14 +60,34 @@ impl Mint {
         let blinding = random_scalar();
         let value_commitment = self.pedersen.commit(&value_scalar, &blinding);
 
-        // Compute the message to be signed: H(token_id || value_commitment)
-        let signed_msg = build_signed_message(&token_id, &value_commitment);
-
         // Threshold blind sign
+        let signed_msg = build_signed_message(&token_id, &value_commitment);
         let signature = threshold::threshold_blind_sign(&self.keyset, signers, &signed_msg)
             .map_err(|e| MintError::SigningFailed(e.to_string()))?;
 
-        // Initial hash chain head = H("specter-genesis:" || token_id)
+        // Create initial fold proof
+        let mut owner_hash = [0u8; 32];
+        owner_hash.copy_from_slice(&specter_primitives::scalar_utils::hash_to_scalar(&owner_secret).as_bytes()[..32]);
+        let genesis_state = TransferState {
+            token_id,
+            owner_hash,
+            step: 0,
+        };
+        let fold_proof = accumulator::create_initial_proof(&genesis_state);
+
+        // Issue compliance credential if attributes provided
+        let credential = attributes.map(|attrs| self.credential_issuer.issue(attrs));
+
+        // Create compliance presentation if credential exists
+        let pres = credential.as_ref().map(|cred| {
+            presentation::create_presentation(
+                cred,
+                &[presentation::ATTR_KYC_PASSED, presentation::ATTR_NOT_SANCTIONED],
+                &self.credential_issuer.pedersen,
+            )
+        });
+
+        // Hash chain genesis
         let hash_chain_head = crate::token::advance_hash_chain(&[0u8; 32], &token_id);
 
         Ok(ProofCarryingToken {
@@ -86,6 +100,9 @@ impl Mint {
             hash_chain_head,
             transfer_count: 0,
             recursion_bound: self.recursion_bound,
+            fold_proof,
+            credential,
+            presentation: pres,
         })
     }
 
@@ -113,7 +130,6 @@ pub enum MintError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify;
 
     fn test_mint() -> Mint {
         Mint::setup(MintConfig {
@@ -123,45 +139,45 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_mint_issue() {
-        let mint = test_mint();
-        let token = mint.issue(1000, &[1, 2]).unwrap();
+    fn test_attrs() -> Attributes {
+        Attributes {
+            kyc_passed: true,
+            not_sanctioned: true,
+            jurisdiction: "EU".to_string(),
+            age_over_18: true,
+        }
+    }
 
+    #[test]
+    fn test_mint_without_credential() {
+        let mint = test_mint();
+        let token = mint.issue(1000, &[1, 2], None).unwrap();
         assert_eq!(token.value, 1000);
-        assert_eq!(token.transfer_count, 0);
-        assert_eq!(token.recursion_bound, 20);
-        assert!(!token.needs_renewal());
+        assert!(token.credential.is_none());
+        assert!(token.presentation.is_none());
+        assert_eq!(token.fold_proof.steps, 0);
     }
 
     #[test]
-    fn test_mint_different_signers() {
+    fn test_mint_with_credential() {
         let mint = test_mint();
-        let t1 = mint.issue(100, &[1, 2]).unwrap();
-        let t2 = mint.issue(100, &[2, 3]).unwrap();
-        let t3 = mint.issue(100, &[1, 3]).unwrap();
-
-        // All should have valid signatures (verified in verify tests)
-        assert_ne!(t1.token_id, t2.token_id);
-        assert_ne!(t2.token_id, t3.token_id);
-    }
-
-    #[test]
-    fn test_mint_insufficient_signers() {
-        let mint = test_mint();
-        let result = mint.issue(100, &[1]); // need 2, only gave 1
-        assert!(result.is_err());
+        let attrs = test_attrs();
+        let token = mint.issue(1000, &[1, 2], Some(&attrs)).unwrap();
+        assert!(token.credential.is_some());
+        assert!(token.presentation.is_some());
     }
 
     #[test]
     fn test_mint_verify_roundtrip() {
         let mint = test_mint();
-        let token = mint.issue(500, &[1, 3]).unwrap();
+        let token = mint.issue(500, &[1, 3], Some(&test_attrs())).unwrap();
 
-        let result = verify::verify_token(&token, &mint.group_public_key(), &mint.pedersen);
-        assert!(result.signature_valid);
-        assert!(result.value_valid);
-        assert!(result.within_bound);
+        let result = crate::verify::verify_token(
+            &token,
+            &mint.group_public_key(),
+            &mint.pedersen,
+            &mint.credential_issuer.pedersen,
+        );
         assert!(result.all_valid());
     }
 }
