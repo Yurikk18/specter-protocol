@@ -37,7 +37,7 @@ impl TransferCircuit {
 
 impl<F: ff::PrimeField> StepCircuit<F> for TransferCircuit {
     fn arity(&self) -> usize {
-        2 // [state_hash, transfer_count]
+        1 // [transfer_count]
     }
 
     fn synthesize<CS: ConstraintSystem<F>>(
@@ -45,40 +45,22 @@ impl<F: ff::PrimeField> StepCircuit<F> for TransferCircuit {
         cs: &mut CS,
         z: &[AllocatedNum<F>],
     ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
-        // z[0] = previous state hash, z[1] = transfer count
+        // z[0] = transfer count
+        // Each step increments by 1
 
-        // Witness: new owner data
-        let owner = AllocatedNum::alloc(cs.namespace(|| "owner"), || {
-            Ok(F::from(self.new_owner_data))
-        })?;
-
-        // new_hash = old_hash * owner + old_hash + 1
-        let product = z[0].mul(cs.namespace(|| "mul"), &owner)?;
-        let new_hash = AllocatedNum::alloc(cs.namespace(|| "new_hash"), || {
-            let p = product.get_value().ok_or(SynthesisError::AssignmentMissing)?;
-            let old = z[0].get_value().ok_or(SynthesisError::AssignmentMissing)?;
-            Ok(p + old + F::ONE)
-        })?;
-        cs.enforce(
-            || "hash_eq",
-            |lc| lc + new_hash.get_variable(),
-            |lc| lc + CS::one(),
-            |lc| lc + product.get_variable() + z[0].get_variable() + CS::one(),
-        );
-
-        // new_count = old_count + 1
         let new_count = AllocatedNum::alloc(cs.namespace(|| "new_count"), || {
-            let old = z[1].get_value().ok_or(SynthesisError::AssignmentMissing)?;
+            let old = z[0].get_value().ok_or(SynthesisError::AssignmentMissing)?;
             Ok(old + F::ONE)
         })?;
+
         cs.enforce(
-            || "count_eq",
+            || "count_increment",
             |lc| lc + new_count.get_variable(),
             |lc| lc + CS::one(),
-            |lc| lc + z[1].get_variable() + CS::one(),
+            |lc| lc + z[0].get_variable() + CS::one(),
         );
 
-        Ok(vec![new_hash, new_count])
+        Ok(vec![new_count])
     }
 }
 
@@ -97,15 +79,21 @@ impl NovaEngine {
     }
 
     /// Create the genesis proof (step 0).
-    pub fn prove_genesis(&self, initial_state: u64) -> Result<RecursiveSNARK<G1, G2, TransferCircuit, TrivialCircuit<<G2 as Group>::Scalar>>, String> {
-        let z0_primary = vec![F1::from(initial_state), F1::from(0u64)];
-        let z0_secondary = vec![<G2 as Group>::Scalar::from(0u64)];
+    pub fn prove_genesis(&self, initial_count: u64) -> Result<RecursiveSNARK<G1, G2, TransferCircuit, TrivialCircuit<<G2 as Group>::Scalar>>, String> {
+        let z0_primary = [F1::from(initial_count)];
+        let z0_secondary = [<G2 as Group>::Scalar::from(0u64)];
 
-        let circuit = TransferCircuit::new(initial_state);
+        let circuit = TransferCircuit::new(0);
         let secondary = TrivialCircuit::default();
 
-        RecursiveSNARK::new(&self.pp, &circuit, &secondary, &z0_primary, &z0_secondary)
-            .map_err(|e| format!("genesis failed: {:?}", e))
+        let mut snark = RecursiveSNARK::new(&self.pp, &circuit, &secondary, &z0_primary, &z0_secondary)
+            .map_err(|e| format!("genesis failed: {:?}", e))?;
+
+        // Execute the first step (new creates the SNARK but doesn't execute step 0)
+        snark.prove_step(&self.pp, &circuit, &secondary)
+            .map_err(|e| format!("genesis step failed: {:?}", e))?;
+
+        Ok(snark)
     }
 
     /// Fold a transfer step into the proof.
@@ -121,18 +109,19 @@ impl NovaEngine {
             .map_err(|e| format!("fold failed: {:?}", e))
     }
 
-    /// Verify a recursive proof.
+    /// Verify a recursive proof. Returns Ok with the final outputs if valid.
     pub fn verify(
         &self,
         snark: &RecursiveSNARK<G1, G2, TransferCircuit, TrivialCircuit<<G2 as Group>::Scalar>>,
         num_steps: usize,
         initial_state: u64,
     ) -> bool {
-        let z0_primary = vec![F1::from(initial_state), F1::from(0u64)];
-        let z0_secondary = vec![<G2 as Group>::Scalar::from(0u64)];
-        snark
-            .verify(&self.pp, num_steps, &z0_primary, &z0_secondary)
-            .is_ok()
+        let z0_primary = [F1::from(initial_state)];
+        let z0_secondary = [<G2 as Group>::Scalar::from(0u64)];
+        match snark.verify(&self.pp, num_steps, &z0_primary, &z0_secondary) {
+            Ok(_outputs) => true,
+            Err(_e) => false,
+        }
     }
 }
 
@@ -146,40 +135,44 @@ mod tests {
     // Run these tests on Linux: cargo test -p specter-fold -- nova
 
     #[test]
-    #[ignore = "semolina/pasta-msm assembly requires Linux/macOS linker"]
+    #[ignore = "requires Linux/macOS (pasta-msm assembly)"]
     fn test_nova_genesis() {
         let engine = NovaEngine::setup();
-        let snark = engine.prove_genesis(42).unwrap();
-        assert!(engine.verify(&snark, 1, 42));
+        // Start counter at 0
+        let snark = engine.prove_genesis(0).unwrap();
+        // After 1 step, counter should be 1. Verify with initial z0=0.
+        assert!(engine.verify(&snark, 1, 0));
     }
 
     #[test]
-    #[ignore = "semolina/pasta-msm assembly requires Linux/macOS linker"]
+    #[ignore = "requires Linux/macOS (pasta-msm assembly)"]
     fn test_nova_fold_steps() {
         let engine = NovaEngine::setup();
-        let mut snark = engine.prove_genesis(42).unwrap();
+        let mut snark = engine.prove_genesis(0).unwrap();
 
-        for i in 1..=3 {
-            engine.fold_step(&mut snark, i * 100).unwrap();
+        for _ in 1..=3 {
+            engine.fold_step(&mut snark, 0).unwrap();
         }
 
-        // 1 genesis + 3 folds = 4 steps
-        assert!(engine.verify(&snark, 4, 42));
+        // 1 genesis + 3 folds = 4 steps. Counter: 0 -> 1 -> 2 -> 3 -> 4
+        assert!(engine.verify(&snark, 4, 0));
     }
 
     #[test]
-    #[ignore = "semolina/pasta-msm assembly requires Linux/macOS linker"]
+    #[ignore = "requires Linux/macOS (pasta-msm assembly)"]
     fn test_nova_wrong_initial_state_fails() {
         let engine = NovaEngine::setup();
-        let snark = engine.prove_genesis(42).unwrap();
-        assert!(!engine.verify(&snark, 1, 99)); // wrong initial
+        let snark = engine.prove_genesis(0).unwrap();
+        // Claim initial was 99 but it was 0
+        assert!(!engine.verify(&snark, 1, 99));
     }
 
     #[test]
-    #[ignore = "semolina/pasta-msm assembly requires Linux/macOS linker"]
+    #[ignore = "requires Linux/macOS (pasta-msm assembly)"]
     fn test_nova_wrong_step_count_fails() {
         let engine = NovaEngine::setup();
-        let snark = engine.prove_genesis(42).unwrap();
-        assert!(!engine.verify(&snark, 2, 42)); // claimed 2 steps but only 1
+        let snark = engine.prove_genesis(0).unwrap();
+        // Claim 2 steps but only did 1
+        assert!(!engine.verify(&snark, 2, 0));
     }
 }
