@@ -3,7 +3,7 @@ use curve25519_dalek::{RistrettoPoint, Scalar};
 /// A signer's keypair for blind Schnorr signatures.
 #[derive(Clone)]
 pub struct SignerKeypair {
-    /// Secret signing key (private — never exposed).
+    /// Secret signing key (private - never exposed).
     secret: Scalar,
     /// Public verification key (secret * G).
     pub public: RistrettoPoint,

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-/// A reputation bond — collateral staked by a user.
+/// A reputation bond - collateral staked by a user.
 #[derive(Clone, Debug)]
 pub struct Bond {
     /// Unique bond identifier.
@@ -25,7 +25,7 @@ pub struct Bond {
     pub offline_exposure: u64,
 }
 
-/// The bond registry — tracks all active bonds.
+/// The bond registry - tracks all active bonds.
 pub struct BondRegistry {
     bonds: HashMap<[u8; 32], Bond>,
     /// Map from owner_id to their bond_id.
@@ -90,7 +90,7 @@ impl BondRegistry {
         }
     }
 
-    /// Register offline spending — increase the owner's exposure.
+    /// Register offline spending - increase the owner's exposure.
     pub fn register_offline_spend(
         &mut self,
         owner_id: &[u8; 32],
@@ -125,7 +125,7 @@ impl BondRegistry {
         Ok(())
     }
 
-    /// Settle an offline spend — decrease exposure when the token goes online.
+    /// Settle an offline spend - decrease exposure when the token goes online.
     pub fn settle(&mut self, owner_id: &[u8; 32], amount: u64) -> Result<(), BondError> {
         let bond_id = self.owner_bonds.get(owner_id).ok_or(BondError::NoBond)?;
         let bond = self.bonds.get_mut(bond_id).ok_or(BondError::NoBond)?;

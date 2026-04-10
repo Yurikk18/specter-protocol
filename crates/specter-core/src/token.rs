@@ -1,4 +1,4 @@
-//! Proof-Carrying Token (PCT) — the core data structure of Specter.
+//! Proof-Carrying Token (PCT) - the core data structure of Specter.
 //!
 //! A PCT is a self-verifying bearer token that carries:
 //! - A blind signature from the threshold mint (proves legitimate issuance)
@@ -42,7 +42,7 @@ pub struct ProofCarryingToken {
     /// Current owner's secret (32 bytes).
     pub owner_secret: [u8; 32],
 
-    /// Hash chain head — tracks the transfer history.
+    /// Hash chain head - tracks the transfer history.
     pub hash_chain_head: [u8; 32],
 
     /// Number of times this token has been transferred.
@@ -54,10 +54,10 @@ pub struct ProofCarryingToken {
     /// Accumulated proof of transfer history (constant size).
     pub fold_proof: AccumulatedProof,
 
-    /// Compliance credential (optional — issued by KYC provider).
+    /// Compliance credential (optional - issued by KYC provider).
     pub credential: Option<Credential>,
 
-    /// Current compliance presentation (optional — proves attributes).
+    /// Current compliance presentation (optional - proves attributes).
     pub presentation: Option<Presentation>,
 
     /// VDF time-lock proof (proves when the token was issued/renewed).

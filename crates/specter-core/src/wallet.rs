@@ -1,4 +1,4 @@
-//! Wallet — manages multiple Proof-Carrying Tokens.
+//! Wallet - manages multiple Proof-Carrying Tokens.
 //!
 //! Provides balance tracking, token selection for spending, and
 //! storage management.

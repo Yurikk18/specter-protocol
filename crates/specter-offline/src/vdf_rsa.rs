@@ -1,7 +1,7 @@
 //! RSA-based Verifiable Delay Function.
 //!
 //! Uses repeated squaring in an RSA group: y = x^(2^T) mod N.
-//! This is inherently sequential — cannot be parallelized — making it
+//! This is inherently sequential - cannot be parallelized - making it
 //! a true time-lock. Verification uses Wesolowski's protocol:
 //! the prover sends a short proof pi that allows O(log T) verification.
 //!
@@ -43,7 +43,7 @@ impl RsaVdfParams {
     /// (published 1991). Its factorization is unknown, making it safe
     /// for use as a VDF group modulus.
     pub fn default_2048() -> Self {
-        // RSA-2048 challenge number — factorization UNKNOWN.
+        // RSA-2048 challenge number - factorization UNKNOWN.
         // Source: RSA Laboratories, published in the RSA Factoring Challenge.
         // 617 decimal digits, 2048 bits.
         let modulus = BigUint::parse_bytes(
@@ -111,7 +111,7 @@ pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> RsaV
 /// Check: pi^l * x^r == y mod N
 /// where r = 2^T mod l
 ///
-/// This is O(log T) — much faster than recomputing the full chain.
+/// This is O(log T) - much faster than recomputing the full chain.
 pub fn verify(params: &RsaVdfParams, proof: &RsaVdfProof) -> bool {
     let n = &params.modulus;
 
@@ -335,7 +335,7 @@ mod tests {
         let params = small_params();
         let input = BigUint::from(42u64);
         let proof = evaluate(&params, &input, 1000);
-        // Verification doesn't repeat 1000 squarings — it's O(log T)
+        // Verification doesn't repeat 1000 squarings - it's O(log T)
         assert!(verify(&params, &proof));
     }
 
@@ -347,7 +347,7 @@ mod tests {
         assert!(is_probably_prime_miller_rabin(&BigUint::from(97u64), 20));
         assert!(!is_probably_prime_miller_rabin(&BigUint::from(4u64), 20));
         assert!(!is_probably_prime_miller_rabin(&BigUint::from(100u64), 20));
-        // Carmichael numbers — MUST be rejected by Miller-Rabin
+        // Carmichael numbers - MUST be rejected by Miller-Rabin
         assert!(!is_probably_prime_miller_rabin(&BigUint::from(561u64), 20));
         assert!(!is_probably_prime_miller_rabin(&BigUint::from(1105u64), 20));
         assert!(!is_probably_prime_miller_rabin(&BigUint::from(1729u64), 20));

@@ -1,4 +1,4 @@
-//! Token serialization — converts PCT to/from portable byte format.
+//! Token serialization - converts PCT to/from portable byte format.
 //!
 //! Provides a compact binary encoding for Proof-Carrying Tokens that
 //! can be written to disk, sent over the network, or embedded in QR codes.
@@ -357,7 +357,7 @@ fn read_scalar(data: &[u8], pos: &mut usize) -> Result<Scalar, SerdeError> {
 
 /// Serialize and encrypt a token with a passphrase.
 ///
-/// The output is fully encrypted — owner_secret and all other sensitive
+/// The output is fully encrypted - owner_secret and all other sensitive
 /// data are protected. An HMAC verifies integrity before decryption.
 pub fn serialize_encrypted(
     token: &ProofCarryingToken,
@@ -562,7 +562,7 @@ mod tests {
         assert!(full_size > basic_size);
         assert!(full_size < 2000);
 
-        // After 10 transfers (should be same size — constant!)
+        // After 10 transfers (should be same size - constant!)
         let mut transferred = full.clone();
         for _ in 0..10 {
             transferred = transfer::transfer(&transferred).unwrap().token;
@@ -644,7 +644,7 @@ mod tests {
             .any(|window| window == owner_secret);
         assert!(
             !secret_in_ciphertext,
-            "owner_secret found in ciphertext — encryption failed"
+            "owner_secret found in ciphertext - encryption failed"
         );
     }
 }

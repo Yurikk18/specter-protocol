@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Specter is a decentralized digital cash protocol based on Proof-Carrying Tokens (PCT). Each token is a self-verifying bearer instrument that embeds cryptographic proofs of legitimate issuance, transfer history integrity, and regulatory compliance — all without revealing the holder's identity. Tokens maintain constant size regardless of transfer count via recursive proof folding.
+Specter is a decentralized digital cash protocol based on Proof-Carrying Tokens (PCT). Each token is a self-verifying bearer instrument that embeds cryptographic proofs of legitimate issuance, transfer history integrity, and regulatory compliance - all without revealing the holder's identity. Tokens maintain constant size regardless of transfer count via recursive proof folding.
 
 ## 1. Proof-Carrying Token (PCT)
 
@@ -48,7 +48,7 @@ No individual signer knows the token content or the final signature.
 4. Receiver generates new owner_secret, advances hash chain, folds new proof
 5. Nullifier is published to the network for double-spend detection
 
-Token size remains constant — the fold proof absorbs each transfer without growing.
+Token size remains constant - the fold proof absorbs each transfer without growing.
 
 ## 4. Verification
 

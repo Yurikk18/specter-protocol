@@ -1,4 +1,4 @@
-//! Proof Accumulator — constant-size transfer history proofs with
+//! Proof Accumulator - constant-size transfer history proofs with
 //! cryptographic verification.
 //!
 //! Each proof is a Schnorr signature where the "secret key" is derived
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn test_forged_proof_rejected() {
         let g = genesis();
-        // Forge a proof with random values — Schnorr equation won't hold
+        // Forge a proof with random values - Schnorr equation won't hold
         let fake_sk = random_scalar();
         let forged = AccumulatedProof {
             s: random_scalar(),

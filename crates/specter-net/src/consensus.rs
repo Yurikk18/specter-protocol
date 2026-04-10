@@ -6,7 +6,7 @@
 //! 3. If a quorum (2f+1 out of 3f+1) of authenticated votes approve, the block is committed.
 //! 4. Leader rotates each block, with view change on leader failure.
 //!
-//! Every vote is cryptographically signed — forged votes are rejected.
+//! Every vote is cryptographically signed - forged votes are rejected.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 use curve25519_dalek::{RistrettoPoint, Scalar};
@@ -354,7 +354,7 @@ mod tests {
         let fake_key = ValidatorKey::generate(99);
         let forged = fake_key.sign_vote(0, &[0u8; 32], true);
 
-        // Should be rejected — voter 99 is not a known validator
+        // Should be rejected - voter 99 is not a known validator
         assert!(state.receive_vote(forged).is_err());
     }
 
@@ -367,7 +367,7 @@ mod tests {
         // Tamper with the approve flag
         vote.approve = false;
 
-        // Signature no longer matches — should be rejected
+        // Signature no longer matches - should be rejected
         assert!(state.receive_vote(vote).is_err());
     }
 

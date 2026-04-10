@@ -6,7 +6,7 @@
 //! The SIS problem: given A, find a short vector x such that A*x = 0 mod q.
 //! This hardness assumption underlies lattice-based commitment schemes.
 //!
-//! **NOT for production use** — uses small parameters for educational purposes.
+//! **NOT for production use** - uses small parameters for educational purposes.
 
 use rand::Rng;
 
@@ -31,10 +31,10 @@ impl SisParams {
     /// Generate random SIS parameters with a uniformly random matrix A.
     ///
     /// # Arguments
-    /// * `n` — rows (security parameter, typically 4-8 for toy)
-    /// * `m` — columns (message length, typically 8-16 for toy)
-    /// * `q` — modulus (a prime, e.g., 65537)
-    /// * `beta` — shortness bound for message entries
+    /// * `n` - rows (security parameter, typically 4-8 for toy)
+    /// * `m` - columns (message length, typically 8-16 for toy)
+    /// * `q` - modulus (a prime, e.g., 65537)
+    /// * `beta` - shortness bound for message entries
     pub fn generate(n: usize, m: usize, q: u64, beta: u64) -> Self {
         let mut rng = rand::thread_rng();
         let matrix_a: Vec<Vec<u64>> = (0..n)

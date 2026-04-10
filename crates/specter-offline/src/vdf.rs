@@ -2,7 +2,7 @@
 //!
 //! A VDF proves that a minimum amount of wall-clock time has passed since
 //! a token was issued or renewed. This prevents tokens from being used
-//! offline indefinitely — after time T, the token expires and must be
+//! offline indefinitely - after time T, the token expires and must be
 //! renewed online.
 //!
 //! Implementation: iterated SHA-256 hashing. The prover computes
@@ -15,7 +15,7 @@
 
 use sha2::{Digest, Sha256};
 
-/// A VDF proof — proves that a specific number of sequential hash
+/// A VDF proof - proves that a specific number of sequential hash
 /// iterations were computed starting from a seed.
 #[derive(Clone, Debug)]
 pub struct VdfProof {
@@ -43,7 +43,7 @@ impl VdfParams {
 
 /// Evaluate the VDF: compute T iterations of SHA-256 starting from seed.
 ///
-/// This is intentionally slow — it proves that the prover spent time
+/// This is intentionally slow - it proves that the prover spent time
 /// computing the chain. The output is deterministic.
 pub fn evaluate(seed: &[u8; 32], iterations: u64) -> VdfProof {
     let mut current = *seed;
@@ -69,7 +69,7 @@ pub fn verify(proof: &VdfProof) -> bool {
     recomputed.output == proof.output
 }
 
-/// Check if a VDF proof has "expired" — i.e., it was computed with
+/// Check if a VDF proof has "expired" - i.e., it was computed with
 /// fewer iterations than required by the current parameters.
 pub fn is_expired(proof: &VdfProof, required_iterations: u64) -> bool {
     proof.iterations < required_iterations

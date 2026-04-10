@@ -1,4 +1,4 @@
-//! Networked protocol — integrates core operations with the P2P layer.
+//! Networked protocol - integrates core operations with the P2P layer.
 //!
 //! Wraps Mint + NetworkNode so that minting publishes to the network,
 //! transfers broadcast nullifiers via gossip, and the consensus layer
@@ -15,7 +15,7 @@ use crate::token::ProofCarryingToken;
 use crate::transfer::{self, TransferResult};
 use crate::verify::{self, VerificationResult};
 
-/// A networked Specter node — combines mint, network, and bonds.
+/// A networked Specter node - combines mint, network, and bonds.
 pub struct NetworkedNode {
     pub mint: Mint,
     pub network: NetworkNode,
@@ -175,7 +175,7 @@ mod tests {
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
 
         let r1 = node.transfer_token(&token).unwrap();
-        // Second transfer of the same token — nullifier already known
+        // Second transfer of the same token - nullifier already known
         assert!(node.is_double_spend(&r1.spent_nullifier));
     }
 

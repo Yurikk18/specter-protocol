@@ -1,4 +1,4 @@
-//! Credential issuer — issues anonymous credentials over attribute commitments.
+//! Credential issuer - issues anonymous credentials over attribute commitments.
 //!
 //! The issuer verifies the holder's attributes (KYC, sanctions check, etc.)
 //! and signs a Pedersen commitment to those attributes. The issuer knows the

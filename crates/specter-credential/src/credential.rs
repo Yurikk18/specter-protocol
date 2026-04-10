@@ -49,7 +49,7 @@ impl Attributes {
     }
 }
 
-/// An anonymous credential — a signed set of attribute commitments.
+/// An anonymous credential - a signed set of attribute commitments.
 #[derive(Clone, Debug)]
 pub struct Credential {
     /// Pedersen commitment to the attribute vector.

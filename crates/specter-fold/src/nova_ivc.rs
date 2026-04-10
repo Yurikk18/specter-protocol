@@ -1,7 +1,7 @@
-//! Nova IVC — true zero-knowledge recursive proof folding.
+//! Nova IVC - true zero-knowledge recursive proof folding.
 //!
 //! Each transfer step is verified inside a Nova StepCircuit.
-//! The proof is constant-size and zero-knowledge — verifiers learn
+//! The proof is constant-size and zero-knowledge - verifiers learn
 //! nothing about the transfer history except that it is valid.
 
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};

@@ -9,7 +9,7 @@
 //! 4. **Requester** unblinds: computes final signature (s, e').
 //!
 //! The signer never sees the message or the final signature.
-//! The signature is unlinkable — the signer cannot correlate signing sessions
+//! The signature is unlinkable - the signer cannot correlate signing sessions
 //! with observed signatures.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;

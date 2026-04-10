@@ -1,4 +1,4 @@
-//! Network node — integrates gossip, consensus, and the nullifier set.
+//! Network node - integrates gossip, consensus, and the nullifier set.
 
 use std::collections::HashMap;
 
@@ -39,7 +39,7 @@ impl NetworkNode {
         }
     }
 
-    /// Submit a nullifier — gossips + submits to consensus.
+    /// Submit a nullifier - gossips + submits to consensus.
     pub fn submit_nullifier(&mut self, nullifier: [u8; 32]) {
         self.gossip.broadcast_nullifier(nullifier);
         self.consensus.submit_nullifier(nullifier);

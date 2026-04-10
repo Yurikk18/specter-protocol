@@ -1,4 +1,4 @@
-//! Specter CLI — demo tool for the Proof-Carrying Token protocol.
+//! Specter CLI - demo tool for the Proof-Carrying Token protocol.
 
 use std::time::Instant;
 

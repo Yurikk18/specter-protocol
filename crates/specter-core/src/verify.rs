@@ -1,4 +1,4 @@
-//! Unified token verification — checks ALL properties of a PCT.
+//! Unified token verification - checks ALL properties of a PCT.
 
 use curve25519_dalek::RistrettoPoint;
 
@@ -11,7 +11,7 @@ use specter_primitives::scalar_utils::scalar_from_u64;
 use crate::mint;
 use crate::token::ProofCarryingToken;
 
-/// Result of token verification — individual checks and combined.
+/// Result of token verification - individual checks and combined.
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
     /// Whether the mint's blind signature is valid.

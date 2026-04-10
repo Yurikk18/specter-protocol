@@ -1,4 +1,4 @@
-//! Secure storage — encrypts wallet secrets at rest.
+//! Secure storage - encrypts wallet secrets at rest.
 //!
 //! Uses:
 //! - Argon2id for passphrase-based key derivation (memory-hard, GPU-resistant)
@@ -94,7 +94,7 @@ pub fn fingerprint(data: &EncryptedData) -> String {
 /// Errors for secure storage.
 #[derive(Debug, thiserror::Error)]
 pub enum SecureStoreError {
-    #[error("decryption failed — wrong passphrase or corrupted data")]
+    #[error("decryption failed - wrong passphrase or corrupted data")]
     DecryptionFailed,
 }
 
