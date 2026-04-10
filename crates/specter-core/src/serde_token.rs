@@ -197,6 +197,7 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
                 not_sanctioned,
                 jurisdiction,
                 age_over_18,
+                expires_at: 0,
             },
             signature_s,
             signature_e,
@@ -401,6 +402,7 @@ mod tests {
             not_sanctioned: true,
             jurisdiction: "EU".to_string(),
             age_over_18: true,
+            expires_at: 0,
         }
     }
 

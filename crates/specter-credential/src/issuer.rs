@@ -110,6 +110,7 @@ mod tests {
             not_sanctioned: true,
             jurisdiction: "EU".to_string(),
             age_over_18: true,
+            expires_at: 0,
         }
     }
 
@@ -129,12 +130,14 @@ mod tests {
             not_sanctioned: true,
             jurisdiction: "US".to_string(),
             age_over_18: true,
+            expires_at: 0,
         });
         let cred2 = issuer.issue(&Attributes {
             kyc_passed: true,
             not_sanctioned: true,
             jurisdiction: "BR".to_string(),
             age_over_18: false,
+            expires_at: 0,
         });
 
         assert!(verify_credential_signature(&cred1));

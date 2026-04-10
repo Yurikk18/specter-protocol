@@ -20,6 +20,7 @@ fn test_attrs() -> Attributes {
         not_sanctioned: true,
         jurisdiction: "EU".to_string(),
         age_over_18: true,
+            expires_at: 0,
     }
 }
 

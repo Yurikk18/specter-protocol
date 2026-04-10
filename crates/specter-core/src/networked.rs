@@ -214,6 +214,7 @@ mod tests {
             not_sanctioned: true,
             jurisdiction: "EU".to_string(),
             age_over_18: true,
+            expires_at: 0,
         };
         let bond_owner = [42u8; 32];
         node.bonds.deposit(bond_owner, 5000);

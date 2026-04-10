@@ -50,7 +50,7 @@ Sources: Zcash from [ECC blog](https://electriccoin.co/blog/reducing-shielded-pr
 ### Where Specter is behind (honestly)
 
 - **Token size is ~6x larger than Cashu**: Cashu proofs are ~65 bytes vs Specter's 413-1,039 bytes. The extra bytes carry fold proof, credentials, and VDF that Cashu does not have.
-- **Not deployed**: Specter is a protocol with 205 tests and a reference implementation. Cashu, Zcash, and Monero have years of production use.
+- **Not deployed**: Specter is a protocol with 221 tests and a reference implementation. Cashu, Zcash, and Monero have years of production use.
 - **BIS Project Tourbillon showed PQ blind signatures are 200x slower**: When Specter migrates to lattice primitives, performance will decrease significantly. The current benchmarks are on elliptic curves.
 
 ## Feature Comparison
@@ -93,7 +93,7 @@ Post-quantum protection only on the mint signature (long-lived, needs PQ). Class
 
 ## Security Details
 
-- **205 tests** across 8 crates, including property-based tests (proptest)
+- **221 tests** across 8 crates, including property-based tests (proptest)
 - **Schnorr-verified proofs**: Accumulator checks `s*G == R + e*PK` - forged proofs rejected
 - **Authenticated consensus**: Every vote carries a Schnorr signature verified against the voter's registered public key. Forged, tampered, and duplicate votes are rejected.
 - **Zeroize on drop**: Secret keys and blinding factors are wiped from memory when tokens go out of scope
@@ -111,7 +111,7 @@ Post-quantum protection only on the mint signature (long-lived, needs PQ). Class
 # Build
 cargo build --workspace
 
-# Run all 205 tests
+# Run all 221 tests
 cargo test --workspace
 
 # Run demo

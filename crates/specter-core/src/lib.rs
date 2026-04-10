@@ -1,6 +1,7 @@
 pub mod deterrence;
 pub mod mint;
 pub mod networked;
+pub mod renewal;
 pub mod nullifier;
 pub mod secure_store;
 pub mod serde_token;

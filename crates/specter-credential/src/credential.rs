@@ -17,6 +17,8 @@ pub struct Attributes {
     pub jurisdiction: String,
     /// Whether the holder is over 18.
     pub age_over_18: bool,
+    /// Credential expiry timestamp (Unix seconds). 0 = no expiry.
+    pub expires_at: u64,
 }
 
 impl Attributes {
@@ -76,6 +78,7 @@ mod tests {
             not_sanctioned: true,
             jurisdiction: "EU".to_string(),
             age_over_18: true,
+            expires_at: 0,
         };
         let scalars = attrs.to_scalars();
         assert_eq!(scalars.len(), 4);
