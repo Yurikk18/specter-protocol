@@ -114,11 +114,18 @@ impl Wallet {
         output
     }
 
-    /// Load a wallet from encrypted bytes.
+    /// Load a wallet from encrypted bytes and verify every token.
     ///
-    /// Decrypts with the passphrase and deserializes all tokens.
-    /// Returns an error if the passphrase is wrong or data is corrupted.
-    pub fn load(data: &[u8], passphrase: &[u8]) -> Result<Self, WalletError> {
+    /// Decrypts with the passphrase, deserializes all tokens,
+    /// and verifies each one against the mint's public key.
+    /// Rejects any token that fails verification (tampered or forged).
+    pub fn load(
+        data: &[u8],
+        passphrase: &[u8],
+        group_public_key: &curve25519_dalek::RistrettoPoint,
+        pedersen: &specter_primitives::pedersen::PedersenParams,
+        credential_pedersen: &specter_primitives::pedersen::PedersenParams,
+    ) -> Result<Self, WalletError> {
         if data.len() < 36 || &data[0..4] != b"SWLT" {
             return Err(WalletError::InvalidFormat);
         }
@@ -166,6 +173,18 @@ impl Wallet {
             }
             let token = crate::serde_token::deserialize_token(&payload[offset..offset + len])
                 .map_err(|e| WalletError::TokenError(e.to_string()))?;
+
+            // Verify the token before accepting it into the wallet
+            let vr = crate::verify::verify_token(
+                &token,
+                group_public_key,
+                pedersen,
+                credential_pedersen,
+            );
+            if !vr.all_valid() {
+                return Err(WalletError::TokenVerificationFailed);
+            }
+
             tokens.push(token);
             offset += len;
         }
@@ -179,6 +198,9 @@ impl Wallet {
 pub enum WalletError {
     #[error("invalid wallet file format")]
     InvalidFormat,
+
+    #[error("token verification failed: forged or tampered token")]
+    TokenVerificationFailed,
 
     #[error("wrong passphrase or corrupted data")]
     WrongPassphrase,
@@ -345,6 +367,10 @@ mod tests {
 
     // ─── Save/Load tests ────────────────────────────────────────────
 
+    fn load_wallet(mint: &Mint, data: &[u8], pass: &[u8]) -> Result<Wallet, WalletError> {
+        Wallet::load(data, pass, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen)
+    }
+
     #[test]
     fn test_save_load_roundtrip() {
         let mint = setup_mint();
@@ -353,7 +379,7 @@ mod tests {
         wallet.add_token(mint.issue(500, &[1, 2], None).unwrap());
 
         let data = wallet.save(b"my-passphrase");
-        let loaded = Wallet::load(&data, b"my-passphrase").unwrap();
+        let loaded = load_wallet(&mint, &data, b"my-passphrase").unwrap();
 
         assert_eq!(loaded.balance(), 600);
         assert_eq!(loaded.token_count(), 2);
@@ -366,15 +392,16 @@ mod tests {
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
 
         let data = wallet.save(b"correct");
-        let result = Wallet::load(&data, b"wrong");
+        let result = load_wallet(&mint, &data, b"wrong");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_save_load_empty_wallet() {
+        let mint = setup_mint();
         let wallet = Wallet::new();
         let data = wallet.save(b"pass");
-        let loaded = Wallet::load(&data, b"pass").unwrap();
+        let loaded = load_wallet(&mint, &data, b"pass").unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -388,7 +415,7 @@ mod tests {
         wallet.add_token(token);
 
         let data = wallet.save(b"pass");
-        let loaded = Wallet::load(&data, b"pass").unwrap();
+        let loaded = load_wallet(&mint, &data, b"pass").unwrap();
 
         let info = loaded.list_tokens();
         assert_eq!(info[0].value, 999);
@@ -402,11 +429,10 @@ mod tests {
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
 
         let mut data = wallet.save(b"pass");
-        // Tamper with encrypted data
         if data.len() > 40 {
             data[40] ^= 0xFF;
         }
-        let result = Wallet::load(&data, b"pass");
+        let result = load_wallet(&mint, &data, b"pass");
         assert!(result.is_err());
     }
 }

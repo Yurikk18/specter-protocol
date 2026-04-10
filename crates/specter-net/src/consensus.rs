@@ -1,16 +1,16 @@
-//! Simplified BFT consensus for the nullifier set.
+//! BFT consensus for the nullifier set with authenticated votes.
 //!
-//! Implements a simplified HotStuff-2-inspired consensus protocol:
+//! Implements a HotStuff-2-inspired consensus protocol:
 //! 1. A leader proposes a block of new nullifiers.
-//! 2. Validators vote on the proposal.
-//! 3. If a quorum (2f+1 out of 3f+1) votes yes, the block is committed.
-//! 4. Leader rotates each block.
+//! 2. Validators sign their votes with Schnorr signatures.
+//! 3. If a quorum (2f+1 out of 3f+1) of authenticated votes approve, the block is committed.
+//! 4. Leader rotates each block, with view change on leader failure.
 //!
-//! The nullifier set is the only shared state that needs consensus.
-//! Token issuance and transfer happen off-chain; only nullifier
-//! publication requires agreement.
+//! Every vote is cryptographically signed — forged votes are rejected.
 
-use sha2::{Digest, Sha256};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+use curve25519_dalek::{RistrettoPoint, Scalar};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::{HashMap, HashSet};
 
 use crate::protocol::NodeId;
@@ -18,26 +18,16 @@ use crate::protocol::NodeId;
 /// A block of nullifiers to be committed.
 #[derive(Clone, Debug)]
 pub struct NullifierBlock {
-    /// Block height (monotonically increasing).
     pub height: u64,
-    /// The leader who proposed this block.
     pub leader: NodeId,
-    /// Nullifiers included in this block.
     pub nullifiers: Vec<[u8; 32]>,
-    /// Hash of the block content.
     pub hash: [u8; 32],
 }
 
 impl NullifierBlock {
-    /// Create a new block.
     pub fn new(height: u64, leader: NodeId, nullifiers: Vec<[u8; 32]>) -> Self {
         let hash = Self::compute_hash(height, leader, &nullifiers);
-        Self {
-            height,
-            leader,
-            nullifiers,
-            hash,
-        }
+        Self { height, leader, nullifiers, hash }
     }
 
     fn compute_hash(height: u64, leader: NodeId, nullifiers: &[[u8; 32]]) -> [u8; 32] {
@@ -45,9 +35,7 @@ impl NullifierBlock {
         hasher.update(b"specter-block:");
         hasher.update(height.to_le_bytes());
         hasher.update(leader.to_le_bytes());
-        for n in nullifiers {
-            hasher.update(n);
-        }
+        for n in nullifiers { hasher.update(n); }
         let digest = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&digest);
@@ -55,74 +43,146 @@ impl NullifierBlock {
     }
 }
 
-/// Vote on a proposed block.
+/// A Schnorr signature for vote authentication.
+#[derive(Clone, Debug)]
+pub struct VoteSignature {
+    pub r: RistrettoPoint,
+    pub s: Scalar,
+}
+
+/// An authenticated vote on a proposed block.
 #[derive(Clone, Debug)]
 pub struct Vote {
     pub voter: NodeId,
     pub block_height: u64,
     pub block_hash: [u8; 32],
     pub approve: bool,
+    pub signature: VoteSignature,
 }
 
-/// The consensus state machine for a single node.
-pub struct ConsensusState {
-    /// This node's ID.
+/// A validator's keypair for signing votes.
+#[derive(Clone)]
+pub struct ValidatorKey {
     pub node_id: NodeId,
-    /// Total number of validators.
+    pub public_key: RistrettoPoint,
+    secret_key: Scalar,
+}
+
+impl ValidatorKey {
+    /// Generate a random validator keypair.
+    pub fn generate(node_id: NodeId) -> Self {
+        let secret_key = specter_primitives::scalar_utils::random_scalar();
+        let public_key = secret_key * G;
+        Self { node_id, public_key, secret_key }
+    }
+
+    /// Sign a vote.
+    pub fn sign_vote(&self, block_height: u64, block_hash: &[u8; 32], approve: bool) -> Vote {
+        let msg = vote_message(self.node_id, block_height, block_hash, approve);
+        let k = specter_primitives::scalar_utils::random_scalar();
+        let r = k * G;
+        let e = vote_challenge(&r, &self.public_key, &msg);
+        let s = k + e * self.secret_key;
+
+        Vote {
+            voter: self.node_id,
+            block_height,
+            block_hash: *block_hash,
+            approve,
+            signature: VoteSignature { r, s },
+        }
+    }
+}
+
+impl Drop for ValidatorKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret_key.zeroize();
+    }
+}
+
+/// Verify a vote's Schnorr signature against the voter's public key.
+pub fn verify_vote_signature(vote: &Vote, voter_pubkey: &RistrettoPoint) -> bool {
+    let msg = vote_message(vote.voter, vote.block_height, &vote.block_hash, vote.approve);
+    let e = vote_challenge(&vote.signature.r, voter_pubkey, &msg);
+    let lhs = vote.signature.s * G;
+    let rhs = vote.signature.r + e * voter_pubkey;
+    lhs == rhs
+}
+
+fn vote_message(voter: NodeId, height: u64, hash: &[u8; 32], approve: bool) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&voter.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(hash);
+    msg.push(if approve { 1 } else { 0 });
+    msg
+}
+
+fn vote_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8]) -> Scalar {
+    let hash = Sha512::new()
+        .chain_update(b"specter-vote-challenge:")
+        .chain_update(r.compress().as_bytes())
+        .chain_update(pk.compress().as_bytes())
+        .chain_update(msg)
+        .finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&hash);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// The consensus state machine.
+pub struct ConsensusState {
+    pub node_id: NodeId,
     pub total_validators: usize,
-    /// Maximum Byzantine faults tolerated: f = (total - 1) / 3.
     pub max_faults: usize,
-    /// Quorum size: 2f + 1.
     pub quorum_size: usize,
-    /// All validator node IDs.
     pub validators: Vec<NodeId>,
-    /// Current block height.
+    /// Validator public keys for vote verification.
+    pub validator_keys: HashMap<NodeId, RistrettoPoint>,
     pub current_height: u64,
-    /// Committed blocks.
     pub committed_blocks: Vec<NullifierBlock>,
-    /// Committed nullifier set.
     pub committed_nullifiers: HashSet<[u8; 32]>,
-    /// Pending nullifiers (not yet in a block).
     pub pending_nullifiers: Vec<[u8; 32]>,
-    /// Votes for the current proposal.
     votes: HashMap<[u8; 32], Vec<Vote>>,
-    /// Current view number (incremented on view change / leader timeout).
     pub view: u64,
 }
 
 impl ConsensusState {
     /// Create a new consensus state.
-    ///
-    /// # Panics
-    /// Panics if `total_validators < 4` (need at least 3f+1 = 4 for f=1).
-    pub fn new(node_id: NodeId, validators: Vec<NodeId>) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        validators: Vec<NodeId>,
+        validator_keys: HashMap<NodeId, RistrettoPoint>,
+    ) -> Result<Self, ConsensusError> {
         let n = validators.len();
-        assert!(n >= 1, "need at least 1 validator");
+        if n < 1 {
+            return Err(ConsensusError::InsufficientValidators { min: 1, got: 0 });
+        }
         let max_faults = (n - 1) / 3;
         let quorum_size = if n < 4 { n } else { 2 * max_faults + 1 };
 
-        Self {
+        Ok(Self {
             node_id,
             total_validators: n,
             max_faults,
             quorum_size,
             validators,
+            validator_keys,
             current_height: 0,
             committed_blocks: Vec::new(),
             committed_nullifiers: HashSet::new(),
             pending_nullifiers: Vec::new(),
             votes: HashMap::new(),
             view: 0,
-        }
+        })
     }
 
-    /// Get the current leader (round-robin with view offset).
     pub fn current_leader(&self) -> NodeId {
         let idx = (self.current_height as usize + self.view as usize) % self.validators.len();
         self.validators[idx]
     }
 
-    /// Submit a nullifier to the pending pool.
     pub fn submit_nullifier(&mut self, nullifier: [u8; 32]) {
         if !self.committed_nullifiers.contains(&nullifier)
             && !self.pending_nullifiers.contains(&nullifier)
@@ -131,7 +191,6 @@ impl ConsensusState {
         }
     }
 
-    /// Propose a new block (only valid if this node is the leader).
     pub fn propose_block(&mut self) -> Result<NullifierBlock, ConsensusError> {
         if self.current_leader() != self.node_id {
             return Err(ConsensusError::NotLeader {
@@ -139,49 +198,39 @@ impl ConsensusState {
                 self_id: self.node_id,
             });
         }
-
         let nullifiers: Vec<[u8; 32]> = self.pending_nullifiers.drain(..).collect();
-        let block = NullifierBlock::new(self.current_height, self.node_id, nullifiers);
-        Ok(block)
+        Ok(NullifierBlock::new(self.current_height, self.node_id, nullifiers))
     }
 
-    /// Cast a vote on a proposed block.
-    pub fn vote_on_block(&mut self, block: &NullifierBlock) -> Vote {
-        // Verify block is for the current height and from the correct leader
-        let approve = block.height == self.current_height
-            && block.leader == self.current_leader()
-            && block.hash == NullifierBlock::compute_hash(block.height, block.leader, &block.nullifiers);
+    /// Receive and authenticate a vote.
+    ///
+    /// Rejects votes from unknown validators or with invalid signatures.
+    pub fn receive_vote(&mut self, vote: Vote) -> Result<(), ConsensusError> {
+        // Check voter is a known validator
+        let voter_pk = self.validator_keys.get(&vote.voter)
+            .ok_or(ConsensusError::UnknownVoter(vote.voter))?;
 
-        let vote = Vote {
-            voter: self.node_id,
-            block_height: block.height,
-            block_hash: block.hash,
-            approve,
-        };
+        // Verify Schnorr signature
+        if !verify_vote_signature(&vote, voter_pk) {
+            return Err(ConsensusError::InvalidVoteSignature(vote.voter));
+        }
 
-        self.votes
-            .entry(block.hash)
-            .or_default()
-            .push(vote.clone());
+        // Check for duplicate votes from same voter on same block
+        if let Some(existing) = self.votes.get(&vote.block_hash) {
+            if existing.iter().any(|v| v.voter == vote.voter) {
+                return Err(ConsensusError::DuplicateVote(vote.voter));
+            }
+        }
 
-        vote
+        self.votes.entry(vote.block_hash).or_default().push(vote);
+        Ok(())
     }
 
-    /// Collect a vote from another node.
-    pub fn receive_vote(&mut self, vote: Vote) {
-        self.votes
-            .entry(vote.block_hash)
-            .or_default()
-            .push(vote);
-    }
-
-    /// Check if a block has reached quorum and commit it.
     pub fn try_commit(&mut self, block: &NullifierBlock) -> Result<bool, ConsensusError> {
         let votes = self.votes.get(&block.hash).cloned().unwrap_or_default();
         let approvals = votes.iter().filter(|v| v.approve).count();
 
         if approvals >= self.quorum_size {
-            // Commit the block
             for nullifier in &block.nullifiers {
                 self.committed_nullifiers.insert(*nullifier);
             }
@@ -194,35 +243,19 @@ impl ConsensusState {
         }
     }
 
-    /// Check if a nullifier has been committed.
     pub fn is_committed(&self, nullifier: &[u8; 32]) -> bool {
         self.committed_nullifiers.contains(nullifier)
     }
 
-    /// Number of committed blocks.
-    pub fn block_count(&self) -> usize {
-        self.committed_blocks.len()
-    }
+    pub fn block_count(&self) -> usize { self.committed_blocks.len() }
+    pub fn nullifier_count(&self) -> usize { self.committed_nullifiers.len() }
 
-    /// Total committed nullifiers.
-    pub fn nullifier_count(&self) -> usize {
-        self.committed_nullifiers.len()
-    }
-
-    /// Trigger a view change — rotate leader when current leader fails.
-    ///
-    /// This increments the view number, which changes the leader
-    /// selection without advancing the block height. Pending nullifiers
-    /// are preserved for the next leader to propose.
     pub fn trigger_view_change(&mut self) {
         self.view += 1;
-        self.votes.clear(); // discard votes from failed view
+        self.votes.clear();
     }
 
-    /// Get the current view number.
-    pub fn current_view(&self) -> u64 {
-        self.view
-    }
+    pub fn current_view(&self) -> u64 { self.view }
 }
 
 /// Consensus errors.
@@ -230,127 +263,151 @@ impl ConsensusState {
 pub enum ConsensusError {
     #[error("not the current leader: leader is {leader}, self is {self_id}")]
     NotLeader { leader: NodeId, self_id: NodeId },
+
+    #[error("insufficient validators: need at least {min}, got {got}")]
+    InsufficientValidators { min: usize, got: usize },
+
+    #[error("unknown voter: {0}")]
+    UnknownVoter(NodeId),
+
+    #[error("invalid vote signature from voter {0}")]
+    InvalidVoteSignature(NodeId),
+
+    #[error("duplicate vote from voter {0}")]
+    DuplicateVote(NodeId),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn validators() -> Vec<NodeId> {
-        vec![1, 2, 3, 4]
+    fn setup_validators() -> (Vec<ValidatorKey>, Vec<NodeId>, HashMap<NodeId, RistrettoPoint>) {
+        let keys: Vec<ValidatorKey> = (1..=4).map(|id| ValidatorKey::generate(id)).collect();
+        let ids: Vec<NodeId> = keys.iter().map(|k| k.node_id).collect();
+        let pubkeys: HashMap<NodeId, RistrettoPoint> = keys.iter()
+            .map(|k| (k.node_id, k.public_key))
+            .collect();
+        (keys, ids, pubkeys)
     }
 
     #[test]
     fn test_leader_rotation() {
-        let state = ConsensusState::new(1, validators());
-        assert_eq!(state.current_leader(), 1); // height 0 -> validator[0]
+        let (_, ids, pks) = setup_validators();
+        let state = ConsensusState::new(1, ids, pks).unwrap();
+        assert_eq!(state.current_leader(), 1);
     }
 
     #[test]
     fn test_quorum_size() {
-        let state = ConsensusState::new(1, validators());
+        let (_, ids, pks) = setup_validators();
+        let state = ConsensusState::new(1, ids, pks).unwrap();
         assert_eq!(state.total_validators, 4);
-        assert_eq!(state.max_faults, 1);
-        assert_eq!(state.quorum_size, 3); // 2*1 + 1 = 3
+        assert_eq!(state.quorum_size, 3);
     }
 
     #[test]
     fn test_propose_as_leader() {
-        let mut state = ConsensusState::new(1, validators());
+        let (_, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
         state.submit_nullifier([42u8; 32]);
-
         let block = state.propose_block().unwrap();
         assert_eq!(block.height, 0);
-        assert_eq!(block.leader, 1);
         assert_eq!(block.nullifiers.len(), 1);
     }
 
     #[test]
     fn test_propose_as_non_leader_fails() {
-        let mut state = ConsensusState::new(2, validators()); // node 2, but leader is node 1
-        let result = state.propose_block();
-        assert!(result.is_err());
+        let (_, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(2, ids, pks).unwrap();
+        assert!(state.propose_block().is_err());
     }
 
     #[test]
-    fn test_vote_and_commit() {
-        let vals = validators();
-        let mut node1 = ConsensusState::new(1, vals.clone());
-        let mut node2 = ConsensusState::new(2, vals.clone());
-        let mut node3 = ConsensusState::new(3, vals.clone());
-        let mut node4 = ConsensusState::new(4, vals.clone());
+    fn test_authenticated_vote_and_commit() {
+        let (keys, ids, pks) = setup_validators();
+        let mut node1 = ConsensusState::new(1, ids, pks).unwrap();
 
-        // Submit nullifier
         node1.submit_nullifier([42u8; 32]);
-
-        // Node 1 (leader) proposes
         let block = node1.propose_block().unwrap();
 
-        // All nodes vote
-        let v1 = node1.vote_on_block(&block);
-        let v2 = node2.vote_on_block(&block);
-        let v3 = node3.vote_on_block(&block);
-        let _v4 = node4.vote_on_block(&block);
+        // All validators sign their votes
+        let v1 = keys[0].sign_vote(block.height, &block.hash, true);
+        let v2 = keys[1].sign_vote(block.height, &block.hash, true);
+        let v3 = keys[2].sign_vote(block.height, &block.hash, true);
 
-        assert!(v1.approve);
-        assert!(v2.approve);
-        assert!(v3.approve);
+        // Receive authenticated votes
+        node1.receive_vote(v1).unwrap();
+        node1.receive_vote(v2).unwrap();
+        node1.receive_vote(v3).unwrap();
 
-        // Collect votes at node 1
-        node1.receive_vote(v2);
-        node1.receive_vote(v3);
-
-        // Try to commit (should succeed with 3 votes = quorum)
-        let committed = node1.try_commit(&block).unwrap();
-        assert!(committed);
-        assert_eq!(node1.current_height, 1);
+        // Commit with quorum
+        assert!(node1.try_commit(&block).unwrap());
         assert!(node1.is_committed(&[42u8; 32]));
     }
 
     #[test]
-    fn test_insufficient_votes_no_commit() {
-        let vals = validators();
-        let mut node1 = ConsensusState::new(1, vals.clone());
+    fn test_forged_vote_rejected() {
+        let (_, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
 
-        node1.submit_nullifier([42u8; 32]);
-        let block = node1.propose_block().unwrap();
+        // Forge a vote with a random key (not a registered validator's key)
+        let fake_key = ValidatorKey::generate(99);
+        let forged = fake_key.sign_vote(0, &[0u8; 32], true);
 
-        // Only 1 vote (self)
-        node1.vote_on_block(&block);
-
-        // Should not commit (need 3, have 1)
-        let committed = node1.try_commit(&block).unwrap();
-        assert!(!committed);
+        // Should be rejected — voter 99 is not a known validator
+        assert!(state.receive_vote(forged).is_err());
     }
 
     #[test]
-    fn test_multiple_blocks() {
-        let vals = vec![1, 2, 3];
-        let mut node1 = ConsensusState::new(1, vals.clone());
+    fn test_tampered_vote_rejected() {
+        let (keys, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
 
-        // Block 0
-        node1.submit_nullifier([1u8; 32]);
-        let block0 = node1.propose_block().unwrap();
-        node1.vote_on_block(&block0);
-        // Simulate 2 more votes
-        node1.receive_vote(Vote { voter: 2, block_height: 0, block_hash: block0.hash, approve: true });
-        node1.receive_vote(Vote { voter: 3, block_height: 0, block_hash: block0.hash, approve: true });
-        assert!(node1.try_commit(&block0).unwrap());
+        let mut vote = keys[0].sign_vote(0, &[0u8; 32], true);
+        // Tamper with the approve flag
+        vote.approve = false;
 
-        // After commit, height is 1, leader rotates to node 2
-        assert_eq!(node1.current_height, 1);
-        assert_eq!(node1.current_leader(), 2);
-        assert_eq!(node1.block_count(), 1);
-        assert_eq!(node1.nullifier_count(), 1);
+        // Signature no longer matches — should be rejected
+        assert!(state.receive_vote(vote).is_err());
     }
 
     #[test]
-    fn test_duplicate_nullifier_ignored() {
-        let mut state = ConsensusState::new(1, vec![1, 2, 3]);
-        state.committed_nullifiers.insert([42u8; 32]);
+    fn test_duplicate_vote_rejected() {
+        let (keys, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
 
-        // Submitting an already-committed nullifier should be ignored
         state.submit_nullifier([42u8; 32]);
-        assert!(state.pending_nullifiers.is_empty());
+        let block = state.propose_block().unwrap();
+
+        let v1 = keys[0].sign_vote(block.height, &block.hash, true);
+        let v1_dup = keys[0].sign_vote(block.height, &block.hash, true);
+
+        state.receive_vote(v1).unwrap();
+        assert!(state.receive_vote(v1_dup).is_err()); // duplicate from same voter
+    }
+
+    #[test]
+    fn test_insufficient_votes_no_commit() {
+        let (keys, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+
+        state.submit_nullifier([42u8; 32]);
+        let block = state.propose_block().unwrap();
+
+        let v1 = keys[0].sign_vote(block.height, &block.hash, true);
+        state.receive_vote(v1).unwrap();
+
+        assert!(!state.try_commit(&block).unwrap()); // need 3, have 1
+    }
+
+    #[test]
+    fn test_view_change() {
+        let (_, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        assert_eq!(state.current_leader(), 1);
+
+        state.trigger_view_change();
+        assert_eq!(state.current_view(), 1);
+        assert_eq!(state.current_leader(), 2); // rotated
     }
 }

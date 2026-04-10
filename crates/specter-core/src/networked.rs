@@ -5,7 +5,7 @@
 //! commits nullifiers in blocks.
 
 use specter_credential::credential::Attributes;
-use specter_net::consensus::Vote;
+use specter_net::consensus::{ValidatorKey, Vote};
 use specter_net::node::NetworkNode;
 use specter_net::protocol::NodeId;
 use specter_offline::bonds::BondRegistry;
@@ -23,16 +23,16 @@ pub struct NetworkedNode {
 }
 
 impl NetworkedNode {
-    /// Create a new networked node.
+    /// Create a new networked node with validator keys.
     pub fn new(
         node_id: NodeId,
         peers: Vec<NodeId>,
-        validators: Vec<NodeId>,
+        validator_keys: Vec<ValidatorKey>,
         mint_config: MintConfig,
     ) -> Self {
         Self {
             mint: Mint::setup(mint_config),
-            network: NetworkNode::new(node_id, peers, validators),
+            network: NetworkNode::new(node_id, peers, validator_keys),
             bonds: BondRegistry::new(),
         }
     }
@@ -96,12 +96,12 @@ impl NetworkedNode {
             .map_err(|e| e.to_string())
     }
 
-    /// Vote on a proposed block.
-    pub fn vote_on_block(
-        &mut self,
+    /// Sign a vote on a proposed block using this node's validator key.
+    pub fn sign_vote(
+        &self,
         block: &specter_net::consensus::NullifierBlock,
     ) -> Vote {
-        self.network.consensus.vote_on_block(block)
+        self.network.sign_vote(block.height, &block.hash, true)
     }
 
     /// Try to commit a block if quorum is reached.
@@ -115,9 +115,9 @@ impl NetworkedNode {
             .map_err(|e| e.to_string())
     }
 
-    /// Receive a vote from another node.
-    pub fn receive_vote(&mut self, vote: Vote) {
-        self.network.consensus.receive_vote(vote);
+    /// Receive and authenticate a vote from another node.
+    pub fn receive_vote(&mut self, vote: Vote) -> Result<(), String> {
+        self.network.consensus.receive_vote(vote).map_err(|e| e.to_string())
     }
 }
 
@@ -125,11 +125,19 @@ impl NetworkedNode {
 mod tests {
     use super::*;
 
-    fn make_node(id: NodeId) -> NetworkedNode {
+    fn make_keys() -> Vec<ValidatorKey> {
+        vec![
+            ValidatorKey::generate(1),
+            ValidatorKey::generate(2),
+            ValidatorKey::generate(3),
+        ]
+    }
+
+    fn make_node(id: NodeId, keys: Vec<ValidatorKey>) -> NetworkedNode {
         NetworkedNode::new(
             id,
             vec![1, 2, 3].into_iter().filter(|&x| x != id).collect(),
-            vec![1, 2, 3],
+            keys,
             MintConfig {
                 threshold: 2,
                 total_signers: 3,
@@ -140,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_mint_and_verify() {
-        let mut node = make_node(1);
+        let mut node = make_node(1, make_keys());
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
         let vr = node.verify_token(&token);
         assert!(vr.all_valid());
@@ -148,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_transfer_broadcasts_nullifier() {
-        let mut node = make_node(1);
+        let mut node = make_node(1, make_keys());
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
 
         let result = node.transfer_token(&token).unwrap();
@@ -163,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_double_spend_via_network() {
-        let mut node = make_node(1);
+        let mut node = make_node(1, make_keys());
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
 
         let r1 = node.transfer_token(&token).unwrap();
@@ -173,35 +181,32 @@ mod tests {
 
     #[test]
     fn test_consensus_flow() {
-        let mut node1 = make_node(1);
-        let mut node2 = make_node(2);
-        let mut node3 = make_node(3);
+        let keys = make_keys();
+        let mut node1 = make_node(1, keys.clone());
+        let node2 = make_node(2, keys.clone());
+        let node3 = make_node(3, keys);
 
-        // Mint and transfer on node1
         let token = node1.mint_token(1000, &[1, 2], None, None, None).unwrap();
         let result = node1.transfer_token(&token).unwrap();
 
-        // Node1 is leader (height 0), proposes block
         let block = node1.propose_block().unwrap();
 
-        // All nodes vote
-        let v1 = node1.vote_on_block(&block);
-        let v2 = node2.vote_on_block(&block);
-        let v3 = node3.vote_on_block(&block);
+        // Authenticated votes
+        let v1 = node1.network.sign_vote(block.height, &block.hash, true);
+        let v2 = node2.network.sign_vote(block.height, &block.hash, true);
+        let v3 = node3.network.sign_vote(block.height, &block.hash, true);
 
-        // Collect votes at node1
-        node1.receive_vote(v2);
-        node1.receive_vote(v3);
+        node1.receive_vote(v1).unwrap();
+        node1.receive_vote(v2).unwrap();
+        node1.receive_vote(v3).unwrap();
 
-        // Commit
-        let committed = node1.try_commit(&block).unwrap();
-        assert!(committed);
+        assert!(node1.try_commit(&block).unwrap());
         assert!(node1.network.consensus.is_committed(&result.spent_nullifier));
     }
 
     #[test]
     fn test_full_networked_lifecycle() {
-        let mut node = make_node(1);
+        let mut node = make_node(1, make_keys());
 
         // Issue with all features
         let attrs = Attributes {
