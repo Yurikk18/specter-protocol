@@ -240,8 +240,20 @@ pub fn verify_accumulated_proof(
 
         // Recompute challenge from stored proof fields and verify it matches.
         // This binds the challenge to (state_hash, PK, pk_chain_hash, R, steps)
-        // via Fiat-Shamir. An attacker cannot satisfy both the Schnorr equation
-        // AND the challenge binding without knowing the DLP of PK.
+        // via Fiat-Shamir. Combined with the Schnorr equation, this proves the
+        // prover knew the DLP of PK at proof creation time.
+        //
+        // KNOWN LIMITATION: An attacker who chooses their OWN keypair (knows DLP
+        // of a self-generated PK) can forge proofs for step > 0. The verifier
+        // cannot distinguish a legitimately-derived PK from an attacker-chosen one
+        // without access to intermediate transfer state data. This is a fundamental
+        // limitation of constant-size Schnorr-based fold proofs.
+        //
+        // For cryptographic soundness against PK forgery, use the Nova IVC module
+        // (nova_ivc.rs) which provides true recursive SNARK verification.
+        // The primary defense against transfer history forgery in Specter is the
+        // mint's blind signature (unforgeable) and the nullifier set (prevents
+        // double-spend), not the fold proof alone.
         let expected_e = compute_fold_challenge(
             &proof.state_hash,
             &proof.pk,

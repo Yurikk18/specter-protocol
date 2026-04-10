@@ -149,7 +149,8 @@ impl AttestationChain {
         sender_pubkey: RistrettoPoint,
         receiver_hash: [u8; 32],
     ) {
-        let position = self.attestations.len() as u32;
+        let position: u32 = self.attestations.len().try_into()
+            .expect("attestation chain exceeded u32::MAX entries");
         let prev_hash = self
             .attestations
             .last()

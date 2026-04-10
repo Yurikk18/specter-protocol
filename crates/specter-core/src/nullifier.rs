@@ -66,6 +66,16 @@ impl NullifierSet {
     pub fn with_file(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref();
 
+        // Reject path traversal components for security
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path traversal (..) not allowed in nullifier file path",
+                ));
+            }
+        }
+
         // Open for reading + appending, creating if it does not exist.
         let mut file = OpenOptions::new()
             .read(true)
@@ -73,8 +83,18 @@ impl NullifierSet {
             .create(true)
             .open(path)?;
 
+        // Check file size before reading (prevent OOM from huge files)
+        const MAX_NULLIFIER_FILE_SIZE: u64 = 32 * 10_000_000; // ~320MB, 10M nullifiers
+        let metadata = file.metadata()?;
+        if metadata.len() > MAX_NULLIFIER_FILE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("nullifier file too large: {} bytes", metadata.len()),
+            ));
+        }
+
         // Read existing contents to reconstruct the set.
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(metadata.len() as usize);
         file.read_to_end(&mut buf)?;
 
         if buf.len() % 32 != 0 {
@@ -109,8 +129,11 @@ impl NullifierSet {
             return false; // already known
         }
         if let Some(ref mut file) = self.file {
-            file.write_all(&nullifier).expect("failed to write nullifier");
-            file.flush().expect("failed to flush nullifier");
+            // Gracefully handle I/O errors — keep nullifier in memory even if disk fails
+            if let Err(e) = file.write_all(&nullifier).and_then(|_| file.flush()) {
+                eprintln!("WARNING: failed to persist nullifier to disk: {}", e);
+                // Nullifier is still in the in-memory set, preventing double-spend
+            }
         }
         true
     }

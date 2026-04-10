@@ -24,18 +24,35 @@ use specter_core::wallet::Wallet;
 const WALLET_FILE: &str = "specter_wallet.dat";
 const DEFAULT_PASSPHRASE: &[u8] = b"specter-dev-only";
 
-/// Get wallet passphrase from environment or use dev-mode default.
-/// In production, this MUST prompt the user or read from a secure source.
+/// Get wallet passphrase from environment.
+/// In debug builds, falls back to a dev-mode default with a warning.
+/// In release builds, refuses to proceed without a valid passphrase.
 fn get_passphrase() -> Vec<u8> {
     match std::env::var("SPECTER_PASSPHRASE") {
         Ok(p) if p.len() >= 8 => p.into_bytes(),
         Ok(_) => {
-            eprintln!("Warning: SPECTER_PASSPHRASE too short (min 8 chars), using dev default");
-            DEFAULT_PASSPHRASE.to_vec()
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("Warning: SPECTER_PASSPHRASE too short, using dev default");
+                DEFAULT_PASSPHRASE.to_vec()
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                eprintln!("Error: SPECTER_PASSPHRASE must be at least 8 characters");
+                std::process::exit(1);
+            }
         }
         Err(_) => {
-            eprintln!("Warning: SPECTER_PASSPHRASE not set, using dev-mode passphrase");
-            DEFAULT_PASSPHRASE.to_vec()
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("Warning: SPECTER_PASSPHRASE not set, using dev-mode passphrase");
+                DEFAULT_PASSPHRASE.to_vec()
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                eprintln!("Error: SPECTER_PASSPHRASE environment variable must be set");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -219,40 +236,67 @@ fn cmd_load() {
 /// Perform ECDH key exchange and derive a shared ChaCha20-Poly1305 key.
 /// Protocol: each side sends their ephemeral public key (32 bytes),
 /// then both derive shared_secret = SHA-256(my_sk * their_pk).
+/// Perform ECDH key exchange with timeouts and key zeroization.
+///
+/// WARNING: This is an anonymous (unauthenticated) DH exchange. It protects
+/// against passive eavesdropping but NOT against active MitM attacks.
+/// For production use, add mutual authentication (e.g., sign the transcript
+/// with long-term node keys, or use a Noise protocol pattern like NK/KK).
 fn dh_handshake(stream: &mut std::net::TcpStream, is_initiator: bool) -> Option<[u8; 32]> {
     use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
     use std::io::{Read, Write};
+    use std::time::Duration;
+    use zeroize::Zeroize;
 
-    let my_sk = specter_primitives::scalar_utils::random_scalar();
+    // Set timeouts to prevent slow-peer DoS
+    let timeout = Some(Duration::from_secs(30));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+
+    let mut my_sk = specter_primitives::scalar_utils::random_scalar();
     let my_pk = (my_sk * G).compress();
 
-    if is_initiator {
-        // Initiator sends first, then receives
-        if stream.write_all(my_pk.as_bytes()).is_err() { return None; }
-        if stream.flush().is_err() { return None; }
-        let mut their_pk_bytes = [0u8; 32];
-        if stream.read_exact(&mut their_pk_bytes).is_err() { return None; }
-        let their_pk = curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
-            .decompress()?;
-        let shared = my_sk * their_pk;
-        let key = sha2::Sha256::digest(shared.compress().as_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&key);
-        Some(out)
+    let result = if is_initiator {
+        if stream.write_all(my_pk.as_bytes()).is_err() { None }
+        else if stream.flush().is_err() { None }
+        else {
+            let mut their_pk_bytes = [0u8; 32];
+            if stream.read_exact(&mut their_pk_bytes).is_err() { None }
+            else {
+                curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
+                    .decompress()
+                    .map(|their_pk| {
+                        let shared = my_sk * their_pk;
+                        let key = sha2::Sha256::digest(shared.compress().as_bytes());
+                        let mut out = [0u8; 32];
+                        out.copy_from_slice(&key);
+                        out
+                    })
+            }
+        }
     } else {
-        // Responder receives first, then sends
         let mut their_pk_bytes = [0u8; 32];
-        if stream.read_exact(&mut their_pk_bytes).is_err() { return None; }
-        let their_pk = curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
-            .decompress()?;
-        if stream.write_all(my_pk.as_bytes()).is_err() { return None; }
-        if stream.flush().is_err() { return None; }
-        let shared = my_sk * their_pk;
-        let key = sha2::Sha256::digest(shared.compress().as_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&key);
-        Some(out)
-    }
+        if stream.read_exact(&mut their_pk_bytes).is_err() { None }
+        else {
+            let their_pk = curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
+                .decompress();
+            if their_pk.is_none() { None }
+            else if stream.write_all(my_pk.as_bytes()).is_err() { None }
+            else if stream.flush().is_err() { None }
+            else {
+                let their_pk = their_pk.unwrap();
+                let shared = my_sk * their_pk;
+                let key = sha2::Sha256::digest(shared.compress().as_bytes());
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&key);
+                Some(out)
+            }
+        }
+    };
+
+    // Zeroize ephemeral secret key
+    my_sk.zeroize();
+    result
 }
 
 /// Encrypt bytes with a shared key using ChaCha20-Poly1305.

@@ -1275,6 +1275,7 @@ dependencies = [
  "specter-core",
  "specter-credential",
  "specter-primitives",
+ "zeroize",
 ]
 
 [[package]]

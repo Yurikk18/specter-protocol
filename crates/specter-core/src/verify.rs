@@ -89,10 +89,14 @@ pub fn verify_token(
     let fold_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
 
     // 5. Verify credential presentation (if present) + check expiry
+    // Note: current_time == 0 means "skip expiry check" (for testing or when time is unavailable).
+    // When current_time > 0 and expires_at > 0, enforce expiry strictly.
     let credential_valid = token.presentation.as_ref().map(|pres| {
         let sig_valid = presentation::verify_presentation(pres, credential_pedersen);
         let not_expired = token.credential.as_ref().map_or(true, |cred| {
-            cred.attributes.expires_at == 0 || current_time <= cred.attributes.expires_at
+            cred.attributes.expires_at == 0
+                || current_time == 0  // caller explicitly opted out of time check
+                || current_time <= cred.attributes.expires_at
         });
         sig_valid && not_expired
     });

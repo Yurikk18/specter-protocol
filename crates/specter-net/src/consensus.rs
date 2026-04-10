@@ -185,8 +185,10 @@ impl ConsensusState {
     }
 
     pub fn current_leader(&self) -> NodeId {
-        let idx = (self.current_height as usize + self.view as usize) % self.validators.len();
-        self.validators[idx]
+        // Use modular arithmetic before addition to prevent overflow on 32-bit platforms
+        let n = self.validators.len() as u64;
+        let idx = ((self.current_height % n) + (self.view % n)) % n;
+        self.validators[idx as usize]
     }
 
     pub fn submit_nullifier(&mut self, nullifier: [u8; 32]) {
