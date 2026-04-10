@@ -146,23 +146,49 @@ pub fn fold_transfer(
     })
 }
 
-/// Verify an accumulated proof by checking the Schnorr equation: s*G == R + e*PK.
+/// Verify an accumulated proof.
 ///
-/// Uses the PK embedded in the proof. The verifier checks:
-/// 1. The Schnorr equation holds: s*G == R + e*PK
-/// 2. The state_hash is non-zero (proof was properly constructed)
+/// Checks:
+/// 1. Schnorr equation: s*G == R + e*PK
+/// 2. For genesis (step 0): PK is correctly derived from genesis_state
+/// 3. For genesis: challenge was computed via the correct transcript
+/// 4. state_hash is non-zero
 pub fn verify_accumulated_proof(
     proof: &AccumulatedProof,
-    _genesis_state: &TransferState,
+    genesis_state: &TransferState,
 ) -> bool {
     if proof.state_hash == [0u8; 32] {
         return false;
     }
 
-    // THE critical Schnorr check: s*G must equal R + e*PK
+    // Schnorr equation check
     let lhs = proof.s * G;
     let rhs = proof.r + proof.e * proof.pk;
-    lhs == rhs
+    if lhs != rhs {
+        return false;
+    }
+
+    // For genesis proofs: verify PK derivation and transcript
+    if proof.steps == 0 {
+        let state_bytes = genesis_state.to_bytes();
+        let expected_secret = derive_proof_secret(&state_bytes);
+        let expected_pk = expected_secret * G;
+        if proof.pk != expected_pk {
+            return false;
+        }
+
+        // Verify the challenge was computed from the correct transcript
+        let mut transcript = Transcript::new(b"specter-fold-genesis");
+        transcript.absorb(b"state", &state_bytes);
+        transcript.absorb(b"PK", proof.pk.compress().as_bytes());
+        transcript.absorb(b"R", proof.r.compress().as_bytes());
+        let expected_e = transcript.challenge(b"genesis-challenge");
+        if proof.e != expected_e {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Errors during fold operations.

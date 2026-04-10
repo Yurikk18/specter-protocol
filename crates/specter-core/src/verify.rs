@@ -69,10 +69,19 @@ pub fn verify_token(
     // 3. Check transfer count
     let within_bound = token.transfer_count <= token.recursion_bound;
 
-    // 4. Verify fold proof (checks Schnorr equation: s*G == R + e*PK)
+    // 4. Verify fold proof
+    // For genesis proofs (step 0), reconstruct the genesis state from the token
+    // to verify PK derivation and transcript. For folded proofs (step > 0),
+    // the Schnorr equation s*G == R + e*PK provides structural integrity.
+    let mut genesis_owner_hash = [0u8; 32];
+    if token.fold_proof.steps == 0 {
+        genesis_owner_hash.copy_from_slice(
+            &specter_primitives::scalar_utils::hash_to_scalar(&token.owner_secret).as_bytes()[..32],
+        );
+    }
     let genesis_state = accumulator::TransferState {
         token_id: token.token_id,
-        owner_hash: [0u8; 32],
+        owner_hash: genesis_owner_hash,
         step: 0,
     };
     let fold_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);

@@ -68,6 +68,62 @@ impl PedersenParams {
 
         RistrettoPoint::multiscalar_mul(&scalars, &points)
     }
+
+    /// Create a ZK proof that a commitment contains a specific value,
+    /// WITHOUT revealing the blinding factor.
+    ///
+    /// Proves knowledge of r such that C = v*G + r*H.
+    pub fn prove_value(&self, _value: &Scalar, blinding: &Scalar) -> ValueProof {
+        let t = crate::scalar_utils::random_scalar();
+        let t_commit = t * self.h;
+
+        let challenge = value_proof_challenge(&self.h, &(*blinding * self.h), &t_commit);
+        let response = t + challenge * blinding;
+
+        ValueProof {
+            commitment: t_commit,
+            response,
+        }
+    }
+
+    /// Verify a ZK proof that a commitment contains a claimed value.
+    pub fn verify_value_proof(
+        &self,
+        token_commitment: &RistrettoPoint,
+        claimed_value: &Scalar,
+        proof: &ValueProof,
+    ) -> bool {
+        let c_minus_vg = token_commitment - claimed_value * self.g;
+        let challenge = value_proof_challenge(&self.h, &c_minus_vg, &proof.commitment);
+        let lhs = proof.response * self.h;
+        let rhs = proof.commitment + challenge * c_minus_vg;
+        lhs == rhs
+    }
+}
+
+/// ZK proof that a Pedersen commitment opens to a specific value
+/// without revealing the blinding factor.
+#[derive(Clone, Debug)]
+pub struct ValueProof {
+    pub commitment: RistrettoPoint,
+    pub response: Scalar,
+}
+
+fn value_proof_challenge(
+    h: &RistrettoPoint,
+    statement: &RistrettoPoint,
+    nonce: &RistrettoPoint,
+) -> Scalar {
+    use sha2::{Digest, Sha512};
+    let hash = Sha512::new()
+        .chain_update(b"specter-value-proof:")
+        .chain_update(h.compress().as_bytes())
+        .chain_update(statement.compress().as_bytes())
+        .chain_update(nonce.compress().as_bytes())
+        .finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&hash);
+    Scalar::from_bytes_mod_order_wide(&wide)
 }
 
 impl Default for PedersenParams {
