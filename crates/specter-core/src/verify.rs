@@ -69,10 +69,10 @@ pub fn verify_token(
     // 3. Check transfer count
     let within_bound = token.transfer_count <= token.recursion_bound;
 
-    // 4. Verify fold proof
+    // 4. Verify fold proof (checks Schnorr equation: s*G == R + e*PK)
     let genesis_state = accumulator::TransferState {
         token_id: token.token_id,
-        owner_hash: [0u8; 32], // genesis owner hash isn't checked in verify
+        owner_hash: [0u8; 32],
         step: 0,
     };
     let fold_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);

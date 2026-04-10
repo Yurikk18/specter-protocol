@@ -79,7 +79,10 @@ impl BondRegistry {
         if !bond.active {
             return false;
         }
-        bond.amount >= bond.offline_exposure + token_value
+        match bond.offline_exposure.checked_add(token_value) {
+            Some(total) => bond.amount >= total,
+            None => false, // overflow = exposure exceeds any possible bond
+        }
     }
 
     /// Register offline spending — increase the owner's exposure.
@@ -100,9 +103,15 @@ impl BondRegistry {
         if !bond.active {
             return Err(BondError::BondSlashed);
         }
-        if bond.amount < bond.offline_exposure + amount {
+        let total_exposure = bond.offline_exposure.checked_add(amount).ok_or(
+            BondError::InsufficientBond {
+                available: bond.amount.saturating_sub(bond.offline_exposure),
+                needed: amount,
+            },
+        )?;
+        if bond.amount < total_exposure {
             return Err(BondError::InsufficientBond {
-                available: bond.amount - bond.offline_exposure,
+                available: bond.amount.saturating_sub(bond.offline_exposure),
                 needed: amount,
             });
         }

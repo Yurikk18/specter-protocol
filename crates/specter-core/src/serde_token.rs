@@ -68,6 +68,7 @@ pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
     write_scalar(&mut buf, &token.fold_proof.s);                     // 32
     write_scalar(&mut buf, &token.fold_proof.e);                     // 32
     write_point(&mut buf, &token.fold_proof.r);                      // 32
+    write_point(&mut buf, &token.fold_proof.pk);                     // 32
     buf.extend_from_slice(&token.fold_proof.state_hash);             // 32
     buf.extend_from_slice(&token.fold_proof.steps.to_le_bytes());    // 4
 
@@ -170,6 +171,7 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
     let fold_s = read_scalar(data, &mut pos)?;
     let fold_e = read_scalar(data, &mut pos)?;
     let fold_r = read_point(data, &mut pos)?;
+    let fold_pk = read_point(data, &mut pos)?;
     let fold_state_hash = read_array32(data, &mut pos)?;
     let fold_steps = read_u32(data, &mut pos)?;
 
@@ -274,6 +276,7 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
             s: fold_s,
             e: fold_e,
             r: fold_r,
+            pk: fold_pk,
             state_hash: fold_state_hash,
             steps: fold_steps,
         },

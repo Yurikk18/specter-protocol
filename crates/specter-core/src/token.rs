@@ -22,7 +22,7 @@ use specter_offline::vdf::VdfProof;
 ///
 /// This is the fundamental unit of value in the Specter protocol.
 /// It is a bearer instrument: whoever holds it can spend it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProofCarryingToken {
     /// Unique token identifier (32 bytes, random).
     pub token_id: [u8; 32],
@@ -66,6 +66,22 @@ pub struct ProofCarryingToken {
     /// Bond owner ID (hash of the staker's public key).
     /// If present, the token's offline spending is backed by a bond.
     pub bond_owner_id: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for ProofCarryingToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProofCarryingToken")
+            .field("token_id", &hex::encode(self.token_id))
+            .field("value", &self.value)
+            .field("owner_secret", &"[REDACTED]")
+            .field("value_blinding", &"[REDACTED]")
+            .field("transfer_count", &self.transfer_count)
+            .field("recursion_bound", &self.recursion_bound)
+            .field("has_credential", &self.credential.is_some())
+            .field("has_vdf", &self.vdf_proof.is_some())
+            .field("has_bond", &self.bond_owner_id.is_some())
+            .finish()
+    }
 }
 
 impl ProofCarryingToken {
@@ -121,9 +137,7 @@ impl ProofCarryingToken {
 impl Drop for ProofCarryingToken {
     fn drop(&mut self) {
         self.owner_secret.zeroize();
-        // Zeroize the scalar by overwriting its bytes
-        let blinding_bytes = self.value_blinding.as_bytes().to_owned();
-        let _ = blinding_bytes; // scalar is immutable, but owner_secret is the critical one
+        self.value_blinding.zeroize();
     }
 }
 

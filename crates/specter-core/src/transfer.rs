@@ -46,7 +46,7 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
     let new_state = TransferState {
         token_id: token.token_id,
         owner_hash,
-        step: token.transfer_count + 1,
+        step: token.transfer_count.saturating_add(1),
     };
     let new_fold_proof = accumulator::fold_transfer(
         &token.fold_proof,
@@ -63,7 +63,7 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
         mint_signature: token.mint_signature.clone(),
         owner_secret: new_owner_secret,
         hash_chain_head: new_hash_chain,
-        transfer_count: token.transfer_count + 1,
+        transfer_count: token.transfer_count.saturating_add(1),
         recursion_bound: token.recursion_bound,
         fold_proof: new_fold_proof,
         credential: token.credential.clone(),

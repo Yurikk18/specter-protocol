@@ -9,6 +9,7 @@
 //! factorization of N, computing y requires T sequential squarings.
 
 use num_bigint::BigUint;
+use num_integer::Integer;
 use num_traits::One;
 use sha2::{Digest, Sha256};
 
@@ -190,52 +191,76 @@ fn modpow_bigint(base: &BigUint, exp: u64, modulus: &BigUint) -> BigUint {
     base.modpow(&BigUint::from(exp), modulus)
 }
 
-/// Find the next prime >= n using trial division.
-/// (For prototype — production would use Miller-Rabin.)
+/// Find the next prime >= n using Miller-Rabin.
 fn next_prime(n: &BigUint) -> BigUint {
     let mut candidate = n.clone();
-    if &candidate % BigUint::from(2u64) == BigUint::ZERO {
+    if candidate.is_even() {
         candidate += BigUint::one();
     }
     let two = BigUint::from(2u64);
     loop {
-        if is_probably_prime(&candidate) {
+        if is_probably_prime_miller_rabin(&candidate, 20) {
             return candidate;
         }
         candidate += &two;
     }
 }
 
-/// Simple primality test (trial division up to sqrt for small primes,
-/// then Fermat test for larger ones).
-fn is_probably_prime(n: &BigUint) -> bool {
-    if n <= &BigUint::from(1u64) {
+/// Miller-Rabin primality test with `rounds` deterministic witnesses.
+///
+/// 20 rounds gives error probability < 4^(-20) ~ 10^(-12).
+/// Uses the first `rounds` small primes as witnesses for determinism.
+fn is_probably_prime_miller_rabin(n: &BigUint, rounds: u32) -> bool {
+    let one = BigUint::one();
+    let two = BigUint::from(2u64);
+
+    if n < &two {
         return false;
     }
-    if n == &BigUint::from(2u64) || n == &BigUint::from(3u64) {
+    if n == &two || n == &BigUint::from(3u64) {
         return true;
     }
-    if n % BigUint::from(2u64) == BigUint::ZERO {
+    if n.is_even() {
         return false;
     }
 
-    // Trial division for small factors
-    let small_primes = [3u64, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
-    for &p in &small_primes {
-        let bp = BigUint::from(p);
-        if n == &bp {
-            return true;
-        }
-        if n % &bp == BigUint::ZERO {
-            return false;
-        }
+    // Write n-1 as 2^r * d where d is odd
+    let n_minus_1 = n - &one;
+    let mut d = n_minus_1.clone();
+    let mut r: u32 = 0;
+    while d.is_even() {
+        d >>= 1;
+        r += 1;
     }
 
-    // Fermat test with base 2
-    let one = BigUint::one();
-    let n_minus_1 = n - &one;
-    let two = BigUint::from(2u64);
-    two.modpow(&n_minus_1, n) == one
+    // Deterministic witnesses (first `rounds` primes)
+    let witnesses: Vec<u64> = vec![
+        2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        59, 61, 67, 71, 73, 79, 83, 89,
+    ];
+
+    'witness: for &w in witnesses.iter().take(rounds as usize) {
+        let a = BigUint::from(w);
+        if &a >= n {
+            continue;
+        }
+        let mut x = a.modpow(&d, n);
+
+        if x == one || x == n_minus_1 {
+            continue 'witness;
+        }
+
+        for _ in 0..(r - 1) {
+            x = x.modpow(&two, n);
+            if x == n_minus_1 {
+                continue 'witness;
+            }
+        }
+
+        return false; // composite
+    }
+
+    true // probably prime
 }
 
 #[cfg(test)]
@@ -315,12 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn test_primality_check() {
-        assert!(is_probably_prime(&BigUint::from(2u64)));
-        assert!(is_probably_prime(&BigUint::from(3u64)));
-        assert!(is_probably_prime(&BigUint::from(17u64)));
-        assert!(is_probably_prime(&BigUint::from(97u64)));
-        assert!(!is_probably_prime(&BigUint::from(4u64)));
-        assert!(!is_probably_prime(&BigUint::from(100u64)));
+    fn test_primality_miller_rabin() {
+        assert!(is_probably_prime_miller_rabin(&BigUint::from(2u64), 20));
+        assert!(is_probably_prime_miller_rabin(&BigUint::from(3u64), 20));
+        assert!(is_probably_prime_miller_rabin(&BigUint::from(17u64), 20));
+        assert!(is_probably_prime_miller_rabin(&BigUint::from(97u64), 20));
+        assert!(!is_probably_prime_miller_rabin(&BigUint::from(4u64), 20));
+        assert!(!is_probably_prime_miller_rabin(&BigUint::from(100u64), 20));
+        // Carmichael numbers — MUST be rejected by Miller-Rabin
+        assert!(!is_probably_prime_miller_rabin(&BigUint::from(561u64), 20));
+        assert!(!is_probably_prime_miller_rabin(&BigUint::from(1105u64), 20));
+        assert!(!is_probably_prime_miller_rabin(&BigUint::from(1729u64), 20));
     }
 }

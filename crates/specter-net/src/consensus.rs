@@ -124,7 +124,9 @@ impl ConsensusState {
 
     /// Submit a nullifier to the pending pool.
     pub fn submit_nullifier(&mut self, nullifier: [u8; 32]) {
-        if !self.committed_nullifiers.contains(&nullifier) {
+        if !self.committed_nullifiers.contains(&nullifier)
+            && !self.pending_nullifiers.contains(&nullifier)
+        {
             self.pending_nullifiers.push(nullifier);
         }
     }
