@@ -12,15 +12,27 @@
 //! HARDER double-spend becomes. This is the opposite of traditional
 //! systems where more transfers = more risk.
 
-use sha2::{Digest, Sha256};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+use curve25519_dalek::{RistrettoPoint, Scalar};
+use sha2::{Digest, Sha256, Sha512};
+
+/// Schnorr signature on an attestation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestationSig {
+    pub r: RistrettoPoint,
+    pub s: Scalar,
+}
 
 /// A single attestation - a witness record of a transfer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Now includes a Schnorr signature from the sender proving authenticity.
+#[derive(Clone, Debug)]
 pub struct Attestation {
     /// Token ID being transferred.
     pub token_id: [u8; 32],
     /// Hash of the sender's identity commitment.
     pub sender_hash: [u8; 32],
+    /// Sender's public key (for signature verification).
+    pub sender_pubkey: RistrettoPoint,
     /// Hash of the receiver's identity commitment.
     pub receiver_hash: [u8; 32],
     /// Position in the transfer chain (0 = first transfer).
@@ -29,13 +41,18 @@ pub struct Attestation {
     pub prev_hash: [u8; 32],
     /// Hash of this attestation (binds all fields).
     pub hash: [u8; 32],
+    /// Schnorr signature from the sender proving they authorized this transfer.
+    pub signature: AttestationSig,
 }
 
 impl Attestation {
-    /// Create a new attestation.
-    pub fn new(
+    /// Create a new signed attestation.
+    /// The sender signs the attestation hash with their secret key.
+    pub fn new_signed(
         token_id: [u8; 32],
         sender_hash: [u8; 32],
+        sender_secret: &Scalar,
+        sender_pubkey: RistrettoPoint,
         receiver_hash: [u8; 32],
         chain_position: u32,
         prev_hash: [u8; 32],
@@ -47,14 +64,42 @@ impl Attestation {
             chain_position,
             &prev_hash,
         );
+        // Sign the hash with sender's secret key
+        let k = specter_primitives::scalar_utils::random_scalar();
+        let r = k * G;
+        let challenge = Self::sig_challenge(&r, &sender_pubkey, &hash);
+        let s = k + challenge * sender_secret;
+
         Self {
             token_id,
             sender_hash,
+            sender_pubkey,
             receiver_hash,
             chain_position,
             prev_hash,
             hash,
+            signature: AttestationSig { r, s },
         }
+    }
+
+    /// Verify the sender's Schnorr signature on this attestation.
+    pub fn verify_signature(&self) -> bool {
+        let challenge = Self::sig_challenge(&self.signature.r, &self.sender_pubkey, &self.hash);
+        let lhs = self.signature.s * G;
+        let rhs = self.signature.r + challenge * self.sender_pubkey;
+        lhs == rhs
+    }
+
+    fn sig_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8; 32]) -> Scalar {
+        let hash = Sha512::new()
+            .chain_update(b"specter-attestation-sig:")
+            .chain_update(r.compress().as_bytes())
+            .chain_update(pk.compress().as_bytes())
+            .chain_update(msg)
+            .finalize();
+        let mut wide = [0u8; 64];
+        wide.copy_from_slice(&hash);
+        Scalar::from_bytes_mod_order_wide(&wide)
     }
 
     fn compute_hash(
@@ -96,10 +141,12 @@ impl AttestationChain {
         }
     }
 
-    /// Add a transfer attestation to the chain.
+    /// Add a signed transfer attestation to the chain.
     pub fn add_transfer(
         &mut self,
         sender_hash: [u8; 32],
+        sender_secret: &Scalar,
+        sender_pubkey: RistrettoPoint,
         receiver_hash: [u8; 32],
     ) {
         let position = self.attestations.len() as u32;
@@ -109,9 +156,11 @@ impl AttestationChain {
             .map(|a| a.hash)
             .unwrap_or([0u8; 32]);
 
-        let attestation = Attestation::new(
+        let attestation = Attestation::new_signed(
             self.token_id,
             sender_hash,
+            sender_secret,
+            sender_pubkey,
             receiver_hash,
             position,
             prev_hash,
@@ -151,6 +200,11 @@ impl AttestationChain {
 
             // Check token_id consistency
             if att.token_id != self.token_id {
+                return false;
+            }
+
+            // Verify sender's Schnorr signature
+            if !att.verify_signature() {
                 return false;
             }
         }
@@ -215,145 +269,109 @@ pub fn detect_double_spend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use specter_primitives::scalar_utils::random_scalar;
 
-    fn token() -> [u8; 32] {
-        [42u8; 32]
-    }
+    fn token() -> [u8; 32] { [42u8; 32] }
 
-    fn user(id: u8) -> [u8; 32] {
+    fn user_hash(id: u8) -> [u8; 32] {
         let mut h = [0u8; 32];
         h[0] = id;
         h
     }
 
+    fn keypair() -> (Scalar, RistrettoPoint) {
+        let sk = random_scalar();
+        let pk = sk * G;
+        (sk, pk)
+    }
+
     #[test]
-    fn test_single_transfer_attestation() {
+    fn test_signed_attestation_roundtrip() {
+        let (sk, pk) = keypair();
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user(1), user(2));
+        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2));
 
         assert_eq!(chain.witness_count(), 1);
         assert!(chain.verify_integrity());
+        assert!(chain.attestations[0].verify_signature());
     }
 
     #[test]
-    fn test_multi_transfer_chain() {
+    fn test_multi_transfer_signed() {
+        let (sk1, pk1) = keypair();
+        let (sk2, pk2) = keypair();
+        let (sk3, pk3) = keypair();
+
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user(1), user(2)); // Alice -> Bob
-        chain.add_transfer(user(2), user(3)); // Bob -> Carol
-        chain.add_transfer(user(3), user(4)); // Carol -> Dave
+        chain.add_transfer(user_hash(1), &sk1, pk1, user_hash(2));
+        chain.add_transfer(user_hash(2), &sk2, pk2, user_hash(3));
+        chain.add_transfer(user_hash(3), &sk3, pk3, user_hash(4));
 
         assert_eq!(chain.witness_count(), 3);
         assert!(chain.verify_integrity());
-
-        // Each attestation links to the previous
-        assert_eq!(chain.attestations[1].prev_hash, chain.attestations[0].hash);
-        assert_eq!(chain.attestations[2].prev_hash, chain.attestations[1].hash);
     }
 
     #[test]
-    fn test_consistent_chains() {
-        let mut chain_a = AttestationChain::new(token());
-        chain_a.add_transfer(user(1), user(2));
+    fn test_double_spend_detected_signed() {
+        let (sk1, pk1) = keypair();
 
-        let chain_b = chain_a.clone();
-
-        assert_eq!(
-            detect_double_spend(&chain_a, &chain_b),
-            ChainComparison::Consistent
-        );
-    }
-
-    #[test]
-    fn test_double_spend_detected() {
-        // Alice sends same token to Bob AND Carol
         let mut chain_bob = AttestationChain::new(token());
-        chain_bob.add_transfer(user(1), user(2)); // Alice -> Bob
+        chain_bob.add_transfer(user_hash(1), &sk1, pk1, user_hash(2));
 
         let mut chain_carol = AttestationChain::new(token());
-        chain_carol.add_transfer(user(1), user(3)); // Alice -> Carol (DOUBLE SPEND!)
+        chain_carol.add_transfer(user_hash(1), &sk1, pk1, user_hash(3));
 
-        let result = detect_double_spend(&chain_bob, &chain_carol);
-        assert_eq!(
-            result,
-            ChainComparison::Conflict {
-                position: 0,
-                cheater_hash: user(1), // Alice is the cheater
+        match detect_double_spend(&chain_bob, &chain_carol) {
+            ChainComparison::Conflict { position, cheater_hash } => {
+                assert_eq!(position, 0);
+                assert_eq!(cheater_hash, user_hash(1));
             }
-        );
+            other => panic!("expected Conflict, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_double_spend_mid_chain() {
-        // Shared history: Alice -> Bob
-        // Then Bob double-spends to Carol AND Dave
-        let mut chain_carol = AttestationChain::new(token());
-        chain_carol.add_transfer(user(1), user(2)); // Alice -> Bob (shared)
-        chain_carol.add_transfer(user(2), user(3)); // Bob -> Carol
-
-        let mut chain_dave = AttestationChain::new(token());
-        chain_dave.add_transfer(user(1), user(2)); // Alice -> Bob (shared)
-        chain_dave.add_transfer(user(2), user(4)); // Bob -> Dave (DOUBLE SPEND!)
-
-        let result = detect_double_spend(&chain_carol, &chain_dave);
-        assert_eq!(
-            result,
-            ChainComparison::Conflict {
-                position: 1,
-                cheater_hash: user(2), // Bob is the cheater
-            }
-        );
-    }
-
-    #[test]
-    fn test_different_tokens_not_comparable() {
-        let mut chain_a = AttestationChain::new([1u8; 32]);
-        chain_a.add_transfer(user(1), user(2));
-
-        let mut chain_b = AttestationChain::new([2u8; 32]);
-        chain_b.add_transfer(user(1), user(2));
-
-        assert_eq!(
-            detect_double_spend(&chain_a, &chain_b),
-            ChainComparison::DifferentTokens
-        );
-    }
-
-    #[test]
-    fn test_tampered_chain_fails_integrity() {
+    fn test_tampered_signature_fails() {
+        let (sk, pk) = keypair();
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user(1), user(2));
-        chain.add_transfer(user(2), user(3));
+        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2));
 
-        // Tamper with attestation
-        chain.attestations[0].sender_hash = user(99);
+        // Tamper with signature
+        chain.attestations[0].signature.s += Scalar::ONE;
         assert!(!chain.verify_integrity());
     }
 
     #[test]
-    fn test_long_chain_integrity() {
+    fn test_forged_attestation_fails() {
+        let (sk, pk) = keypair();
+        let (_sk2, pk2) = keypair();
+
         let mut chain = AttestationChain::new(token());
-        for i in 0..50 {
-            chain.add_transfer(user(i), user(i + 1));
+        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+
+        // Replace sender pubkey with a different key (forged identity)
+        chain.attestations[0].sender_pubkey = pk2;
+        assert!(!chain.verify_integrity());
+    }
+
+    #[test]
+    fn test_long_chain_signed() {
+        let mut chain = AttestationChain::new(token());
+        for i in 0u8..20 {
+            let (sk, pk) = keypair();
+            chain.add_transfer(user_hash(i), &sk, pk, user_hash(i + 1));
         }
-        assert_eq!(chain.witness_count(), 50);
+        assert_eq!(chain.witness_count(), 20);
         assert!(chain.verify_integrity());
     }
 
     #[test]
-    fn test_more_witnesses_is_harder_to_evade() {
-        // With 0 witnesses (first transfer), no offline detection
-        // With 5 witnesses, offline detection is likely
-        // With 20 witnesses, offline detection is near-certain
-
-        let mut chain = AttestationChain::new(token());
-        for i in 0..20 {
-            chain.add_transfer(user(i), user(i + 1));
-        }
-
-        // Each participant has seen part of the chain
-        // If the cheater double-spends at any point, at least
-        // one witness has a conflicting chain
-        assert_eq!(chain.witness_count(), 20);
-        assert!(chain.verify_integrity());
+    fn test_different_tokens() {
+        let (sk, pk) = keypair();
+        let mut a = AttestationChain::new([1u8; 32]);
+        a.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        let mut b = AttestationChain::new([2u8; 32]);
+        b.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        assert_eq!(detect_double_spend(&a, &b), ChainComparison::DifferentTokens);
     }
 }

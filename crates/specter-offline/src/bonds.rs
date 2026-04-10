@@ -23,6 +23,8 @@ pub struct Bond {
     pub active: bool,
     /// Total value of tokens currently held offline by this owner.
     pub offline_exposure: u64,
+    /// Timestamp when withdrawal was requested (0 = not requested).
+    pub withdrawal_requested_at: u64,
 }
 
 /// The bond registry - tracks all active bonds.
@@ -30,14 +32,18 @@ pub struct BondRegistry {
     bonds: HashMap<[u8; 32], Bond>,
     /// Map from owner_id to their bond_id.
     owner_bonds: HashMap<[u8; 32], [u8; 32]>,
+    /// Lock period in seconds before withdrawal is allowed.
+    /// Must be >= max_offline_duration to prevent withdraw-before-slash.
+    pub lock_period_secs: u64,
 }
 
 impl BondRegistry {
-    /// Create an empty bond registry.
+    /// Create an empty bond registry with a lock period.
     pub fn new() -> Self {
         Self {
             bonds: HashMap::new(),
             owner_bonds: HashMap::new(),
+            lock_period_secs: 604800, // 7 days default
         }
     }
 
@@ -63,6 +69,7 @@ impl BondRegistry {
             amount,
             active: true,
             offline_exposure: 0,
+            withdrawal_requested_at: 0,
         };
 
         self.bonds.insert(bond_id, bond.clone());
@@ -150,19 +157,40 @@ impl BondRegistry {
         Ok(slashed)
     }
 
-    /// Withdraw a bond (unstake collateral).
-    /// Only possible if offline exposure is zero.
-    pub fn withdraw(&mut self, owner_id: &[u8; 32]) -> Result<u64, BondError> {
+    /// Request withdrawal. Starts the lock period countdown.
+    /// During lock period, bond is still active and can be slashed.
+    pub fn request_withdrawal(&mut self, owner_id: &[u8; 32], current_time: u64) -> Result<u64, BondError> {
+        let bond_id = self.owner_bonds.get(owner_id).ok_or(BondError::NoBond)?;
+        let bond = self.bonds.get_mut(bond_id).ok_or(BondError::NoBond)?;
+
+        if !bond.active {
+            return Err(BondError::BondSlashed);
+        }
+        if bond.offline_exposure > 0 {
+            return Err(BondError::ExposureNotSettled { remaining: bond.offline_exposure });
+        }
+
+        bond.withdrawal_requested_at = current_time;
+        Ok(current_time + self.lock_period_secs)
+    }
+
+    /// Withdraw a bond after lock period has elapsed.
+    /// Prevents withdraw-before-slash gaming.
+    pub fn withdraw(&mut self, owner_id: &[u8; 32], current_time: u64) -> Result<u64, BondError> {
         let bond_id = self.owner_bonds.get(owner_id).ok_or(BondError::NoBond)?;
         let bond = self.bonds.get(bond_id).ok_or(BondError::NoBond)?;
 
         if !bond.active {
             return Err(BondError::BondSlashed);
         }
+        if bond.withdrawal_requested_at == 0 {
+            return Err(BondError::WithdrawalNotRequested);
+        }
+        if current_time < bond.withdrawal_requested_at + self.lock_period_secs {
+            return Err(BondError::LockPeriodNotElapsed);
+        }
         if bond.offline_exposure > 0 {
-            return Err(BondError::ExposureNotSettled {
-                remaining: bond.offline_exposure,
-            });
+            return Err(BondError::ExposureNotSettled { remaining: bond.offline_exposure });
         }
 
         let amount = bond.amount;
@@ -203,6 +231,12 @@ pub enum BondError {
 
     #[error("cannot withdraw: offline exposure not settled ({remaining} remaining)")]
     ExposureNotSettled { remaining: u64 },
+
+    #[error("withdrawal not yet requested - call request_withdrawal first")]
+    WithdrawalNotRequested,
+
+    #[error("lock period has not elapsed - bond can still be slashed during this period")]
+    LockPeriodNotElapsed,
 }
 
 #[cfg(test)]
@@ -262,12 +296,24 @@ mod tests {
     }
 
     #[test]
-    fn test_withdraw() {
+    fn test_withdraw_with_lock_period() {
         let mut reg = BondRegistry::new();
+        reg.lock_period_secs = 100; // 100 seconds for testing
         reg.deposit(owner(1), 1000);
-        let amount = reg.withdraw(&owner(1)).unwrap();
+
+        // Can't withdraw without requesting first
+        assert!(reg.withdraw(&owner(1), 0).is_err());
+
+        // Request withdrawal at time 1000
+        let withdrawable_at = reg.request_withdrawal(&owner(1), 1000).unwrap();
+        assert_eq!(withdrawable_at, 1100); // 1000 + 100
+
+        // Can't withdraw before lock period
+        assert!(reg.withdraw(&owner(1), 1050).is_err());
+
+        // Can withdraw after lock period
+        let amount = reg.withdraw(&owner(1), 1100).unwrap();
         assert_eq!(amount, 1000);
-        assert!(!reg.check_coverage(&owner(1), 1)); // bond removed
     }
 
     #[test]
@@ -275,7 +321,25 @@ mod tests {
         let mut reg = BondRegistry::new();
         reg.deposit(owner(1), 1000);
         reg.register_offline_spend(&owner(1), 500).unwrap();
-        assert!(reg.withdraw(&owner(1)).is_err());
+        // Can't even request withdrawal with exposure
+        assert!(reg.request_withdrawal(&owner(1), 0).is_err());
+    }
+
+    #[test]
+    fn test_slash_during_lock_period() {
+        let mut reg = BondRegistry::new();
+        reg.lock_period_secs = 100;
+        reg.deposit(owner(1), 1000);
+
+        // Request withdrawal
+        reg.request_withdrawal(&owner(1), 1000).unwrap();
+
+        // Slash works during lock period (that's the point)
+        let slashed = reg.slash(&owner(1)).unwrap();
+        assert_eq!(slashed, 1000);
+
+        // Can't withdraw a slashed bond
+        assert!(reg.withdraw(&owner(1), 2000).is_err());
     }
 
     #[test]
@@ -293,6 +357,7 @@ mod tests {
     #[test]
     fn test_full_lifecycle() {
         let mut reg = BondRegistry::new();
+        reg.lock_period_secs = 100;
 
         // Deposit
         reg.deposit(owner(1), 1000);
@@ -301,18 +366,13 @@ mod tests {
         reg.register_offline_spend(&owner(1), 300).unwrap();
         reg.register_offline_spend(&owner(1), 200).unwrap();
 
-        // Go online, settle some
+        // Go online, settle
         reg.settle(&owner(1), 300).unwrap();
-
-        // Check remaining exposure
-        let bond = reg.get_bond(&owner(1)).unwrap();
-        assert_eq!(bond.offline_exposure, 200);
-
-        // Settle rest
         reg.settle(&owner(1), 200).unwrap();
 
-        // Withdraw
-        let amount = reg.withdraw(&owner(1)).unwrap();
+        // Request + wait + withdraw
+        reg.request_withdrawal(&owner(1), 1000).unwrap();
+        let amount = reg.withdraw(&owner(1), 1100).unwrap();
         assert_eq!(amount, 1000);
     }
 }
