@@ -14,4 +14,4 @@ borsh = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# proptest = { workspace = true }  # TODO: enable when MinGW dlltool is available
+proptest = { workspace = true }

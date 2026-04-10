@@ -143,9 +143,25 @@ mod tests {
         assert_eq!(c, c2);
     }
 
-    // TODO: proptest-based tests (requires MinGW dlltool fix)
-    // prop_pedersen_homomorphic: for any a, b, r1, r2:
-    //   commit(a,r1) + commit(b,r2) == commit(a+b, r1+r2)
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_pedersen_homomorphic(
+            a_val in 0u64..1_000_000,
+            b_val in 0u64..1_000_000,
+        ) {
+            let params = PedersenParams::new();
+            let a = scalar_from_u64(a_val);
+            let b = scalar_from_u64(b_val);
+            let r1 = random_scalar();
+            let r2 = random_scalar();
+
+            let sum_commit = params.commit(&a, &r1) + params.commit(&b, &r2);
+            let direct = params.commit(&(a + b), &(r1 + r2));
+            prop_assert_eq!(sum_commit.compress(), direct.compress());
+        }
+    }
 
     #[test]
     fn test_homomorphic_many_values() {
