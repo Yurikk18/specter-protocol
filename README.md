@@ -41,7 +41,7 @@ Sources: Zcash from [ECC blog](https://electriccoin.co/blog/reducing-shielded-pr
 
 2. **Compliance inside the token**: Each token carries a ZK selective disclosure proof that the holder is KYC-verified and not sanctioned - without revealing identity. No other system embeds regulatory compliance in the bearer instrument itself.
 
-3. **97 microsecond P2P transfer**: 24,000x faster than a Zcash shielded transaction (2.3s). No server contact, no blockchain, no waiting.
+3. **97 microsecond P2P transfer**: Local transfer with no network round-trip. Not directly comparable to Zcash (which includes ZK proof generation + blockchain broadcast), but demonstrates that the protocol layer itself adds minimal overhead.
 
 4. **Threshold blind issuance**: t-of-n signers cooperate blindly. Cashu has a single trusted mint. Fedimint has a federation but signers see the token content. Specter signers are completely blind.
 
@@ -51,7 +51,11 @@ Sources: Zcash from [ECC blog](https://electriccoin.co/blog/reducing-shielded-pr
 
 - **Token size is ~6x larger than Cashu**: Cashu proofs are ~65 bytes vs Specter's 413-1,039 bytes. The extra bytes carry fold proof, credentials, and VDF that Cashu does not have.
 - **Not deployed**: Specter is a protocol with 221 tests and a reference implementation. Cashu, Zcash, and Monero have years of production use.
-- **BIS Project Tourbillon showed PQ blind signatures are 200x slower**: When Specter migrates to lattice primitives, performance will decrease significantly. The current benchmarks are on elliptic curves.
+- **PQ migration will be slower**: BIS Project Tourbillon (2023) measured 200x throughput reduction with PQ blind signatures, but used a broken scheme (BLAZE). Modern PQ schemes (CCS 2023, CRYPTO 2025) are significantly faster. Specter's Lazy PQ Migration architecture (PQ only on mint signature, classical for transfers) minimizes the overhead. Current benchmarks are on elliptic curves.
+
+### Benchmark comparison notes
+
+Specter transfer (97us) is a local P2P operation with no network or ZK proof, comparable to handing physical cash. Zcash (2.3s) includes Groth16 ZK proof generation + blockchain broadcast, comparable to a wire transfer. These solve different problems and are not directly comparable. A fair ZK comparison: Specter with Nova IVC (~500ms-1s) vs Zcash Sapling (~2.3s). Token size comparisons ARE fair because both are serialized bearer instruments.
 
 ## Feature Comparison
 
