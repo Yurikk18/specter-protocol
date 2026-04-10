@@ -1,0 +1,17 @@
+[package]
+name = "specter-blind-sig"
+version = "0.1.0"
+edition = "2021"
+description = "Blind signature schemes for the Specter protocol"
+
+[dependencies]
+specter-primitives = { path = "../specter-primitives" }
+curve25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# proptest = { workspace = true }  # TODO: enable when MinGW dlltool is available
