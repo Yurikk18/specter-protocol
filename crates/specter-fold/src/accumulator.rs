@@ -106,6 +106,25 @@ pub fn create_initial_proof(genesis_state: &TransferState) -> AccumulatedProof {
     }
 }
 
+/// Compute the fold challenge deterministically from stored proof fields.
+/// Both prover and verifier use this identical function, ensuring the challenge
+/// is bound to all proof fields and cannot be freely chosen by an attacker.
+fn compute_fold_challenge(
+    state_hash: &[u8; 32],
+    pk: &RistrettoPoint,
+    pk_chain_hash: &[u8; 32],
+    r: &RistrettoPoint,
+    steps: u32,
+) -> Scalar {
+    let mut transcript = Transcript::new(b"specter-fold-challenge-v2");
+    transcript.absorb(b"state-hash", state_hash);
+    transcript.absorb(b"PK", pk.compress().as_bytes());
+    transcript.absorb(b"pk-chain", pk_chain_hash);
+    transcript.absorb(b"R", r.compress().as_bytes());
+    transcript.absorb(b"steps", &steps.to_le_bytes());
+    transcript.challenge(b"fold-e")
+}
+
 /// Fold a new transfer step into the accumulated proof.
 pub fn fold_transfer(
     current_proof: &AccumulatedProof,
@@ -126,33 +145,30 @@ pub fn fold_transfer(
     let secret = derive_proof_secret(&secret_input);
     let pk = secret * G;
 
-    let k = random_scalar();
-    let new_r = k * G;
-
-    // Build transcript from current proof + new state
-    let mut transcript = Transcript::new(b"specter-fold-step");
-    transcript.absorb(b"prev-state-hash", &current_proof.state_hash);
-    transcript.absorb(b"prev-s", current_proof.s.as_bytes());
-    transcript.absorb(b"prev-e", current_proof.e.as_bytes());
-    transcript.absorb(b"prev-R", current_proof.r.compress().as_bytes());
-    transcript.absorb(b"new-state", &new_state.to_bytes());
-    transcript.absorb(b"step", &new_state.step.to_le_bytes());
-    transcript.absorb(b"PK", pk.compress().as_bytes());
-    transcript.absorb(b"pk-chain", &current_proof.pk_chain_hash);
-    transcript.absorb(b"new-R", new_r.compress().as_bytes());
-
-    let new_e = transcript.challenge(b"fold-challenge");
-    let new_s = k + new_e * secret;
-
+    // 1. Compute new state_hash (binds to full transfer context)
+    let mut state_transcript = Transcript::new(b"specter-fold-state-v2");
+    state_transcript.absorb(b"prev-state-hash", &current_proof.state_hash);
+    state_transcript.absorb(b"prev-pk", current_proof.pk.compress().as_bytes());
+    state_transcript.absorb(b"new-state", &new_state.to_bytes());
+    state_transcript.absorb(b"step", &new_state.step.to_le_bytes());
     let mut new_state_hash = [0u8; 32];
-    transcript.squeeze_bytes(b"accumulated-state", &mut new_state_hash);
+    state_transcript.squeeze_bytes(b"state-hash", &mut new_state_hash);
 
-    // Extend PK chain hash
+    // 2. Extend PK chain hash
     let mut pk_chain_hash = [0u8; 32];
     let mut chain_transcript = Transcript::new(b"specter-pk-chain");
     chain_transcript.absorb(b"prev", &current_proof.pk_chain_hash);
     chain_transcript.absorb(b"pk", pk.compress().as_bytes());
     chain_transcript.squeeze_bytes(b"chain", &mut pk_chain_hash);
+
+    // 3. Compute challenge from ONLY stored proof fields (verifier can recompute)
+    let k = random_scalar();
+    let new_r = k * G;
+    let new_steps = current_proof.steps + 1;
+    let new_e = compute_fold_challenge(&new_state_hash, &pk, &pk_chain_hash, &new_r, new_steps);
+
+    // 4. Schnorr response: s = k + e * secret
+    let new_s = k + new_e * secret;
 
     Ok(AccumulatedProof {
         s: new_s,
@@ -160,7 +176,7 @@ pub fn fold_transfer(
         r: new_r,
         pk,
         state_hash: new_state_hash,
-        steps: current_proof.steps + 1,
+        steps: new_steps,
         pk_chain_hash,
     })
 }
@@ -172,6 +188,8 @@ pub fn fold_transfer(
 /// 2. For genesis (step 0): PK is correctly derived from genesis_state
 /// 3. For genesis: challenge was computed via the correct transcript
 /// 4. state_hash is non-zero
+/// 5. pk_chain_hash is non-zero for step > 0
+/// 6. For step > 0: challenge e is bound to the full proof state via transcript
 pub fn verify_accumulated_proof(
     proof: &AccumulatedProof,
     genesis_state: &TransferState,
@@ -202,6 +220,35 @@ pub fn verify_accumulated_proof(
         transcript.absorb(b"PK", proof.pk.compress().as_bytes());
         transcript.absorb(b"R", proof.r.compress().as_bytes());
         let expected_e = transcript.challenge(b"genesis-challenge");
+        if proof.e != expected_e {
+            return false;
+        }
+
+        // Verify genesis pk_chain_hash
+        let mut chain_transcript = Transcript::new(b"specter-pk-chain");
+        chain_transcript.absorb(b"pk", proof.pk.compress().as_bytes());
+        let mut expected_chain = [0u8; 32];
+        chain_transcript.squeeze_bytes(b"chain", &mut expected_chain);
+        if proof.pk_chain_hash != expected_chain {
+            return false;
+        }
+    } else {
+        // For step > 0: pk_chain_hash must be non-zero
+        if proof.pk_chain_hash == [0u8; 32] {
+            return false;
+        }
+
+        // Recompute challenge from stored proof fields and verify it matches.
+        // This binds the challenge to (state_hash, PK, pk_chain_hash, R, steps)
+        // via Fiat-Shamir. An attacker cannot satisfy both the Schnorr equation
+        // AND the challenge binding without knowing the DLP of PK.
+        let expected_e = compute_fold_challenge(
+            &proof.state_hash,
+            &proof.pk,
+            &proof.pk_chain_hash,
+            &proof.r,
+            proof.steps,
+        );
         if proof.e != expected_e {
             return false;
         }

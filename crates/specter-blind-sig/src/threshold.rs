@@ -51,6 +51,13 @@ pub struct SignerSessionState {
     pub nonce_commitment: RistrettoPoint,
 }
 
+impl Drop for SignerSessionState {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.nonce.zeroize();
+    }
+}
+
 /// Generate a threshold keyset using a trusted dealer.
 ///
 /// The dealer generates a random group secret key, splits it via Shamir,

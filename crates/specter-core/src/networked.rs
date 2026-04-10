@@ -11,6 +11,7 @@ use specter_net::protocol::NodeId;
 use specter_offline::bonds::BondRegistry;
 
 use crate::mint::{Mint, MintConfig};
+use crate::nullifier::NullifierSet;
 use crate::token::ProofCarryingToken;
 use crate::transfer::{self, TransferResult};
 use crate::verify::{self, VerificationResult};
@@ -20,6 +21,7 @@ pub struct NetworkedNode {
     pub mint: Mint,
     pub network: NetworkNode,
     pub bonds: BondRegistry,
+    pub nullifier_set: NullifierSet,
 }
 
 impl NetworkedNode {
@@ -34,6 +36,7 @@ impl NetworkedNode {
             mint: Mint::setup(mint_config),
             network: NetworkNode::new(node_id, peers, validator_keys),
             bonds: BondRegistry::new(),
+            nullifier_set: NullifierSet::new(),
         }
     }
 
@@ -56,9 +59,9 @@ impl NetworkedNode {
     /// Transfer a token and publish the nullifier to the network.
     pub fn transfer_token(
         &mut self,
-        token: &ProofCarryingToken,
+        token: ProofCarryingToken,
     ) -> Result<TransferResult, String> {
-        let result = transfer::transfer(token).map_err(|e| e.to_string())?;
+        let result = transfer::transfer(token, &mut self.nullifier_set).map_err(|e| e.to_string())?;
 
         // Broadcast nullifier via gossip
         self.network.submit_nullifier(result.spent_nullifier);
@@ -72,12 +75,13 @@ impl NetworkedNode {
     }
 
     /// Verify a token against this node's mint and network state.
-    pub fn verify_token(&self, token: &ProofCarryingToken) -> VerificationResult {
+    pub fn verify_token(&self, token: &ProofCarryingToken, current_time: u64) -> VerificationResult {
         verify::verify_token(
             token,
             &self.mint.group_public_key(),
             &self.mint.pedersen,
             &self.mint.credential_issuer.pedersen,
+            current_time,
         )
     }
 
@@ -150,7 +154,7 @@ mod tests {
     fn test_mint_and_verify() {
         let mut node = make_node(1, make_keys());
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
-        let vr = node.verify_token(&token);
+        let vr = node.verify_token(&token, 0);
         assert!(vr.all_valid());
     }
 
@@ -159,13 +163,13 @@ mod tests {
         let mut node = make_node(1, make_keys());
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
 
-        let result = node.transfer_token(&token).unwrap();
+        let result = node.transfer_token(token).unwrap();
 
         // Nullifier should be in gossip
         assert!(node.is_double_spend(&result.spent_nullifier));
 
         // Token should still verify
-        let vr = node.verify_token(&result.token);
+        let vr = node.verify_token(&result.token, 0);
         assert!(vr.all_valid());
     }
 
@@ -174,8 +178,8 @@ mod tests {
         let mut node = make_node(1, make_keys());
         let token = node.mint_token(1000, &[1, 2], None, None, None).unwrap();
 
-        let r1 = node.transfer_token(&token).unwrap();
-        // Second transfer of the same token - nullifier already known
+        let r1 = node.transfer_token(token).unwrap();
+        // Nullifier already known after first transfer
         assert!(node.is_double_spend(&r1.spent_nullifier));
     }
 
@@ -187,7 +191,7 @@ mod tests {
         let node3 = make_node(3, keys);
 
         let token = node1.mint_token(1000, &[1, 2], None, None, None).unwrap();
-        let result = node1.transfer_token(&token).unwrap();
+        let result = node1.transfer_token(token).unwrap();
 
         let block = node1.propose_block().unwrap();
 
@@ -217,7 +221,7 @@ mod tests {
             expires_at: 0,
         };
         let bond_owner = [42u8; 32];
-        node.bonds.deposit(bond_owner, 5000);
+        node.bonds.deposit(bond_owner, 5000).unwrap();
 
         let token = node
             .mint_token(1000, &[1, 2], Some(&attrs), Some(50), Some(bond_owner))
@@ -230,8 +234,8 @@ mod tests {
         // Transfer 5 times
         let mut current = token;
         for _ in 0..5 {
-            let result = node.transfer_token(&current).unwrap();
-            let vr = node.verify_token(&result.token);
+            let result = node.transfer_token(current).unwrap();
+            let vr = node.verify_token(&result.token, 0);
             assert!(vr.all_valid());
             current = result.token;
         }

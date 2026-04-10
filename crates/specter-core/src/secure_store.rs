@@ -28,7 +28,7 @@ fn derive_key(passphrase: &[u8], salt: &[u8; 16]) -> [u8; 32] {
     let params = argon2::Params::new(
         65536,  // 64 MB memory
         3,      // 3 iterations
-        1,      // 1 lane (parallelism)
+        4,      // 4 lanes (parallelism) - forces 4x resources per brute-force attempt
         Some(32), // 32-byte output
     )
     .expect("valid argon2 params");
@@ -42,8 +42,18 @@ fn derive_key(passphrase: &[u8], salt: &[u8; 16]) -> [u8; 32] {
     key
 }
 
+/// Minimum passphrase length for encryption.
+pub const MIN_PASSPHRASE_LEN: usize = 8;
+
 /// Encrypt data with a passphrase.
+///
+/// Requires passphrase of at least MIN_PASSPHRASE_LEN bytes.
 pub fn encrypt(plaintext: &[u8], passphrase: &[u8]) -> EncryptedData {
+    assert!(
+        passphrase.len() >= MIN_PASSPHRASE_LEN,
+        "passphrase must be at least {} bytes",
+        MIN_PASSPHRASE_LEN,
+    );
     // Generate random salt and nonce
     let mut salt = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
@@ -124,47 +134,47 @@ mod tests {
     #[test]
     fn test_tampered_ciphertext_fails() {
         let data = b"secret data";
-        let mut encrypted = encrypt(data, b"passphrase");
+        let mut encrypted = encrypt(data, b"passphrase-min8");
         if !encrypted.ciphertext.is_empty() {
             encrypted.ciphertext[0] ^= 0xFF;
         }
-        let result = decrypt(&encrypted, b"passphrase");
+        let result = decrypt(&encrypted, b"passphrase-min8");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_different_plaintexts_different_ciphertexts() {
-        let e1 = encrypt(b"data one", b"pass");
-        let e2 = encrypt(b"data two", b"pass");
+        let e1 = encrypt(b"data one", b"pass-min8");
+        let e2 = encrypt(b"data two", b"pass-min8");
         assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     #[test]
     fn test_same_plaintext_different_ciphertexts() {
         // Random salt + nonce means same input produces different ciphertext
-        let e1 = encrypt(b"same data", b"pass");
-        let e2 = encrypt(b"same data", b"pass");
+        let e1 = encrypt(b"same data", b"pass-min8");
+        let e2 = encrypt(b"same data", b"pass-min8");
         assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     #[test]
     fn test_empty_plaintext() {
-        let encrypted = encrypt(b"", b"pass");
-        let decrypted = decrypt(&encrypted, b"pass").unwrap();
+        let encrypted = encrypt(b"", b"pass-min8");
+        let decrypted = decrypt(&encrypted, b"pass-min8").unwrap();
         assert!(decrypted.is_empty());
     }
 
     #[test]
     fn test_large_plaintext() {
         let data = vec![0x42u8; 10_000];
-        let encrypted = encrypt(&data, b"pass");
-        let decrypted = decrypt(&encrypted, b"pass").unwrap();
+        let encrypted = encrypt(&data, b"pass-min8");
+        let decrypted = decrypt(&encrypted, b"pass-min8").unwrap();
         assert_eq!(decrypted, data);
     }
 
     #[test]
     fn test_fingerprint() {
-        let encrypted = encrypt(b"data", b"pass");
+        let encrypted = encrypt(b"data", b"pass-min8");
         let fp = fingerprint(&encrypted);
         assert_eq!(fp.len(), 16); // 8 bytes hex = 16 chars
     }

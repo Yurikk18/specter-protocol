@@ -38,6 +38,7 @@ pub fn renew_token(
         &mint.group_public_key(),
         &mint.pedersen,
         &mint.credential_issuer.pedersen,
+        0,
     );
 
     if !vr.signature_valid {
@@ -107,9 +108,10 @@ mod tests {
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
         // Exhaust the token
+        let mut ns = NullifierSet::new();
         let mut current = token;
         for _ in 0..3 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
         assert!(current.needs_renewal());
 
@@ -131,16 +133,18 @@ mod tests {
         let mint = setup();
         let token = mint.issue(500, &[1, 2], None).unwrap();
 
+        let mut ns = NullifierSet::new();
         let mut current = token;
         for _ in 0..3 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
 
-        let mut ns = NullifierSet::new();
-        let result = renew_token(&current, &mint, &[1, 3], &mut ns).unwrap();
+        let mut renew_ns = NullifierSet::new();
+        let result = renew_token(&current, &mint, &[1, 3], &mut renew_ns).unwrap();
 
         // Can transfer the renewed token
-        let transferred = transfer::transfer(&result.new_token).unwrap();
+        let mut transfer_ns = NullifierSet::new();
+        let transferred = transfer::transfer(result.new_token, &mut transfer_ns).unwrap();
         assert_eq!(transferred.token.transfer_count, 1);
     }
 
@@ -149,9 +153,10 @@ mod tests {
         let mint = setup();
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
+        let mut transfer_ns = NullifierSet::new();
         let mut current = token;
         for _ in 0..3 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut transfer_ns).unwrap().token;
         }
 
         let mut ns = NullifierSet::new();
@@ -167,9 +172,10 @@ mod tests {
         let mint = setup();
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
+        let mut transfer_ns = NullifierSet::new();
         let mut current = token;
         for _ in 0..3 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut transfer_ns).unwrap().token;
         }
 
         let mut ns = NullifierSet::new();
@@ -180,6 +186,7 @@ mod tests {
             &mint.group_public_key(),
             &mint.pedersen,
             &mint.credential_issuer.pedersen,
+            0,
         );
         assert!(vr.all_valid());
     }

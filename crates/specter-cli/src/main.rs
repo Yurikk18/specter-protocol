@@ -12,6 +12,7 @@
 
 use std::time::Instant;
 
+use sha2::Digest;
 use specter_credential::credential::Attributes;
 use specter_core::mint::{Mint, MintConfig};
 use specter_core::nullifier::NullifierSet;
@@ -21,6 +22,23 @@ use specter_core::verify;
 use specter_core::wallet::Wallet;
 
 const WALLET_FILE: &str = "specter_wallet.dat";
+const DEFAULT_PASSPHRASE: &[u8] = b"specter-dev-only";
+
+/// Get wallet passphrase from environment or use dev-mode default.
+/// In production, this MUST prompt the user or read from a secure source.
+fn get_passphrase() -> Vec<u8> {
+    match std::env::var("SPECTER_PASSPHRASE") {
+        Ok(p) if p.len() >= 8 => p.into_bytes(),
+        Ok(_) => {
+            eprintln!("Warning: SPECTER_PASSPHRASE too short (min 8 chars), using dev default");
+            DEFAULT_PASSPHRASE.to_vec()
+        }
+        Err(_) => {
+            eprintln!("Warning: SPECTER_PASSPHRASE not set, using dev-mode passphrase");
+            DEFAULT_PASSPHRASE.to_vec()
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,7 +57,8 @@ fn main() {
         "benchmark" => run_benchmark(),
         "help" | "--help" | "-h" => print_help(),
         other => {
-            eprintln!("Unknown command: {}. Use 'help' for usage.", other);
+            let sanitized: String = other.chars().filter(|c| !c.is_control()).collect();
+            eprintln!("Unknown command: {}. Use 'help' for usage.", sanitized);
             std::process::exit(1);
         }
     }
@@ -56,7 +75,7 @@ fn print_help() {
     println!("  balance             Show wallet balance and tokens");
     println!("  transfer            Transfer first available token");
     println!("  send <addr>         Send a token via TCP (default: 127.0.0.1:7878)");
-    println!("  receive <addr>      Listen for a token via TCP (default: 0.0.0.0:7878)");
+    println!("  receive <addr>      Listen for a token via TCP (default: 127.0.0.1:7878)");
     println!("  save                Save wallet to encrypted file");
     println!("  load                Load wallet from encrypted file");
     println!("  demo                Run full protocol demonstration");
@@ -94,7 +113,7 @@ fn cmd_setup() {
     println!("  Group public key: {}", hex::encode(mint.group_public_key().compress().as_bytes()));
 
     let wallet = Wallet::new();
-    let data = wallet.save(b"specter");
+    let data = wallet.save(&get_passphrase());
     std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet file");
     println!("  Empty wallet saved to {}", WALLET_FILE);
     println!("Setup complete.");
@@ -117,7 +136,7 @@ fn cmd_mint(args: &[String]) {
     let mut wallet = load_or_create_wallet(&mint);
     wallet.add_token(token);
 
-    let data = wallet.save(b"specter");
+    let data = wallet.save(&get_passphrase());
     std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
     println!("  Added to wallet. Balance: {}", wallet.balance());
 }
@@ -165,14 +184,15 @@ fn cmd_transfer() {
         }
     };
 
-    let result = transfer::transfer(&token).unwrap();
     let id = token.token_id;
+    let mut ns = NullifierSet::new();
+    let result = transfer::transfer(token, &mut ns).unwrap();
 
     // Remove old, add new
     wallet.remove_token(&id);
     wallet.add_token(result.token);
 
-    let data = wallet.save(b"specter");
+    let data = wallet.save(&get_passphrase());
     std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
 
     println!("Transferred token {}.", hex::encode(&id[..8]));
@@ -183,7 +203,7 @@ fn cmd_transfer() {
 fn cmd_save() {
     let mint = default_mint();
     let wallet = load_or_create_wallet(&mint);
-    let data = wallet.save(b"specter");
+    let data = wallet.save(&get_passphrase());
     std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
     println!("Wallet saved to {} ({} bytes, {} tokens)", WALLET_FILE, data.len(), wallet.token_count());
 }
@@ -194,6 +214,74 @@ fn cmd_load() {
     println!("Wallet loaded from {}", WALLET_FILE);
     println!("  Balance: {}", wallet.balance());
     println!("  Tokens:  {}", wallet.token_count());
+}
+
+/// Perform ECDH key exchange and derive a shared ChaCha20-Poly1305 key.
+/// Protocol: each side sends their ephemeral public key (32 bytes),
+/// then both derive shared_secret = SHA-256(my_sk * their_pk).
+fn dh_handshake(stream: &mut std::net::TcpStream, is_initiator: bool) -> Option<[u8; 32]> {
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+    use std::io::{Read, Write};
+
+    let my_sk = specter_primitives::scalar_utils::random_scalar();
+    let my_pk = (my_sk * G).compress();
+
+    if is_initiator {
+        // Initiator sends first, then receives
+        if stream.write_all(my_pk.as_bytes()).is_err() { return None; }
+        if stream.flush().is_err() { return None; }
+        let mut their_pk_bytes = [0u8; 32];
+        if stream.read_exact(&mut their_pk_bytes).is_err() { return None; }
+        let their_pk = curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
+            .decompress()?;
+        let shared = my_sk * their_pk;
+        let key = sha2::Sha256::digest(shared.compress().as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&key);
+        Some(out)
+    } else {
+        // Responder receives first, then sends
+        let mut their_pk_bytes = [0u8; 32];
+        if stream.read_exact(&mut their_pk_bytes).is_err() { return None; }
+        let their_pk = curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
+            .decompress()?;
+        if stream.write_all(my_pk.as_bytes()).is_err() { return None; }
+        if stream.flush().is_err() { return None; }
+        let shared = my_sk * their_pk;
+        let key = sha2::Sha256::digest(shared.compress().as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&key);
+        Some(out)
+    }
+}
+
+/// Encrypt bytes with a shared key using ChaCha20-Poly1305.
+fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};
+    use rand_core::{OsRng, RngCore};
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, plaintext).ok()?;
+
+    // Return nonce || ciphertext
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Some(out)
+}
+
+/// Decrypt bytes with a shared key using ChaCha20-Poly1305.
+fn decrypt_with_key(data: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};
+
+    if data.len() < 12 { return None; }
+    let nonce = Nonce::from_slice(&data[..12]);
+    let ciphertext = &data[12..];
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    cipher.decrypt(nonce, ciphertext).ok()
 }
 
 fn cmd_send(args: &[String]) {
@@ -214,19 +302,43 @@ fn cmd_send(args: &[String]) {
         }
     };
     let id = token.token_id;
-    let bytes = serde_token::serialize_token(&token);
+    let plaintext = serde_token::serialize_token_public(&token);
 
-    // Send over TCP: [4-byte length][token bytes]
     match std::net::TcpStream::connect(addr) {
         Ok(mut stream) => {
             use std::io::Write;
-            stream.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
-            stream.write_all(&bytes).unwrap();
 
+            // ECDH key exchange (sender is initiator)
+            let shared_key = match dh_handshake(&mut stream, true) {
+                Some(k) => k,
+                None => { eprintln!("Key exchange failed with {}", addr); return; }
+            };
+
+            // Encrypt token bytes
+            let encrypted = match encrypt_with_key(&plaintext, &shared_key) {
+                Some(e) => e,
+                None => { eprintln!("Encryption failed"); return; }
+            };
+
+            // Send encrypted: [4-byte length][nonce+ciphertext]
+            if let Err(e) = stream.write_all(&(encrypted.len() as u32).to_le_bytes()) {
+                eprintln!("Failed to send length to {}: {}", addr, e);
+                return;
+            }
+            if let Err(e) = stream.write_all(&encrypted) {
+                eprintln!("Failed to send token data to {}: {}", addr, e);
+                return;
+            }
+            if let Err(e) = stream.flush() {
+                eprintln!("Failed to flush stream to {}: {}", addr, e);
+                return;
+            }
+
+            // Only remove from wallet AFTER successful send
             wallet.remove_token(&id);
-            let data = wallet.save(b"specter");
+            let data = wallet.save(&get_passphrase());
             std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
-            println!("Sent token {} to {} ({} bytes)", hex::encode(&id[..8]), addr, bytes.len());
+            println!("Sent token {} to {} (encrypted, {} bytes)", hex::encode(&id[..8]), addr, encrypted.len());
         }
         Err(e) => {
             eprintln!("Failed to connect to {}: {}", addr, e);
@@ -235,7 +347,7 @@ fn cmd_send(args: &[String]) {
 }
 
 fn cmd_receive(args: &[String]) {
-    let addr = args.get(2).map(|s| s.as_str()).unwrap_or("0.0.0.0:7878");
+    let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:7878");
 
     let listener = match std::net::TcpListener::bind(addr) {
         Ok(l) => l,
@@ -249,26 +361,56 @@ fn cmd_receive(args: &[String]) {
     match listener.accept() {
         Ok((mut stream, peer)) => {
             use std::io::Read;
+
+            // ECDH key exchange (receiver is responder)
+            let shared_key = match dh_handshake(&mut stream, false) {
+                Some(k) => k,
+                None => { eprintln!("Key exchange failed with {}", peer); return; }
+            };
+
+            // Read encrypted length
             let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).unwrap();
+            if let Err(e) = stream.read_exact(&mut len_buf) {
+                eprintln!("Connection error reading length: {}", e);
+                return;
+            }
             let len = u32::from_le_bytes(len_buf) as usize;
 
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).unwrap();
+            const MAX_TOKEN_SIZE: usize = 65536;
+            if len > MAX_TOKEN_SIZE || len == 0 {
+                eprintln!("Rejected token: invalid size {} bytes (max {})", len, MAX_TOKEN_SIZE);
+                return;
+            }
+
+            // Read encrypted data
+            let mut encrypted_buf = vec![0u8; len];
+            if let Err(e) = stream.read_exact(&mut encrypted_buf) {
+                eprintln!("Connection error reading token data: {}", e);
+                return;
+            }
+
+            // Decrypt with shared key
+            let buf = match decrypt_with_key(&encrypted_buf, &shared_key) {
+                Some(p) => p,
+                None => {
+                    eprintln!("Decryption failed from {} - tampered or wrong key", peer);
+                    return;
+                }
+            };
 
             match serde_token::deserialize_token(&buf) {
                 Ok(token) => {
                     let mint = default_mint();
                     let vr = verify::verify_token(
                         &token, &mint.group_public_key(), &mint.pedersen,
-                        &mint.credential_issuer.pedersen,
+                        &mint.credential_issuer.pedersen, 0,
                     );
 
                     if vr.all_valid() {
                         let id = token.token_id;
                         let mut wallet = load_or_create_wallet(&mint);
                         wallet.add_token(token);
-                        let data = wallet.save(b"specter");
+                        let data = wallet.save(&get_passphrase());
                         std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
                         println!("Received valid token {} from {} ({} bytes)",
                             hex::encode(&id[..8]), peer, len);
@@ -292,7 +434,7 @@ fn load_or_create_wallet(mint: &Mint) -> Wallet {
         Ok(data) => {
             Wallet::load(
                 &data,
-                b"specter",
+                &get_passphrase(),
                 &mint.group_public_key(),
                 &mint.pedersen,
                 &mint.credential_issuer.pedersen,
@@ -327,7 +469,7 @@ fn run_demo() {
     println!();
 
     println!("[3/6] Verifying freshly minted token...");
-    let result = verify::verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+    let result = verify::verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
     println!("  Signature valid:   {}", result.signature_valid);
     println!("  Value valid:       {}", result.value_valid);
     println!("  Within bound:      {}", result.within_bound);
@@ -341,10 +483,9 @@ fn run_demo() {
     let mut nullifier_set = NullifierSet::new();
 
     for i in 1..=5 {
-        let tr = transfer::transfer(&current).unwrap();
-        transfer::check_double_spend(&mut nullifier_set, &tr.spent_nullifier).unwrap();
+        let tr = transfer::transfer(current, &mut nullifier_set).unwrap();
 
-        let vr = verify::verify_token(&tr.token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let vr = verify::verify_token(&tr.token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         println!(
             "  Transfer {}: count={}/{}, fold_steps={}, valid={}, nullifier={}...",
             i, tr.token.transfer_count, tr.token.recursion_bound,
@@ -357,13 +498,12 @@ fn run_demo() {
 
     println!("[5/6] Demonstrating double-spend detection...");
     let original = mint.issue(500, &[2, 3], None).unwrap();
-    let spend1 = transfer::transfer(&original).unwrap();
-    let spend2 = transfer::transfer(&original).unwrap();
-
-    println!("  Same nullifier:    {}", spend1.spent_nullifier == spend2.spent_nullifier);
     let mut ds_set = NullifierSet::new();
-    let first_ok = transfer::check_double_spend(&mut ds_set, &spend1.spent_nullifier).is_ok();
-    let second_ok = transfer::check_double_spend(&mut ds_set, &spend2.spent_nullifier).is_ok();
+    let _spend1 = transfer::transfer(original.clone(), &mut ds_set).unwrap();
+    let spend2_result = transfer::transfer(original, &mut ds_set);
+
+    let first_ok = true; // spend1 succeeded above
+    let second_ok = spend2_result.is_ok();
     println!("  First spend:       {} (valid)", first_ok);
     println!("  Second spend:      {} (DOUBLE SPEND DETECTED)", second_ok);
     println!();
@@ -402,22 +542,26 @@ fn run_benchmark() {
 
     let start = Instant::now();
     for t in &cred_tokens {
-        let _ = verify::verify_token(t, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let _ = verify::verify_token(t, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
     }
     println!("Verify (with cred):            {:?} avg", start.elapsed() / n as u32);
 
     let start = Instant::now();
-    for t in &tokens { let _ = transfer::transfer(t).unwrap(); }
+    for t in tokens.iter() {
+        let mut ns = NullifierSet::new();
+        let _ = transfer::transfer(t.clone(), &mut ns).unwrap();
+    }
     println!("Transfer (P2P local):          {:?} avg", start.elapsed() / n as u32);
 
     let token = mint.issue(1000, &[1, 2], Some(&attrs)).unwrap();
     let start = Instant::now();
+    let mut chain_ns = NullifierSet::new();
     let mut current = token;
-    for _ in 0..20 { current = transfer::transfer(&current).unwrap().token; }
+    for _ in 0..20 { current = transfer::transfer(current, &mut chain_ns).unwrap().token; }
     println!("20-transfer chain:             {:?} total", start.elapsed());
 
     let start = Instant::now();
-    let r = verify::verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+    let r = verify::verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
     println!("Final verify (20 transfers):   {:?} (valid={})", start.elapsed(), r.all_valid());
 
     // Serialization benchmark

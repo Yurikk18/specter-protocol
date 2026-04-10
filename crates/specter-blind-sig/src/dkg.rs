@@ -7,9 +7,14 @@
 //!
 //! Based on Feldman's Verifiable Secret Sharing (1987) adapted
 //! for Ristretto255 Schnorr threshold signatures.
+//!
+//! Each participant provides a Schnorr proof-of-knowledge of
+//! their secret polynomial's constant term in Round 1 to prevent
+//! rogue-key attacks.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 use curve25519_dalek::{RistrettoPoint, Scalar};
+use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 
 use specter_primitives::scalar_utils::random_scalar;
@@ -27,21 +32,78 @@ pub struct DkgParticipant {
     pub commitments: Vec<RistrettoPoint>,
 }
 
-/// Round 1: Each participant generates a random polynomial and
-/// publishes commitments.
+impl Drop for DkgParticipant {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for s in &mut self.secret_poly {
+            s.zeroize();
+        }
+    }
+}
+
+/// Schnorr proof-of-knowledge of a discrete logarithm.
 ///
-/// Returns the participant state (kept private) and the public
-/// commitments (broadcast to all other participants).
-pub fn dkg_round1(id: SignerId, threshold: usize) -> DkgParticipant {
+/// Proves knowledge of the scalar `a_0` such that `C_0 = a_0 * G`
+/// without revealing `a_0`. Used in DKG Round 1 to prevent
+/// rogue-key attacks where a malicious participant sets their
+/// commitment to control the group public key.
+pub struct ProofOfKnowledge {
+    /// The commitment R = k * G for the random nonce k.
+    pub r: RistrettoPoint,
+    /// The response s = k + e * a_0 where e is the challenge hash.
+    pub s: Scalar,
+}
+
+impl Drop for ProofOfKnowledge {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.s.zeroize();
+    }
+}
+
+/// Round 1: Each participant generates a random polynomial and
+/// publishes commitments along with a Schnorr proof-of-knowledge.
+///
+/// Returns the participant state (kept private), the public
+/// commitments, and a proof-of-knowledge of the constant term
+/// (all broadcast to all other participants).
+pub fn dkg_round1(id: SignerId, threshold: usize) -> (DkgParticipant, ProofOfKnowledge) {
     let secret_poly: Vec<Scalar> = (0..threshold).map(|_| random_scalar()).collect();
     let commitments: Vec<RistrettoPoint> = secret_poly.iter().map(|a| a * G).collect();
 
-    DkgParticipant {
+    // Schnorr PoK of secret_poly[0]: proves knowledge of discrete log of commitments[0]
+    let k = random_scalar();
+    let pok_r = k * G;
+    let pok_e = hash_dkg_pok(id, &commitments[0], &pok_r);
+    let pok_s = k + pok_e * secret_poly[0];
+
+    let pok = ProofOfKnowledge { r: pok_r, s: pok_s };
+
+    let participant = DkgParticipant {
         id,
         threshold,
         secret_poly,
         commitments,
-    }
+    };
+
+    (participant, pok)
+}
+
+/// Verify a Schnorr proof-of-knowledge for a participant's constant-term commitment.
+///
+/// Checks that the prover knows the discrete log of `commitment_0`
+/// (i.e., the scalar `a_0` such that `commitment_0 = a_0 * G`).
+///
+/// Verification: `s * G == R + e * C_0` where `e = H(id || C_0 || R)`.
+pub fn verify_pok(
+    id: SignerId,
+    commitment_0: &RistrettoPoint,
+    pok: &ProofOfKnowledge,
+) -> bool {
+    let e = hash_dkg_pok(id, commitment_0, &pok.r);
+    let lhs = pok.s * G;
+    let rhs = pok.r + e * commitment_0;
+    lhs == rhs
 }
 
 /// Round 2: Each participant computes shares for every other participant.
@@ -64,10 +126,13 @@ pub fn dkg_round2(
     shares
 }
 
-/// Round 3: Each participant verifies received shares and computes
-/// their final key share.
+/// Round 3: Each participant verifies received proofs-of-knowledge
+/// and shares, then computes their final key share.
 ///
-/// Verification: for share s_{j->i} from participant j,
+/// PoK verification: for each participant j, verify their Schnorr
+/// proof-of-knowledge of the constant term a_{j,0}.
+///
+/// Share verification: for share s_{j->i} from participant j,
 /// check that s_{j->i} * G == sum(i^k * C_{j,k}) for k=0..t-1.
 ///
 /// Final share: y_i = sum(s_{j->i}) for all j (including self).
@@ -75,8 +140,19 @@ pub fn dkg_round3(
     participant: &DkgParticipant,
     received_shares: &HashMap<SignerId, Scalar>,
     all_commitments: &HashMap<SignerId, Vec<RistrettoPoint>>,
+    all_poks: &HashMap<SignerId, ProofOfKnowledge>,
 ) -> Result<ThresholdKeyset, DkgError> {
     let x_i = Scalar::from(participant.id);
+
+    // Verify all proofs-of-knowledge before processing shares
+    for (&pid, commitments) in all_commitments {
+        let pok = all_poks
+            .get(&pid)
+            .ok_or(DkgError::MissingProofOfKnowledge(pid))?;
+        if !verify_pok(pid, &commitments[0], pok) {
+            return Err(DkgError::InvalidProofOfKnowledge(pid));
+        }
+    }
 
     // Verify each received share against the sender's commitments
     for (&sender_id, share) in received_shares {
@@ -155,16 +231,29 @@ pub fn run_dkg(
         return Err(DkgError::InvalidParams { threshold, total });
     }
 
-    // Round 1: everyone generates polynomials and commitments
-    let participants: HashMap<SignerId, DkgParticipant> = participant_ids
-        .iter()
-        .map(|&id| (id, dkg_round1(id, threshold)))
-        .collect();
+    // Round 1: everyone generates polynomials, commitments, and PoKs
+    let mut participants: HashMap<SignerId, DkgParticipant> = HashMap::new();
+    let mut all_poks: HashMap<SignerId, ProofOfKnowledge> = HashMap::new();
+    for &id in participant_ids {
+        let (participant, pok) = dkg_round1(id, threshold);
+        participants.insert(id, participant);
+        all_poks.insert(id, pok);
+    }
 
     let all_commitments: HashMap<SignerId, Vec<RistrettoPoint>> = participants
         .iter()
         .map(|(&id, p)| (id, p.commitments.clone()))
         .collect();
+
+    // Verify all PoKs before proceeding to Round 2
+    for (&pid, commitments) in &all_commitments {
+        let pok = all_poks
+            .get(&pid)
+            .ok_or(DkgError::MissingProofOfKnowledge(pid))?;
+        if !verify_pok(pid, &commitments[0], pok) {
+            return Err(DkgError::InvalidProofOfKnowledge(pid));
+        }
+    }
 
     // Round 2: everyone computes shares for everyone else
     let all_shares: HashMap<SignerId, HashMap<SignerId, Scalar>> = participants
@@ -186,10 +275,10 @@ pub fn run_dkg(
         received.insert(target_id, shares_for_target);
     }
 
-    // Round 3: everyone verifies and computes final keyset
+    // Round 3: everyone verifies PoKs again, verifies shares, and computes final keyset
     let mut keysets = HashMap::new();
     for (&id, participant) in &participants {
-        let keyset = dkg_round3(participant, &received[&id], &all_commitments)?;
+        let keyset = dkg_round3(participant, &received[&id], &all_commitments, &all_poks)?;
         keysets.insert(id, keyset);
     }
 
@@ -197,6 +286,22 @@ pub fn run_dkg(
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+/// Hash function for the DKG proof-of-knowledge challenge.
+///
+/// Computes `e = H(domain || id || C_0 || R)` using SHA-512 with
+/// domain separation to produce a scalar challenge.
+fn hash_dkg_pok(id: SignerId, commitment: &RistrettoPoint, r: &RistrettoPoint) -> Scalar {
+    let hash = Sha512::new()
+        .chain_update(b"specter-dkg-pok:")
+        .chain_update(id.to_le_bytes())
+        .chain_update(commitment.compress().as_bytes())
+        .chain_update(r.compress().as_bytes())
+        .finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&hash);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
 
 fn evaluate_poly(coeffs: &[Scalar], x: &Scalar) -> Scalar {
     let mut result = Scalar::ZERO;
@@ -229,6 +334,12 @@ pub enum DkgError {
 
     #[error("invalid DKG parameters: threshold={threshold}, total={total}")]
     InvalidParams { threshold: usize, total: usize },
+
+    #[error("missing proof-of-knowledge from participant {0}")]
+    MissingProofOfKnowledge(SignerId),
+
+    #[error("invalid proof-of-knowledge from participant {0}")]
+    InvalidProofOfKnowledge(SignerId),
 }
 
 #[cfg(test)]
@@ -313,5 +424,127 @@ mod tests {
     fn test_dkg_invalid_params() {
         assert!(run_dkg(0, &[1, 2, 3]).is_err());
         assert!(run_dkg(5, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn test_pok_valid_proof_verifies() {
+        // Generate a participant with a PoK and verify it passes
+        let (participant, pok) = dkg_round1(1, 2);
+        assert!(
+            verify_pok(participant.id, &participant.commitments[0], &pok),
+            "valid PoK should verify"
+        );
+    }
+
+    #[test]
+    fn test_pok_multiple_participants_all_verify() {
+        for id in 1..=5 {
+            let (participant, pok) = dkg_round1(id, 3);
+            assert!(
+                verify_pok(participant.id, &participant.commitments[0], &pok),
+                "valid PoK for participant {} should verify",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn test_pok_forged_wrong_scalar_rejected() {
+        // A forged proof with a random s value should fail verification
+        let (participant, _pok) = dkg_round1(1, 2);
+        let forged = ProofOfKnowledge {
+            r: random_scalar() * G,
+            s: random_scalar(),
+        };
+        assert!(
+            !verify_pok(participant.id, &participant.commitments[0], &forged),
+            "forged PoK with random s should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_pok_forged_wrong_id_rejected() {
+        // A proof generated for participant 1 should not verify for participant 2
+        let (participant, pok) = dkg_round1(1, 2);
+        let wrong_id: SignerId = 2;
+        assert!(
+            !verify_pok(wrong_id, &participant.commitments[0], &pok),
+            "PoK verified with wrong participant ID should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_pok_forged_wrong_commitment_rejected() {
+        // A proof generated for one commitment should not verify against a different commitment
+        let (participant_a, pok_a) = dkg_round1(1, 2);
+        let (participant_b, _pok_b) = dkg_round1(1, 2);
+        // Use participant A's PoK against participant B's commitment
+        assert!(
+            !verify_pok(1, &participant_b.commitments[0], &pok_a),
+            "PoK verified against wrong commitment should be rejected"
+        );
+        // Also verify the PoK still works against the correct commitment
+        assert!(verify_pok(1, &participant_a.commitments[0], &pok_a));
+    }
+
+    #[test]
+    fn test_dkg_with_pok_round3_rejects_invalid_pok() {
+        // Manually run the protocol and inject a forged PoK
+        let ids: Vec<SignerId> = vec![1, 2, 3];
+        let threshold = 2;
+
+        let mut participants = HashMap::new();
+        let mut all_poks = HashMap::new();
+        for &id in &ids {
+            let (p, pok) = dkg_round1(id, threshold);
+            participants.insert(id, p);
+            all_poks.insert(id, pok);
+        }
+
+        let all_commitments: HashMap<SignerId, Vec<RistrettoPoint>> = participants
+            .iter()
+            .map(|(&id, p)| (id, p.commitments.clone()))
+            .collect();
+
+        // Forge participant 2's PoK
+        all_poks.insert(
+            2,
+            ProofOfKnowledge {
+                r: random_scalar() * G,
+                s: random_scalar(),
+            },
+        );
+
+        // Round 2
+        let all_shares: HashMap<SignerId, HashMap<SignerId, Scalar>> = participants
+            .iter()
+            .map(|(&id, p)| (id, dkg_round2(p, &ids)))
+            .collect();
+
+        let mut received: HashMap<SignerId, HashMap<SignerId, Scalar>> = HashMap::new();
+        for &target_id in &ids {
+            let mut shares_for_target = HashMap::new();
+            for &sender_id in &ids {
+                if sender_id == target_id {
+                    continue;
+                }
+                shares_for_target.insert(sender_id, all_shares[&sender_id][&target_id]);
+            }
+            received.insert(target_id, shares_for_target);
+        }
+
+        // Round 3 should reject the forged PoK
+        let result = dkg_round3(
+            &participants[&1],
+            &received[&1],
+            &all_commitments,
+            &all_poks,
+        );
+        assert!(result.is_err(), "dkg_round3 should reject forged PoK");
+        match result {
+            Err(DkgError::InvalidProofOfKnowledge(id)) => assert_eq!(id, 2),
+            Err(other) => panic!("expected InvalidProofOfKnowledge(2), got {:?}", other),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 }

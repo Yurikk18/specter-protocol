@@ -214,8 +214,21 @@ impl Mint {
         signers: &[SignerId],
         nullifier_set: &mut crate::nullifier::NullifierSet,
     ) -> Result<Vec<crate::token::ProofCarryingToken>, MintError> {
-        // Verify value conservation
-        let total_out: u64 = output_values.iter().sum();
+        // Validate all output values BEFORE burning the nullifier
+        for &v in output_values {
+            if v == 0 {
+                return Err(MintError::InvalidValue);
+            }
+        }
+
+        // Verify value conservation using checked arithmetic to prevent overflow
+        let total_out: u64 = output_values
+            .iter()
+            .try_fold(0u64, |acc, &v| acc.checked_add(v))
+            .ok_or(MintError::ValueMismatch {
+                input: old_token.value,
+                output: u64::MAX,
+            })?;
         if total_out != old_token.value {
             return Err(MintError::ValueMismatch {
                 input: old_token.value,
@@ -223,17 +236,19 @@ impl Mint {
             });
         }
 
-        // Burn old token (publish nullifier)
+        // Issue new tokens BEFORE burning the nullifier to ensure atomicity
+        let new_tokens: Vec<crate::token::ProofCarryingToken> = output_values
+            .iter()
+            .map(|&v| self.issue(v, signers, None))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Burn old token (publish nullifier) only after successful issuance
         let nullifier = old_token.compute_nullifier();
         if !nullifier_set.insert(nullifier) {
             return Err(MintError::SigningFailed("token already spent".into()));
         }
 
-        // Issue new tokens for each output value
-        output_values
-            .iter()
-            .map(|&v| self.issue(v, signers, None))
-            .collect()
+        Ok(new_tokens)
     }
 }
 
@@ -309,6 +324,7 @@ mod tests {
             &mint.group_public_key(),
             &mint.pedersen,
             &mint.credential_issuer.pedersen,
+            0,
         );
         assert!(result.all_valid());
     }

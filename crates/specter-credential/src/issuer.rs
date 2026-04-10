@@ -70,6 +70,13 @@ impl Issuer {
     }
 }
 
+impl Drop for Issuer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+    }
+}
+
 impl Default for Issuer {
     fn default() -> Self {
         Self::new()

@@ -162,6 +162,9 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
     // Fixed fields
     let token_id = read_array32(data, &mut pos)?;
     let value = read_u64(data, &mut pos)?;
+    if value == 0 {
+        return Err(SerdeError::Io("token value must be non-zero".into()));
+    }
     let value_commitment = read_point(data, &mut pos)?;
     let vp_commitment = read_point(data, &mut pos)?;
     let vp_response = read_scalar(data, &mut pos)?;
@@ -171,6 +174,9 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
     let hash_chain_head = read_array32(data, &mut pos)?;
     let transfer_count = read_u32(data, &mut pos)?;
     let recursion_bound = read_u32(data, &mut pos)?;
+    if transfer_count > recursion_bound {
+        return Err(SerdeError::Io("transfer_count exceeds recursion_bound".into()));
+    }
 
     // Fold proof
     let fold_s = read_scalar(data, &mut pos)?;
@@ -190,6 +196,10 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         let jur_len = read_u8(data, &mut pos)? as usize;
         let jur_bytes = read_bytes(data, &mut pos, jur_len)?;
         let jurisdiction = String::from_utf8_lossy(jur_bytes).to_string();
+        // Validate jurisdiction contains only safe characters (prevent injection)
+        if !jurisdiction.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            return Err(SerdeError::Io("invalid jurisdiction characters".into()));
+        }
         let age_over_18 = read_u8(data, &mut pos)? != 0;
         let expires_at = read_u64(data, &mut pos)?;
         let signature_s = read_scalar(data, &mut pos)?;
@@ -297,6 +307,19 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         vdf_proof,
         bond_owner_id,
     })
+}
+
+/// Serialize a PCT for network transmission (blinding factor zeroed for privacy).
+///
+/// The blinding factor is holder-private and not needed for verification.
+/// Zeroing it prevents leaking the holder's private value during network transfer,
+/// while keeping the serialization format backward-compatible.
+pub fn serialize_token_public(token: &ProofCarryingToken) -> Vec<u8> {
+    let mut token_copy = token.clone();
+    if let Some(ref mut cred) = token_copy.credential {
+        cred.blinding = Scalar::ZERO;
+    }
+    serialize_token(&token_copy)
 }
 
 /// Get the actual serialized size of a token in bytes.
@@ -471,9 +494,10 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(1000, &[1, 2], Some(&test_attrs())).unwrap();
 
+        let mut ns = crate::nullifier::NullifierSet::new();
         let mut current = token;
         for _ in 0..5 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
 
         let bytes = serialize_token(&current);
@@ -498,6 +522,7 @@ mod tests {
             &mint.group_public_key(),
             &mint.pedersen,
             &mint.credential_issuer.pedersen,
+            0,
         );
         assert!(result.all_valid());
     }
@@ -505,13 +530,15 @@ mod tests {
     #[test]
     fn test_transferred_serialized_token_verifies() {
         let mint = test_mint();
-        let mut token = mint.issue(500, &[1, 2], Some(&test_attrs())).unwrap();
+        let token = mint.issue(500, &[1, 2], Some(&test_attrs())).unwrap();
 
+        let mut ns = crate::nullifier::NullifierSet::new();
+        let mut current = token;
         for _ in 0..3 {
-            token = transfer::transfer(&token).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
 
-        let bytes = serialize_token(&token);
+        let bytes = serialize_token(&current);
         let recovered = deserialize_token(&bytes).unwrap();
 
         let result = crate::verify::verify_token(
@@ -519,6 +546,7 @@ mod tests {
             &mint.group_public_key(),
             &mint.pedersen,
             &mint.credential_issuer.pedersen,
+            0,
         );
         assert!(result.all_valid());
     }
@@ -576,9 +604,10 @@ mod tests {
         assert!(full_size < 2000);
 
         // After 10 transfers (should be same size - constant!)
+        let mut ns = crate::nullifier::NullifierSet::new();
         let mut transferred = full.clone();
         for _ in 0..10 {
-            transferred = transfer::transfer(&transferred).unwrap().token;
+            transferred = transfer::transfer(transferred, &mut ns).unwrap().token;
         }
         let transferred_size = serialized_size(&transferred);
         println!("After 10 transfers: {} bytes", transferred_size);
@@ -592,7 +621,7 @@ mod tests {
     fn test_encrypted_roundtrip() {
         let mint = test_mint();
         let token = mint.issue(1000, &[1, 2], Some(&test_attrs())).unwrap();
-        let passphrase = b"strong-passphrase-123";
+        let passphrase = b"strong-passphrase-min8-123";
 
         let encrypted = serialize_encrypted(&token, passphrase);
         let recovered = deserialize_encrypted(&encrypted, passphrase).unwrap();
@@ -607,8 +636,8 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
-        let encrypted = serialize_encrypted(&token, b"correct");
-        let result = deserialize_encrypted(&encrypted, b"wrong");
+        let encrypted = serialize_encrypted(&token, b"correct-min8");
+        let result = deserialize_encrypted(&encrypted, b"wrong-mn8");
         assert!(result.is_err());
     }
 
@@ -617,11 +646,11 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
-        let mut encrypted = serialize_encrypted(&token, b"pass");
+        let mut encrypted = serialize_encrypted(&token, b"pass-min8");
         if !encrypted.ciphertext.is_empty() {
             encrypted.ciphertext[0] ^= 0xFF;
         }
-        let result = deserialize_encrypted(&encrypted, b"pass");
+        let result = deserialize_encrypted(&encrypted, b"pass-min8");
         assert!(result.is_err());
     }
 
@@ -630,14 +659,15 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(500, &[1, 3], Some(&test_attrs())).unwrap();
 
-        let encrypted = serialize_encrypted(&token, b"passphrase");
-        let recovered = deserialize_encrypted(&encrypted, b"passphrase").unwrap();
+        let encrypted = serialize_encrypted(&token, b"passphrase-min8");
+        let recovered = deserialize_encrypted(&encrypted, b"passphrase-min8").unwrap();
 
         let result = crate::verify::verify_token(
             &recovered,
             &mint.group_public_key(),
             &mint.pedersen,
             &mint.credential_issuer.pedersen,
+            0,
         );
         assert!(result.all_valid());
     }
@@ -648,7 +678,7 @@ mod tests {
         let token = mint.issue(1000, &[1, 2], None).unwrap();
         let owner_secret = token.owner_secret;
 
-        let encrypted = serialize_encrypted(&token, b"pass");
+        let encrypted = serialize_encrypted(&token, b"pass-min8");
 
         // The owner_secret should NOT appear in the ciphertext
         let secret_in_ciphertext = encrypted

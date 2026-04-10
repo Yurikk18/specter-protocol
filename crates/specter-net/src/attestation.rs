@@ -110,7 +110,7 @@ impl Attestation {
         prev: &[u8; 32],
     ) -> [u8; 32] {
         let digest = Sha256::new()
-            .chain_update(b"specter-attestation:")
+            .chain_update(b"specter-attestation-v2:")
             .chain_update(token_id)
             .chain_update(sender)
             .chain_update(receiver)

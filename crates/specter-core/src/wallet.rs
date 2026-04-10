@@ -30,9 +30,9 @@ impl Wallet {
         }
     }
 
-    /// Total balance across all tokens.
+    /// Total balance across all tokens (saturating to prevent overflow).
     pub fn balance(&self) -> u64 {
-        self.tokens.iter().map(|t| t.value).sum()
+        self.tokens.iter().map(|t| t.value).fold(0u64, |acc, v| acc.saturating_add(v))
     }
 
     /// Number of tokens in the wallet.
@@ -159,6 +159,10 @@ impl Wallet {
             return Err(WalletError::InvalidFormat);
         }
         let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        const MAX_TOKENS_PER_WALLET: usize = 100_000;
+        if count > MAX_TOKENS_PER_WALLET {
+            return Err(WalletError::InvalidFormat);
+        }
         let mut offset = 4;
         let mut tokens = Vec::with_capacity(count);
 
@@ -180,6 +184,7 @@ impl Wallet {
                 group_public_key,
                 pedersen,
                 credential_pedersen,
+                0,
             );
             if !vr.all_valid() {
                 return Err(WalletError::TokenVerificationFailed);
@@ -291,9 +296,10 @@ mod tests {
 
         let token = mint.issue(100, &[1, 2], None).unwrap();
         // Transfer 5 times to reach bound
+        let mut ns = crate::nullifier::NullifierSet::new();
         let mut current = token;
         for _ in 0..5 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
         wallet.add_token(current); // needs renewal
 
@@ -329,9 +335,10 @@ mod tests {
 
         // Exhausted token
         let token = mint.issue(200, &[1, 2], None).unwrap();
+        let mut ns = crate::nullifier::NullifierSet::new();
         let mut current = token;
         for _ in 0..5 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
         wallet.add_token(current);
 
@@ -378,8 +385,8 @@ mod tests {
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
         wallet.add_token(mint.issue(500, &[1, 2], None).unwrap());
 
-        let data = wallet.save(b"my-passphrase");
-        let loaded = load_wallet(&mint, &data, b"my-passphrase").unwrap();
+        let data = wallet.save(b"my-passphrase-min8");
+        let loaded = load_wallet(&mint, &data, b"my-passphrase-min8").unwrap();
 
         assert_eq!(loaded.balance(), 600);
         assert_eq!(loaded.token_count(), 2);
@@ -391,8 +398,8 @@ mod tests {
         let mut wallet = Wallet::new();
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
 
-        let data = wallet.save(b"correct");
-        let result = load_wallet(&mint, &data, b"wrong");
+        let data = wallet.save(b"correct-min8");
+        let result = load_wallet(&mint, &data, b"wrong-mn8");
         assert!(result.is_err());
     }
 
@@ -400,8 +407,8 @@ mod tests {
     fn test_save_load_empty_wallet() {
         let mint = setup_mint();
         let wallet = Wallet::new();
-        let data = wallet.save(b"pass");
-        let loaded = load_wallet(&mint, &data, b"pass").unwrap();
+        let data = wallet.save(b"pass-min8");
+        let loaded = load_wallet(&mint, &data, b"pass-min8").unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -414,8 +421,8 @@ mod tests {
         let original_id = token.token_id;
         wallet.add_token(token);
 
-        let data = wallet.save(b"pass");
-        let loaded = load_wallet(&mint, &data, b"pass").unwrap();
+        let data = wallet.save(b"pass-min8");
+        let loaded = load_wallet(&mint, &data, b"pass-min8").unwrap();
 
         let info = loaded.list_tokens();
         assert_eq!(info[0].value, 999);
@@ -428,11 +435,11 @@ mod tests {
         let mut wallet = Wallet::new();
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
 
-        let mut data = wallet.save(b"pass");
+        let mut data = wallet.save(b"pass-min8");
         if data.len() > 40 {
             data[40] ^= 0xFF;
         }
-        let result = load_wallet(&mint, &data, b"pass");
+        let result = load_wallet(&mint, &data, b"pass-min8");
         assert!(result.is_err());
     }
 }

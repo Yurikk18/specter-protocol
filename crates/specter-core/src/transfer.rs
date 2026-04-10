@@ -14,9 +14,13 @@ pub struct TransferResult {
 
 /// Transfer a token to a new owner.
 ///
-/// Updates: owner secret, hash chain, transfer count, fold proof.
-/// Returns the nullifier to publish for double-spend detection.
-pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferError> {
+/// Takes ownership of the token (move semantics) to prevent reuse.
+/// Atomically inserts the nullifier into the set to prevent double-spend.
+/// Returns the new token and the spent nullifier.
+pub fn transfer(
+    token: ProofCarryingToken,
+    nullifier_set: &mut crate::nullifier::NullifierSet,
+) -> Result<TransferResult, TransferError> {
     if token.value == 0 {
         return Err(TransferError::InvalidTokenValue);
     }
@@ -28,7 +32,13 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
         });
     }
 
+    // Atomically check and insert nullifier — prevents double-spend
     let spent_nullifier = token.compute_nullifier();
+    if !nullifier_set.insert(spent_nullifier) {
+        return Err(TransferError::DoubleSpend {
+            nullifier: spent_nullifier,
+        });
+    }
 
     // Generate new owner secret
     let mut new_owner_secret = [0u8; 32];
@@ -43,10 +53,12 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
     owner_hash.copy_from_slice(
         &specter_primitives::scalar_utils::hash_to_scalar(&new_owner_secret).as_bytes()[..32],
     );
+    let new_count = token.transfer_count.checked_add(1)
+        .ok_or(TransferError::FoldFailed("transfer count overflow".to_string()))?;
     let new_state = TransferState {
         token_id: token.token_id,
         owner_hash,
-        step: token.transfer_count.saturating_add(1),
+        step: new_count,
     };
     let new_fold_proof = accumulator::fold_transfer(
         &token.fold_proof,
@@ -63,7 +75,7 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
         mint_signature: token.mint_signature.clone(),
         owner_secret: new_owner_secret,
         hash_chain_head: new_hash_chain,
-        transfer_count: token.transfer_count.saturating_add(1),
+        transfer_count: new_count,
         recursion_bound: token.recursion_bound,
         fold_proof: new_fold_proof,
         credential: token.credential.clone(),
@@ -79,6 +91,8 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
 }
 
 /// Check a nullifier against the spent set to detect double-spending.
+/// NOTE: When using the new transfer() API, nullifier checking is automatic.
+/// This function is retained for external nullifier verification (e.g., network sync).
 pub fn check_double_spend(
     nullifier_set: &mut NullifierSet,
     nullifier: &[u8; 32],
@@ -125,30 +139,31 @@ mod tests {
     #[test]
     fn test_transfer_updates_fold_proof() {
         let (_, token) = setup();
-        let result = transfer(&token).unwrap();
+        let mut ns = NullifierSet::new();
+        let result = transfer(token, &mut ns).unwrap();
         assert_eq!(result.token.fold_proof.steps, 1);
     }
 
     #[test]
     fn test_transfer_chain_with_fold() {
-        let (_, mut token) = setup();
+        let (_, token) = setup();
+        let mut ns = NullifierSet::new();
+        let mut current = token;
         for i in 0..5 {
-            let result = transfer(&token).unwrap();
+            let result = transfer(current, &mut ns).unwrap();
             assert_eq!(result.token.fold_proof.steps, i + 1);
-            token = result.token;
+            current = result.token;
         }
-        assert!(transfer(&token).is_err()); // bound reached
+        assert!(transfer(current, &mut ns).is_err()); // bound reached
     }
 
     #[test]
     fn test_double_spend_detected() {
         let (_, token) = setup();
-        let r1 = transfer(&token).unwrap();
-        let r2 = transfer(&token).unwrap();
-        assert_eq!(r1.spent_nullifier, r2.spent_nullifier);
-
-        let mut set = NullifierSet::new();
-        assert!(check_double_spend(&mut set, &r1.spent_nullifier).is_ok());
-        assert!(check_double_spend(&mut set, &r2.spent_nullifier).is_err());
+        let mut ns = NullifierSet::new();
+        let _r1 = transfer(token.clone(), &mut ns).unwrap();
+        // Second transfer of the same token is atomically rejected
+        let r2 = transfer(token, &mut ns);
+        assert!(r2.is_err());
     }
 }

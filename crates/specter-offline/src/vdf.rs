@@ -60,11 +60,21 @@ pub fn evaluate(seed: &[u8; 32], iterations: u64) -> VdfProof {
     }
 }
 
+/// Maximum VDF iterations allowed during verification to prevent CPU exhaustion.
+const MAX_VDF_ITERATIONS: u64 = 10_000_000;
+
 /// Verify a VDF proof by recomputing the hash chain.
 ///
 /// In this prototype, verification has the same cost as evaluation.
 /// In production (with Wesolowski/Pietrzak), verification would be O(log T).
+/// Rejects proofs with excessive iterations to prevent DoS.
 pub fn verify(proof: &VdfProof) -> bool {
+    if proof.iterations > MAX_VDF_ITERATIONS {
+        return false;
+    }
+    if proof.iterations == 0 {
+        return false;
+    }
     let recomputed = evaluate(&proof.seed, proof.iterations);
     recomputed.output == proof.output
 }
@@ -146,10 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_iterations() {
+    fn test_zero_iterations_rejected() {
         let seed = [1u8; 32];
         let proof = evaluate(&seed, 0);
         assert_eq!(proof.output, seed);
-        assert!(verify(&proof));
+        // Zero iterations should be rejected -- provides no time-lock guarantee
+        assert!(!verify(&proof));
     }
 }

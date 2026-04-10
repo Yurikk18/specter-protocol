@@ -48,7 +48,16 @@ impl BondRegistry {
     }
 
     /// Deposit a bond (stake collateral).
-    pub fn deposit(&mut self, owner_id: [u8; 32], amount: u64) -> Bond {
+    /// Returns an error if the owner already has an active bond.
+    pub fn deposit(&mut self, owner_id: [u8; 32], amount: u64) -> Result<Bond, BondError> {
+        // Prevent overwriting an existing bond (which would orphan it)
+        if let Some(existing_id) = self.owner_bonds.get(&owner_id) {
+            if let Some(existing) = self.bonds.get(existing_id) {
+                if existing.active {
+                    return Err(BondError::AlreadyHasBond);
+                }
+            }
+        }
         let mut bond_id = [0u8; 32];
         use sha2::{Digest, Sha256};
         // Include random nonce to prevent bond_id collisions on identical deposits
@@ -74,7 +83,7 @@ impl BondRegistry {
 
         self.bonds.insert(bond_id, bond.clone());
         self.owner_bonds.insert(owner_id, bond_id);
-        bond
+        Ok(bond)
     }
 
     /// Check if an owner has sufficient bond for a given token value.
@@ -237,6 +246,9 @@ pub enum BondError {
 
     #[error("lock period has not elapsed - bond can still be slashed during this period")]
     LockPeriodNotElapsed,
+
+    #[error("owner already has an active bond")]
+    AlreadyHasBond,
 }
 
 #[cfg(test)]
@@ -252,7 +264,7 @@ mod tests {
     #[test]
     fn test_deposit_and_check_coverage() {
         let mut reg = BondRegistry::new();
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
         assert!(reg.check_coverage(&owner(1), 500));
         assert!(reg.check_coverage(&owner(1), 1000));
         assert!(!reg.check_coverage(&owner(1), 1001));
@@ -267,7 +279,7 @@ mod tests {
     #[test]
     fn test_register_and_settle() {
         let mut reg = BondRegistry::new();
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
 
         reg.register_offline_spend(&owner(1), 500).unwrap();
         assert!(reg.check_coverage(&owner(1), 500)); // 1000 - 500 = 500 left
@@ -280,14 +292,14 @@ mod tests {
     #[test]
     fn test_insufficient_bond() {
         let mut reg = BondRegistry::new();
-        reg.deposit(owner(1), 100);
+        reg.deposit(owner(1), 100).unwrap();
         assert!(reg.register_offline_spend(&owner(1), 200).is_err());
     }
 
     #[test]
     fn test_slash() {
         let mut reg = BondRegistry::new();
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
 
         let slashed = reg.slash(&owner(1)).unwrap();
         assert_eq!(slashed, 1000);
@@ -299,7 +311,7 @@ mod tests {
     fn test_withdraw_with_lock_period() {
         let mut reg = BondRegistry::new();
         reg.lock_period_secs = 100; // 100 seconds for testing
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
 
         // Can't withdraw without requesting first
         assert!(reg.withdraw(&owner(1), 0).is_err());
@@ -319,7 +331,7 @@ mod tests {
     #[test]
     fn test_withdraw_with_exposure_fails() {
         let mut reg = BondRegistry::new();
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
         reg.register_offline_spend(&owner(1), 500).unwrap();
         // Can't even request withdrawal with exposure
         assert!(reg.request_withdrawal(&owner(1), 0).is_err());
@@ -329,7 +341,7 @@ mod tests {
     fn test_slash_during_lock_period() {
         let mut reg = BondRegistry::new();
         reg.lock_period_secs = 100;
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
 
         // Request withdrawal
         reg.request_withdrawal(&owner(1), 1000).unwrap();
@@ -345,8 +357,8 @@ mod tests {
     #[test]
     fn test_multiple_owners() {
         let mut reg = BondRegistry::new();
-        reg.deposit(owner(1), 1000);
-        reg.deposit(owner(2), 500);
+        reg.deposit(owner(1), 1000).unwrap();
+        reg.deposit(owner(2), 500).unwrap();
 
         assert!(reg.check_coverage(&owner(1), 900));
         assert!(reg.check_coverage(&owner(2), 400));
@@ -360,7 +372,7 @@ mod tests {
         reg.lock_period_secs = 100;
 
         // Deposit
-        reg.deposit(owner(1), 1000);
+        reg.deposit(owner(1), 1000).unwrap();
 
         // Spend offline
         reg.register_offline_spend(&owner(1), 300).unwrap();

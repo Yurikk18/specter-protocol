@@ -190,6 +190,10 @@ impl ConsensusState {
     }
 
     pub fn submit_nullifier(&mut self, nullifier: [u8; 32]) {
+        const MAX_PENDING_NULLIFIERS: usize = 100_000;
+        if self.pending_nullifiers.len() >= MAX_PENDING_NULLIFIERS {
+            return; // drop under memory pressure
+        }
         if !self.committed_nullifiers.contains(&nullifier)
             && !self.pending_nullifiers.contains(&nullifier)
         {
@@ -236,6 +240,14 @@ impl ConsensusState {
         let voter_pk = self.validator_keys.get(&vote.voter)
             .ok_or(ConsensusError::UnknownVoter(vote.voter))?;
 
+        // Validate vote height matches current consensus height
+        if vote.block_height != self.current_height {
+            return Err(ConsensusError::WrongHeight {
+                expected: self.current_height,
+                got: vote.block_height,
+            });
+        }
+
         // Verify Schnorr signature
         if !verify_vote_signature(&vote, voter_pk) {
             return Err(ConsensusError::InvalidVoteSignature(vote.voter));
@@ -253,6 +265,14 @@ impl ConsensusState {
     }
 
     pub fn try_commit(&mut self, block: &NullifierBlock) -> Result<bool, ConsensusError> {
+        // Verify block hash integrity before committing
+        let computed = NullifierBlock::compute_hash(
+            block.height, block.leader, &block.nullifiers, &block.prev_hash,
+        );
+        if computed != block.hash {
+            return Err(ConsensusError::InvalidBlockHash);
+        }
+
         let votes = self.votes.get(&block.hash).cloned().unwrap_or_default();
         let approvals = votes.iter().filter(|v| v.approve).count();
 
@@ -304,6 +324,12 @@ pub enum ConsensusError {
 
     #[error("equivocation detected: leader {leader} proposed different blocks at height {height}")]
     Equivocation { leader: NodeId, height: u64 },
+
+    #[error("vote for wrong height: expected {expected}, got {got}")]
+    WrongHeight { expected: u64, got: u64 },
+
+    #[error("block hash mismatch: block contents do not match hash")]
+    InvalidBlockHash,
 }
 
 #[cfg(test)]

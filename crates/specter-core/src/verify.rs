@@ -47,12 +47,13 @@ impl VerificationResult {
 /// 2. Value commitment correctness
 /// 3. Transfer count within recursion bound
 /// 4. Accumulated fold proof validity
-/// 5. Compliance credential presentation (if present)
+/// 5. Compliance credential presentation (if present) + expiry
 pub fn verify_token(
     token: &ProofCarryingToken,
     group_public_key: &RistrettoPoint,
     pedersen: &PedersenParams,
     credential_pedersen: &PedersenParams,
+    current_time: u64,
 ) -> VerificationResult {
     // 1. Verify mint signature
     let signed_msg = mint::build_signed_message(&token.token_id, &token.value_commitment);
@@ -87,9 +88,13 @@ pub fn verify_token(
     };
     let fold_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
 
-    // 5. Verify credential presentation (if present)
+    // 5. Verify credential presentation (if present) + check expiry
     let credential_valid = token.presentation.as_ref().map(|pres| {
-        presentation::verify_presentation(pres, credential_pedersen)
+        let sig_valid = presentation::verify_presentation(pres, credential_pedersen);
+        let not_expired = token.credential.as_ref().map_or(true, |cred| {
+            cred.attributes.expires_at == 0 || current_time <= cred.attributes.expires_at
+        });
+        sig_valid && not_expired
     });
 
     // 6. Verify VDF proof (if present)
@@ -136,7 +141,7 @@ mod tests {
     fn test_fresh_token_valid() {
         let mint = setup();
         let token = mint.issue(500, &[1, 2], Some(&test_attrs())).unwrap();
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(result.signature_valid);
         assert!(result.value_valid);
         assert!(result.within_bound);
@@ -149,11 +154,12 @@ mod tests {
     fn test_transferred_token_valid() {
         let mint = setup();
         let token = mint.issue(500, &[1, 2], Some(&test_attrs())).unwrap();
+        let mut ns = crate::nullifier::NullifierSet::new();
         let mut current = token;
         for _ in 0..5 {
-            current = transfer::transfer(&current).unwrap().token;
+            current = transfer::transfer(current, &mut ns).unwrap().token;
         }
-        let result = verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(result.all_valid());
     }
 
@@ -161,7 +167,7 @@ mod tests {
     fn test_no_credential_still_valid() {
         let mint = setup();
         let token = mint.issue(500, &[1, 2], None).unwrap();
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(result.all_valid());
         assert_eq!(result.credential_valid, None);
     }
@@ -171,7 +177,7 @@ mod tests {
         let mint = setup();
         let mut token = mint.issue(500, &[1, 2], None).unwrap();
         token.value = 9999;
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(!result.value_valid);
         assert!(!result.all_valid());
     }
@@ -181,14 +187,13 @@ mod tests {
         let mint = setup();
         let token = mint.issue(1000, &[1, 2], Some(&test_attrs())).unwrap();
         let mut current = token;
-        let mut nullifier_set = crate::nullifier::NullifierSet::new();
+        let mut ns = crate::nullifier::NullifierSet::new();
 
         for i in 0..10 {
-            let result = transfer::transfer(&current).unwrap();
-            assert!(transfer::check_double_spend(&mut nullifier_set, &result.spent_nullifier).is_ok());
+            let result = transfer::transfer(current, &mut ns).unwrap();
             current = result.token;
 
-            let vr = verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+            let vr = verify_token(&current, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
             assert!(vr.all_valid(), "failed at step {}", i);
             assert_eq!(vr.credential_valid, Some(true));
         }
@@ -198,7 +203,7 @@ mod tests {
     fn test_token_with_vdf() {
         let mint = setup();
         let token = mint.issue_full(500, &[1, 2], Some(&test_attrs()), Some(50), None).unwrap();
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(result.all_valid());
         assert_eq!(result.vdf_valid, Some(true));
     }
@@ -209,7 +214,7 @@ mod tests {
         let bond_owner = [99u8; 32];
         let token = mint.issue_full(500, &[1, 2], None, None, Some(bond_owner)).unwrap();
         assert!(token.has_bond());
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(result.all_valid());
     }
 
@@ -222,14 +227,15 @@ mod tests {
         assert!(token.has_bond());
         assert!(!token.is_vdf_expired(50));
 
-        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(result.all_valid());
         assert_eq!(result.credential_valid, Some(true));
         assert_eq!(result.vdf_valid, Some(true));
 
         // Transfer preserves all features
-        let transferred = crate::transfer::transfer(&token).unwrap().token;
-        let vr = verify_token(&transferred, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        let mut ns = crate::nullifier::NullifierSet::new();
+        let transferred = crate::transfer::transfer(token, &mut ns).unwrap().token;
+        let vr = verify_token(&transferred, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
         assert!(vr.all_valid());
         assert!(transferred.has_bond());
     }

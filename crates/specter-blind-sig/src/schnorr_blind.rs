@@ -28,6 +28,13 @@ pub struct SignerSession {
     k: Scalar,
 }
 
+impl Drop for SignerSession {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.k.zeroize();
+    }
+}
+
 impl SignerKeypair {
     /// Generate a new random keypair.
     pub fn generate() -> Self {
@@ -65,6 +72,14 @@ impl SignerSession {
 pub struct BlindingFactors {
     alpha: Scalar,
     beta: Scalar,
+}
+
+impl Drop for BlindingFactors {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.alpha.zeroize();
+        self.beta.zeroize();
+    }
 }
 
 /// Blind a challenge for a message.
@@ -141,13 +156,15 @@ pub fn verify(pk: &RistrettoPoint, message: &[u8], sig: &BlindSignature) -> bool
 
 // ─── Internal ───────────────────────────────────────────────────────────────
 
-/// Hash a Ristretto point and message to a scalar challenge.
+/// Hash a Ristretto point, public key, and message to a scalar challenge.
 ///
-/// H(R || message) using SHA-512 reduced to a scalar.
+/// H(R || PK || message) using SHA-512 reduced to a scalar.
+/// Including PK prevents key-substitution (rogue-key) attacks.
 fn hash_challenge(r: &RistrettoPoint, message: &[u8]) -> Scalar {
     let hash = Sha512::new()
         .chain_update(b"specter-blind-sig-challenge:")
         .chain_update(r.compress().as_bytes())
+        .chain_update((message.len() as u64).to_le_bytes())
         .chain_update(message)
         .finalize();
     let mut wide = [0u8; 64];

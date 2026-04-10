@@ -1,7 +1,10 @@
 /target
-Cargo.lock
 *.swp
 *.swo
 .DS_Store
 .env
 *.pdb
+*.dat
+*.key
+*.secret
+specter_wallet.*
