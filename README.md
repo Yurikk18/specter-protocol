@@ -166,6 +166,16 @@ See [docs/phantasm-plano-completo.md](docs/phantasm-plano-completo.md) for the f
 - Faller et al., "Lattice-based Threshold Blind Signatures" (2025)
 - Goodell et al., "Private Electronic Payments with Self-Custody" (FC 2025)
 
+## Disclaimer
+
+Specter Protocol is published as open-source software for research and educational purposes. This software is provided "as is," without warranty of any kind.
+
+This software implements cryptographic primitives including blind signatures, anonymous credentials, and peer-to-peer token transfer mechanisms. The publication of this source code is protected as free expression under applicable law, including but not limited to the First Amendment to the United States Constitution (Bernstein v. United States, 176 F.3d 1132, 9th Cir. 1999), the EU Charter of Fundamental Rights Article 13 (freedom of sciences), and Brazil's Marco Civil da Internet (Lei 12.965/2014).
+
+The authors do not operate any financial service, money transmission business, or virtual asset service. Users are solely responsible for compliance with all applicable laws in their jurisdiction. This software is not intended to facilitate any unlawful activity.
+
+This software is publicly available encryption source code published in accordance with 15 CFR 742.15(b).
+
 ## License
 
 [MIT](LICENSE)

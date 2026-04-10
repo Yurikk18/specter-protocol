@@ -81,18 +81,6 @@ fn default_mint() -> Mint {
     })
 }
 
-/// Get a deterministic mint by seeding the RNG.
-/// This ensures the same mint keys across CLI sessions.
-fn persistent_mint() -> Mint {
-    // Seed with a fixed value so keys are consistent across invocations.
-    // This is NOT secure for production - it's for CLI demo only.
-    use rand::SeedableRng;
-    // We can't easily seed the global rng, so we use default_mint
-    // and accept that wallet must be re-created if keys change.
-    // The wallet load will fail gracefully and create a new one.
-    default_mint()
-}
-
 fn cmd_setup() {
     // Note: each CLI invocation generates a new random mint.
     // Wallet persistence works within a single session.

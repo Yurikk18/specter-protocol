@@ -85,6 +85,7 @@ pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
             buf.push(jur.len() as u8);
             buf.extend_from_slice(jur);
             buf.push(cred.attributes.age_over_18 as u8);
+            buf.extend_from_slice(&cred.attributes.expires_at.to_le_bytes());
             // Signature
             write_scalar(&mut buf, &cred.signature_s);
             write_scalar(&mut buf, &cred.signature_e);
@@ -185,6 +186,7 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         let jur_bytes = read_bytes(data, &mut pos, jur_len)?;
         let jurisdiction = String::from_utf8_lossy(jur_bytes).to_string();
         let age_over_18 = read_u8(data, &mut pos)? != 0;
+        let expires_at = read_u64(data, &mut pos)?;
         let signature_s = read_scalar(data, &mut pos)?;
         let signature_e = read_scalar(data, &mut pos)?;
         let issuer_pk = read_point(data, &mut pos)?;
@@ -197,7 +199,7 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
                 not_sanctioned,
                 jurisdiction,
                 age_over_18,
-                expires_at: 0,
+                expires_at,
             },
             signature_s,
             signature_e,
