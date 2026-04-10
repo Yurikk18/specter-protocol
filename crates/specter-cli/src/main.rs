@@ -31,6 +31,8 @@ fn main() {
         "mint" => cmd_mint(&args),
         "balance" => cmd_balance(),
         "transfer" => cmd_transfer(),
+        "send" => cmd_send(&args),
+        "receive" => cmd_receive(&args),
         "save" => cmd_save(),
         "load" => cmd_load(),
         "demo" => run_demo(),
@@ -53,6 +55,8 @@ fn print_help() {
     println!("  mint <value>        Mint a token with given value");
     println!("  balance             Show wallet balance and tokens");
     println!("  transfer            Transfer first available token");
+    println!("  send <addr>         Send a token via TCP (default: 127.0.0.1:7878)");
+    println!("  receive <addr>      Listen for a token via TCP (default: 0.0.0.0:7878)");
     println!("  save                Save wallet to encrypted file");
     println!("  load                Load wallet from encrypted file");
     println!("  demo                Run full protocol demonstration");
@@ -71,10 +75,10 @@ fn default_attrs() -> Attributes {
 }
 
 fn default_mint() -> Mint {
-    // Use a fixed mint for CLI consistency across sessions.
-    // In production, the mint would be a network service with persistent keys.
-    // lazy_static or OnceCell would be ideal, but for a CLI tool this works.
-    Mint::setup(MintConfig {
+    // Use DKG-based mint for production-grade key generation.
+    // Each invocation generates fresh keys (consistent within session).
+    // In production, mint keys would be loaded from persistent storage.
+    Mint::setup_with_dkg(MintConfig {
         threshold: 2,
         total_signers: 3,
         recursion_bound: 20,
@@ -190,6 +194,97 @@ fn cmd_load() {
     println!("Wallet loaded from {}", WALLET_FILE);
     println!("  Balance: {}", wallet.balance());
     println!("  Tokens:  {}", wallet.token_count());
+}
+
+fn cmd_send(args: &[String]) {
+    let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:7878");
+    let mint = default_mint();
+    let mut wallet = load_or_create_wallet(&mint);
+
+    if wallet.is_empty() {
+        println!("Wallet is empty. Mint a token first.");
+        return;
+    }
+
+    let token = match wallet.select_token(1) {
+        Some(t) => t.clone(),
+        None => {
+            println!("No transferable tokens.");
+            return;
+        }
+    };
+    let id = token.token_id;
+    let bytes = serde_token::serialize_token(&token);
+
+    // Send over TCP: [4-byte length][token bytes]
+    match std::net::TcpStream::connect(addr) {
+        Ok(mut stream) => {
+            use std::io::Write;
+            stream.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+            stream.write_all(&bytes).unwrap();
+
+            wallet.remove_token(&id);
+            let data = wallet.save(b"specter");
+            std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+            println!("Sent token {} to {} ({} bytes)", hex::encode(&id[..8]), addr, bytes.len());
+        }
+        Err(e) => {
+            eprintln!("Failed to connect to {}: {}", addr, e);
+        }
+    }
+}
+
+fn cmd_receive(args: &[String]) {
+    let addr = args.get(2).map(|s| s.as_str()).unwrap_or("0.0.0.0:7878");
+
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind {}: {}", addr, e);
+            return;
+        }
+    };
+    println!("Listening on {}...", addr);
+
+    match listener.accept() {
+        Ok((mut stream, peer)) => {
+            use std::io::Read;
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).unwrap();
+
+            match serde_token::deserialize_token(&buf) {
+                Ok(token) => {
+                    let mint = default_mint();
+                    let vr = verify::verify_token(
+                        &token, &mint.group_public_key(), &mint.pedersen,
+                        &mint.credential_issuer.pedersen,
+                    );
+
+                    if vr.all_valid() {
+                        let id = token.token_id;
+                        let mut wallet = load_or_create_wallet(&mint);
+                        wallet.add_token(token);
+                        let data = wallet.save(b"specter");
+                        std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+                        println!("Received valid token {} from {} ({} bytes)",
+                            hex::encode(&id[..8]), peer, len);
+                    } else {
+                        eprintln!("Received INVALID token from {}!", peer);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to deserialize token: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to accept connection: {}", e);
+        }
+    }
 }
 
 fn load_or_create_wallet(mint: &Mint) -> Wallet {

@@ -178,11 +178,15 @@ impl Mint {
             specter_offline::vdf::evaluate(&seed, iters)
         });
 
+        // Create ZK proof of value (proves commitment contains claimed value
+        // WITHOUT revealing the blinding factor)
+        let value_proof = self.pedersen.prove_value(&scalar_from_u64(value), &blinding);
+
         Ok(ProofCarryingToken {
             token_id,
             value,
             value_commitment,
-            value_blinding: blinding,
+            value_proof,
             mint_signature: signature,
             owner_secret,
             hash_chain_head,

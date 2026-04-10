@@ -56,7 +56,9 @@ pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
     buf.extend_from_slice(&token.token_id);                          // 32
     buf.extend_from_slice(&token.value.to_le_bytes());               // 8
     write_point(&mut buf, &token.value_commitment);                  // 32
-    write_scalar(&mut buf, &token.value_blinding);                   // 32
+    // ValueProof: commitment point (32) + response scalar (32) = 64 bytes
+    write_point(&mut buf, &token.value_proof.commitment);             // 32
+    write_scalar(&mut buf, &token.value_proof.response);              // 32
     write_scalar(&mut buf, &token.mint_signature.s);                 // 32
     write_scalar(&mut buf, &token.mint_signature.e);                 // 32
     buf.extend_from_slice(&token.owner_secret);                      // 32
@@ -161,7 +163,8 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
     let token_id = read_array32(data, &mut pos)?;
     let value = read_u64(data, &mut pos)?;
     let value_commitment = read_point(data, &mut pos)?;
-    let value_blinding = read_scalar(data, &mut pos)?;
+    let vp_commitment = read_point(data, &mut pos)?;
+    let vp_response = read_scalar(data, &mut pos)?;
     let sig_s = read_scalar(data, &mut pos)?;
     let sig_e = read_scalar(data, &mut pos)?;
     let owner_secret = read_array32(data, &mut pos)?;
@@ -271,7 +274,10 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         token_id,
         value,
         value_commitment,
-        value_blinding,
+        value_proof: specter_primitives::pedersen::ValueProof {
+            commitment: vp_commitment,
+            response: vp_response,
+        },
         mint_signature: BlindSignature { s: sig_s, e: sig_e },
         owner_secret,
         hash_chain_head,

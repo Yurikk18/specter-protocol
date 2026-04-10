@@ -59,7 +59,7 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
         token_id: token.token_id,
         value: token.value,
         value_commitment: token.value_commitment,
-        value_blinding: token.value_blinding,
+        value_proof: token.value_proof.clone(),
         mint_signature: token.mint_signature.clone(),
         owner_secret: new_owner_secret,
         hash_chain_head: new_hash_chain,

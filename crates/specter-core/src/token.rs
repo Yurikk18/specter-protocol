@@ -8,7 +8,7 @@
 //! - A nullifier commitment (for double-spend detection)
 //! - Value commitment (hides the denomination)
 
-use curve25519_dalek::{RistrettoPoint, Scalar};
+use curve25519_dalek::RistrettoPoint;
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 use zeroize::Zeroize;
 
@@ -33,8 +33,9 @@ pub struct ProofCarryingToken {
     /// Pedersen commitment to the value: C = value*G + blinding*H.
     pub value_commitment: RistrettoPoint,
 
-    /// Blinding factor for the value commitment (known only to the current owner).
-    pub value_blinding: Scalar,
+    /// ZK proof that the commitment contains the claimed value.
+    /// Proves knowledge of blinding factor WITHOUT revealing it.
+    pub value_proof: specter_primitives::pedersen::ValueProof,
 
     /// Blind signature from the threshold mint.
     pub mint_signature: BlindSignature,
@@ -74,7 +75,7 @@ impl std::fmt::Debug for ProofCarryingToken {
             .field("token_id", &hex::encode(self.token_id))
             .field("value", &self.value)
             .field("owner_secret", &"[REDACTED]")
-            .field("value_blinding", &"[REDACTED]")
+            .field("value_proof", &"[ZK proof]")
             .field("transfer_count", &self.transfer_count)
             .field("recursion_bound", &self.recursion_bound)
             .field("has_credential", &self.credential.is_some())
@@ -137,7 +138,7 @@ impl ProofCarryingToken {
 impl Drop for ProofCarryingToken {
     fn drop(&mut self) {
         self.owner_secret.zeroize();
-        self.value_blinding.zeroize();
+        // value_proof contains no raw secrets (only ZK proof components)
     }
 }
 
@@ -172,11 +173,13 @@ mod tests {
         };
         let fold_proof = specter_fold::accumulator::create_initial_proof(&genesis);
 
+        let value_proof = params.prove_value(&scalar_from_u64(value), &blinding);
+
         ProofCarryingToken {
             token_id: [42u8; 32],
             value,
             value_commitment: commitment,
-            value_blinding: blinding,
+            value_proof,
             mint_signature: BlindSignature {
                 s: random_scalar(),
                 e: random_scalar(),

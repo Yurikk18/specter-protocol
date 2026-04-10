@@ -33,6 +33,21 @@ impl PedersenParams {
     ///
     /// The commitment hides the value (via the random blinding factor)
     /// and is binding (the committer cannot change the value later).
+    ///
+    /// ```
+    /// use specter_primitives::pedersen::PedersenParams;
+    /// use specter_primitives::scalar_utils::{scalar_from_u64, random_scalar};
+    ///
+    /// let params = PedersenParams::new();
+    /// let value = scalar_from_u64(100);
+    /// let blinding = random_scalar();
+    /// let c = params.commit(&value, &blinding);
+    ///
+    /// // Commitment is binding: can verify with the same inputs
+    /// assert!(params.verify_opening(&c, &value, &blinding));
+    /// // But fails with wrong value
+    /// assert!(!params.verify_opening(&c, &scalar_from_u64(999), &blinding));
+    /// ```
     pub fn commit(&self, value: &Scalar, blinding: &Scalar) -> RistrettoPoint {
         RistrettoPoint::multiscalar_mul(&[*value, *blinding], &[self.g, self.h])
     }

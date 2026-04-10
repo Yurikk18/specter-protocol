@@ -59,11 +59,12 @@ pub fn verify_token(
     let signature_valid = schnorr_blind::verify(group_public_key, &signed_msg, &token.mint_signature);
 
     // 2. Verify value commitment
+    // 2. Verify value via ZK proof (no raw blinding factor needed)
     let value_scalar = scalar_from_u64(token.value);
-    let value_valid = pedersen.verify_opening(
+    let value_valid = pedersen.verify_value_proof(
         &token.value_commitment,
         &value_scalar,
-        &token.value_blinding,
+        &token.value_proof,
     );
 
     // 3. Check transfer count
