@@ -77,11 +77,11 @@ pub fn reconstruct_secret(shares: &[Share]) -> Option<Scalar> {
         // L_i(0) = product_{j != i} (0 - x_j) / (x_i - x_j)
         //        = product_{j != i} (-x_j) / (x_i - x_j)
         let mut basis = Scalar::ONE;
-        for j in 0..shares.len() {
+        for (j, share_j) in shares.iter().enumerate() {
             if i == j {
                 continue;
             }
-            let xj = &shares[j].x;
+            let xj = &share_j.x;
             // numerator: (0 - x_j) = -x_j
             // denominator: (x_i - x_j)
             let num = -xj;

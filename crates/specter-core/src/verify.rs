@@ -24,6 +24,8 @@ pub struct VerificationResult {
     pub fold_valid: bool,
     /// Whether the compliance credential presentation is valid (None if no credential).
     pub credential_valid: Option<bool>,
+    /// Whether the VDF time-lock proof is valid (None if no VDF).
+    pub vdf_valid: Option<bool>,
 }
 
 impl VerificationResult {
@@ -33,7 +35,8 @@ impl VerificationResult {
             && self.value_valid
             && self.within_bound
             && self.fold_valid
-            && self.credential_valid.unwrap_or(true) // no credential = no check needed
+            && self.credential_valid.unwrap_or(true)
+            && self.vdf_valid.unwrap_or(true)
     }
 }
 
@@ -79,12 +82,18 @@ pub fn verify_token(
         presentation::verify_presentation(pres, credential_pedersen)
     });
 
+    // 6. Verify VDF proof (if present)
+    let vdf_valid = token.vdf_proof.as_ref().map(|proof| {
+        specter_offline::vdf::verify(proof)
+    });
+
     VerificationResult {
         signature_valid,
         value_valid,
         within_bound,
         fold_valid,
         credential_valid,
+        vdf_valid,
     }
 }
 
@@ -172,5 +181,45 @@ mod tests {
             assert!(vr.all_valid(), "failed at step {}", i);
             assert_eq!(vr.credential_valid, Some(true));
         }
+    }
+
+    #[test]
+    fn test_token_with_vdf() {
+        let mint = setup();
+        let token = mint.issue_full(500, &[1, 2], Some(&test_attrs()), Some(50), None).unwrap();
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        assert!(result.all_valid());
+        assert_eq!(result.vdf_valid, Some(true));
+    }
+
+    #[test]
+    fn test_token_with_bond() {
+        let mint = setup();
+        let bond_owner = [99u8; 32];
+        let token = mint.issue_full(500, &[1, 2], None, None, Some(bond_owner)).unwrap();
+        assert!(token.has_bond());
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        assert!(result.all_valid());
+    }
+
+    #[test]
+    fn test_token_with_all_features() {
+        let mint = setup();
+        let token = mint.issue_full(500, &[1, 2], Some(&test_attrs()), Some(50), Some([1u8; 32])).unwrap();
+
+        assert!(token.has_credential());
+        assert!(token.has_bond());
+        assert!(!token.is_vdf_expired(50));
+
+        let result = verify_token(&token, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        assert!(result.all_valid());
+        assert_eq!(result.credential_valid, Some(true));
+        assert_eq!(result.vdf_valid, Some(true));
+
+        // Transfer preserves all features
+        let transferred = crate::transfer::transfer(&token).unwrap().token;
+        let vr = verify_token(&transferred, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+        assert!(vr.all_valid());
+        assert!(transferred.has_bond());
     }
 }

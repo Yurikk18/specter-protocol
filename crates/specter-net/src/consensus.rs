@@ -43,8 +43,8 @@ impl NullifierBlock {
     fn compute_hash(height: u64, leader: NodeId, nullifiers: &[[u8; 32]]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"specter-block:");
-        hasher.update(&height.to_le_bytes());
-        hasher.update(&leader.to_le_bytes());
+        hasher.update(height.to_le_bytes());
+        hasher.update(leader.to_le_bytes());
         for n in nullifiers {
             hasher.update(n);
         }

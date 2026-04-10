@@ -6,7 +6,6 @@ description = "P2P network protocol and BFT consensus for Specter"
 
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
-specter-core = { path = "../specter-core" }
 sha2 = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }

@@ -64,6 +64,8 @@ pub fn transfer(token: &ProofCarryingToken) -> Result<TransferResult, TransferEr
         fold_proof: new_fold_proof,
         credential: token.credential.clone(),
         presentation: token.presentation.clone(),
+        vdf_proof: token.vdf_proof.clone(),
+        bond_owner_id: token.bond_owner_id,
     };
 
     Ok(TransferResult {

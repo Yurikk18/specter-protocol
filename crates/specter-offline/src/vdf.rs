@@ -49,7 +49,7 @@ pub fn evaluate(seed: &[u8; 32], iterations: u64) -> VdfProof {
     let mut current = *seed;
 
     for _ in 0..iterations {
-        let hash = Sha256::digest(&current);
+        let hash = Sha256::digest(current);
         current.copy_from_slice(&hash);
     }
 
@@ -80,7 +80,7 @@ pub fn create_seed(token_id: &[u8; 32], timestamp_secs: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"specter-vdf-seed:");
     hasher.update(token_id);
-    hasher.update(&timestamp_secs.to_le_bytes());
+    hasher.update(timestamp_secs.to_le_bytes());
     let hash = hasher.finalize();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&hash);

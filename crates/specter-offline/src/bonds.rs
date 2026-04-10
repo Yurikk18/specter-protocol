@@ -47,8 +47,8 @@ impl BondRegistry {
         use sha2::{Digest, Sha256};
         let hash = Sha256::new()
             .chain_update(b"specter-bond:")
-            .chain_update(&owner_id)
-            .chain_update(&amount.to_le_bytes())
+            .chain_update(owner_id)
+            .chain_update(amount.to_le_bytes())
             .finalize();
         bond_id.copy_from_slice(&hash);
 

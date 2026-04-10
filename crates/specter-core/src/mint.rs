@@ -41,12 +41,28 @@ impl Mint {
         }
     }
 
-    /// Issue a new token with the given value and optional compliance attributes.
+    /// Issue a new token with the given value and optional features.
+    ///
+    /// - `attributes`: compliance credential (KYC, sanctions, etc.)
+    /// - `vdf_iterations`: if set, creates a VDF time-lock proof
+    /// - `bond_owner_id`: if set, links the token to a reputation bond
     pub fn issue(
         &self,
         value: u64,
         signers: &[SignerId],
         attributes: Option<&Attributes>,
+    ) -> Result<ProofCarryingToken, MintError> {
+        self.issue_full(value, signers, attributes, None, None)
+    }
+
+    /// Issue with all optional features.
+    pub fn issue_full(
+        &self,
+        value: u64,
+        signers: &[SignerId],
+        attributes: Option<&Attributes>,
+        vdf_iterations: Option<u64>,
+        bond_owner_id: Option<[u8; 32]>,
     ) -> Result<ProofCarryingToken, MintError> {
         // Generate random token ID and owner secret
         let mut token_id = [0u8; 32];
@@ -90,6 +106,12 @@ impl Mint {
         // Hash chain genesis
         let hash_chain_head = crate::token::advance_hash_chain(&[0u8; 32], &token_id);
 
+        // VDF time-lock (if requested)
+        let vdf_proof = vdf_iterations.map(|iters| {
+            let seed = specter_offline::vdf::create_seed(&token_id, 0);
+            specter_offline::vdf::evaluate(&seed, iters)
+        });
+
         Ok(ProofCarryingToken {
             token_id,
             value,
@@ -103,6 +125,8 @@ impl Mint {
             fold_proof,
             credential,
             presentation: pres,
+            vdf_proof,
+            bond_owner_id,
         })
     }
 

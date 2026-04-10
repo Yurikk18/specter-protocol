@@ -60,7 +60,7 @@ fn run_demo() {
     // Mint with credential
     println!("[2/6] Minting token with compliance credential...");
     let token = mint.issue(1000, &[1, 3], Some(&default_attrs())).unwrap();
-    println!("  Token ID:          {}", hex::encode(&token.token_id));
+    println!("  Token ID:          {}", hex::encode(token.token_id));
     println!("  Value:             {}", token.value);
     println!("  Has credential:    {}", token.has_credential());
     println!("  Fold proof steps:  {}", token.fold_proof.steps);

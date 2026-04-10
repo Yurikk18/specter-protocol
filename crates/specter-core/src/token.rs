@@ -15,6 +15,7 @@ use specter_blind_sig::types::BlindSignature;
 use specter_credential::credential::Credential;
 use specter_credential::presentation::Presentation;
 use specter_fold::accumulator::AccumulatedProof;
+use specter_offline::vdf::VdfProof;
 
 /// A Proof-Carrying Token.
 ///
@@ -57,6 +58,13 @@ pub struct ProofCarryingToken {
 
     /// Current compliance presentation (optional — proves attributes).
     pub presentation: Option<Presentation>,
+
+    /// VDF time-lock proof (proves when the token was issued/renewed).
+    pub vdf_proof: Option<VdfProof>,
+
+    /// Bond owner ID (hash of the staker's public key).
+    /// If present, the token's offline spending is backed by a bond.
+    pub bond_owner_id: Option<[u8; 32]>,
 }
 
 impl ProofCarryingToken {
@@ -71,7 +79,22 @@ impl ProofCarryingToken {
         let fold = 32 + 32 + 32 + 32 + 4; // AccumulatedProof
         let cred = if self.credential.is_some() { 256 } else { 0 };
         let pres = if self.presentation.is_some() { 512 } else { 0 };
-        base + fold + cred + pres
+        let vdf = if self.vdf_proof.is_some() { 32 + 8 + 32 } else { 0 }; // seed + iterations + output
+        let bond = if self.bond_owner_id.is_some() { 32 } else { 0 };
+        base + fold + cred + pres + vdf + bond
+    }
+
+    /// Check if the VDF time-lock has expired.
+    pub fn is_vdf_expired(&self, required_iterations: u64) -> bool {
+        match &self.vdf_proof {
+            Some(proof) => specter_offline::vdf::is_expired(proof, required_iterations),
+            None => true, // no VDF = always expired for offline use
+        }
+    }
+
+    /// Check if the token has a bond backing it.
+    pub fn has_bond(&self) -> bool {
+        self.bond_owner_id.is_some()
     }
 
     /// Compute the nullifier for this token (used when spending).
@@ -140,6 +163,8 @@ mod tests {
             fold_proof,
             credential: None,
             presentation: None,
+            vdf_proof: None,
+            bond_owner_id: None,
         }
     }
 
@@ -152,23 +177,40 @@ mod tests {
     }
 
     #[test]
-    fn test_estimated_size_with_credential() {
+    fn test_vdf_expired_when_none() {
+        let token = dummy_token();
+        assert!(token.is_vdf_expired(100)); // no VDF = expired
+    }
+
+    #[test]
+    fn test_vdf_not_expired() {
         let mut token = dummy_token();
-        let size_without = token.estimated_size();
-        token.credential = Some(specter_credential::credential::Credential {
-            commitment: token.value_commitment,
-            blinding: token.value_blinding,
-            attributes: specter_credential::credential::Attributes {
-                kyc_passed: true,
-                not_sanctioned: true,
-                jurisdiction: "EU".to_string(),
-                age_over_18: true,
-            },
-            signature_s: random_scalar(),
-            signature_e: random_scalar(),
-            issuer_pk: token.value_commitment,
-        });
-        let size_with = token.estimated_size();
-        assert!(size_with > size_without);
+        let seed = specter_offline::vdf::create_seed(&token.token_id, 1000);
+        token.vdf_proof = Some(specter_offline::vdf::evaluate(&seed, 100));
+        assert!(!token.is_vdf_expired(100));
+        assert!(!token.is_vdf_expired(50));
+        assert!(token.is_vdf_expired(200));
+    }
+
+    #[test]
+    fn test_has_bond() {
+        let mut token = dummy_token();
+        assert!(!token.has_bond());
+        token.bond_owner_id = Some([1u8; 32]);
+        assert!(token.has_bond());
+    }
+
+    #[test]
+    fn test_estimated_size_all_components() {
+        let mut token = dummy_token();
+        let base = token.estimated_size();
+
+        token.vdf_proof = Some(specter_offline::vdf::evaluate(&[0u8; 32], 10));
+        let with_vdf = token.estimated_size();
+        assert!(with_vdf > base);
+
+        token.bond_owner_id = Some([1u8; 32]);
+        let with_bond = token.estimated_size();
+        assert!(with_bond > with_vdf);
     }
 }

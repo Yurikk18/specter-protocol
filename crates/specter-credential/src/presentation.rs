@@ -213,7 +213,7 @@ fn hash_presentation_challenge(
     hasher.update(proof_commitment.compress().as_bytes());
     hasher.update(issuer_pk.compress().as_bytes());
     for (i, v) in disclosed {
-        hasher.update(&(*i as u64).to_le_bytes());
+        hasher.update((*i as u64).to_le_bytes());
         hasher.update(v.as_bytes());
     }
     let hash = hasher.finalize();
