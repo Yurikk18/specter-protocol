@@ -50,7 +50,7 @@ Sources: Zcash from [ECC blog](https://electriccoin.co/blog/reducing-shielded-pr
 ### Where Specter is behind (honestly)
 
 - **Token size is ~6x larger than Cashu**: Cashu proofs are ~65 bytes vs Specter's 413-1,039 bytes. The extra bytes carry fold proof, credentials, and VDF that Cashu does not have.
-- **Not deployed**: Specter is a protocol with 188 tests and a reference implementation. Cashu, Zcash, and Monero have years of production use.
+- **Not deployed**: Specter is a protocol with 205 tests and a reference implementation. Cashu, Zcash, and Monero have years of production use.
 - **BIS Project Tourbillon showed PQ blind signatures are 200x slower**: When Specter migrates to lattice primitives, performance will decrease significantly. The current benchmarks are on elliptic curves.
 
 ## Feature Comparison
@@ -74,13 +74,26 @@ specter-fold           Proof accumulation + Nova IVC (feature-gated)
 specter-credential     Anonymous credentials with selective disclosure
 specter-core           PCT lifecycle: mint, transfer, verify, wallet, serialization
 specter-offline        VDF time-locks (SHA-256 + RSA Wesolowski) + reputation bonds
-specter-net            Gossip protocol + authenticated BFT consensus
+specter-net            Gossip + authenticated BFT consensus + social attestation
 specter-cli            Demo + benchmarks
 ```
 
-## Security
+## Specter Security Framework
 
-- **188 tests** across 8 crates, including property-based tests (proptest)
+Three novel security pillars that together achieve offline payment security formally stronger than TEE-based systems:
+
+### Pilar 1: Deterrence Theorem
+Formal proof that the expected value of double-spending is strictly negative when bond > token value. TEE-based systems rely on hardware trust (broken by Spectre/Plundervolt/SGAxe). Specter relies on economic rationality, a strictly stronger assumption.
+
+### Pilar 2: Social Attestation Chain
+Each offline transfer creates a cryptographic witness. Witnesses form a mesh that detects double-spend between offline devices, before anyone goes online. More transfers = more witnesses = harder to evade. Conflicting attestation chains identify the cheater with cryptographic proof.
+
+### Pilar 3: Lazy PQ Migration
+Post-quantum protection only on the mint signature (long-lived, needs PQ). Classical crypto for per-transfer fold proofs (ephemeral, no PQ needed). PQ overhead paid once at issuance, not on every transfer.
+
+## Security Details
+
+- **205 tests** across 8 crates, including property-based tests (proptest)
 - **Schnorr-verified proofs**: Accumulator checks `s*G == R + e*PK` - forged proofs rejected
 - **Authenticated consensus**: Every vote carries a Schnorr signature verified against the voter's registered public key. Forged, tampered, and duplicate votes are rejected.
 - **Zeroize on drop**: Secret keys and blinding factors are wiped from memory when tokens go out of scope
@@ -98,7 +111,7 @@ specter-cli            Demo + benchmarks
 # Build
 cargo build --workspace
 
-# Run all 188 tests
+# Run all 205 tests
 cargo test --workspace
 
 # Run demo

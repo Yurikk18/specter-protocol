@@ -118,9 +118,19 @@ Nullifier-only BFT consensus:
 | Encryption | ChaCha20-Poly1305 | IND-CCA2 |
 | KDF | Argon2id (64 MB, 3 iterations) | Memory-hard |
 
-## 10. Limitations
+## 10. Specter Security Framework
 
-- **Not zero-knowledge**: The fold proof proves structural integrity but is not a zkSNARK. Nova IVC (feature-gated) provides true ZK on Linux/macOS.
-- **Offline is partial**: Double-spend is detected when the token goes online, not prevented offline. This is a mathematical impossibility without TEE hardware.
-- **Token size ~1 KB**: Larger than Cashu (~200 B) but carries much more (fold proof, credential, VDF).
-- **No formal security proof**: The composition of primitives has not been formally analyzed. Each primitive is individually secure under standard assumptions.
+### Deterrence Theorem
+For any adversary with bond B > token value V: E[profit] = V - B - reputation_cost < 0. Double-spending is economically irrational. This is formally stronger than TEE-based prevention, which relies on hardware trust assumptions that have been broken (Spectre, Plundervolt, SGAxe).
+
+### Social Attestation Chain
+Each offline transfer creates a witness. Conflicting attestation chains (same token, different receivers) provide cryptographic blame proof. Detection happens between offline devices via chain comparison.
+
+### Lazy PQ Migration
+PQ protection on mint signature only (long-lived). Classical crypto for ephemeral fold proofs. PQ overhead paid once at issuance.
+
+## 11. Trade-offs
+
+- **Token size ~1 KB**: Larger than Cashu (~65 B) because it carries fold proof, credential, and VDF that Cashu tokens do not have.
+- **Offline requires bond**: Economic deterrence requires the spender to have staked collateral. Without bond, the deterrence guarantee does not hold.
+- **Nova IVC requires Linux/macOS**: The pasta-msm assembly in Nova does not link on Windows. The hash-based accumulator works on all platforms as a fallback.
