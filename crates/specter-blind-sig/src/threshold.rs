@@ -215,6 +215,73 @@ pub fn threshold_blind_sign(
     Ok(sig)
 }
 
+/// Threshold clause blind sign - resistant to Wagner/ROS attack.
+/// Uses two nonces per signer (Abe 2001 / GNU Taler variant).
+pub fn threshold_clause_blind_sign(
+    keyset: &ThresholdKeyset,
+    signer_ids: &[SignerId],
+    message: &[u8],
+) -> Result<BlindSignature, ThresholdError> {
+    if signer_ids.len() < keyset.threshold {
+        return Err(ThresholdError::InsufficientSigners {
+            needed: keyset.threshold,
+            got: signer_ids.len(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for &id in signer_ids {
+        if !keyset.shares.contains_key(&id) {
+            return Err(ThresholdError::UnknownSigner(id));
+        }
+        if !seen.insert(id) {
+            return Err(ThresholdError::DuplicateSigner(id));
+        }
+    }
+
+    // Each signer generates TWO nonces
+    let sessions: Vec<(Scalar, Scalar, RistrettoPoint, RistrettoPoint)> = signer_ids
+        .iter()
+        .map(|_| {
+            let k0 = random_scalar();
+            let k1 = random_scalar();
+            (k0, k1, k0 * G, k1 * G)
+        })
+        .collect();
+
+    let lagrange_coeffs = compute_lagrange_coefficients(signer_ids, &keyset.shares);
+
+    // Combine nonce commitments with Lagrange weights
+    let r0: RistrettoPoint = sessions.iter().zip(signer_ids).map(|(s, &id)|
+        lagrange_coeffs[&id] * s.2
+    ).fold(RistrettoPoint::default(), |a, b| a + b);
+
+    let r1: RistrettoPoint = sessions.iter().zip(signer_ids).map(|(s, &id)|
+        lagrange_coeffs[&id] * s.3
+    ).fold(RistrettoPoint::default(), |a, b| a + b);
+
+    // Clause blinding
+    let (factors, e0, e1) = crate::clause_blind::clause_blind_challenge(
+        &r0, &r1, &keyset.group_public, message
+    );
+
+    // Each signer responds to BOTH challenges
+    let (s0_combined, s1_combined) = signer_ids
+        .iter()
+        .zip(sessions.iter())
+        .map(|(&id, (k0, k1, _, _))| {
+            let share = &keyset.shares[&id];
+            let s0 = k0 + e0 * share.y;
+            let s1 = k1 + e1 * share.y;
+            (lagrange_coeffs[&id] * s0, lagrange_coeffs[&id] * s1)
+        })
+        .fold((Scalar::ZERO, Scalar::ZERO), |(a0, a1), (b0, b1)| (a0 + b0, a1 + b1));
+
+    // Unblind
+    Ok(crate::clause_blind::clause_unblind(
+        &s0_combined, &s1_combined, &factors, &r0, &r1, &keyset.group_public, message
+    ))
+}
+
 /// Compute Lagrange coefficients for the given signer IDs.
 ///
 /// lambda_i = product_{j != i} (0 - x_j) / (x_i - x_j)

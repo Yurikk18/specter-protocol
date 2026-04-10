@@ -21,20 +21,23 @@ pub struct NullifierBlock {
     pub height: u64,
     pub leader: NodeId,
     pub nullifiers: Vec<[u8; 32]>,
+    /// Hash of the previous block (chain linking for fork detection).
+    pub prev_hash: [u8; 32],
     pub hash: [u8; 32],
 }
 
 impl NullifierBlock {
-    pub fn new(height: u64, leader: NodeId, nullifiers: Vec<[u8; 32]>) -> Self {
-        let hash = Self::compute_hash(height, leader, &nullifiers);
-        Self { height, leader, nullifiers, hash }
+    pub fn new(height: u64, leader: NodeId, nullifiers: Vec<[u8; 32]>, prev_hash: [u8; 32]) -> Self {
+        let hash = Self::compute_hash(height, leader, &nullifiers, &prev_hash);
+        Self { height, leader, nullifiers, prev_hash, hash }
     }
 
-    fn compute_hash(height: u64, leader: NodeId, nullifiers: &[[u8; 32]]) -> [u8; 32] {
+    fn compute_hash(height: u64, leader: NodeId, nullifiers: &[[u8; 32]], prev_hash: &[u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"specter-block:");
         hasher.update(height.to_le_bytes());
         hasher.update(leader.to_le_bytes());
+        hasher.update(prev_hash);
         for n in nullifiers { hasher.update(n); }
         let digest = hasher.finalize();
         let mut hash = [0u8; 32];
@@ -146,6 +149,8 @@ pub struct ConsensusState {
     pub pending_nullifiers: Vec<[u8; 32]>,
     votes: HashMap<[u8; 32], Vec<Vote>>,
     pub view: u64,
+    /// Seen proposals for equivocation detection: (height, leader) -> first hash.
+    seen_proposals: HashMap<(u64, NodeId), [u8; 32]>,
 }
 
 impl ConsensusState {
@@ -175,6 +180,7 @@ impl ConsensusState {
             pending_nullifiers: Vec::new(),
             votes: HashMap::new(),
             view: 0,
+            seen_proposals: HashMap::new(),
         })
     }
 
@@ -199,7 +205,27 @@ impl ConsensusState {
             });
         }
         let nullifiers: Vec<[u8; 32]> = self.pending_nullifiers.drain(..).collect();
-        Ok(NullifierBlock::new(self.current_height, self.node_id, nullifiers))
+        let prev_hash = self.committed_blocks.last()
+            .map(|b| b.hash)
+            .unwrap_or([0u8; 32]);
+        Ok(NullifierBlock::new(self.current_height, self.node_id, nullifiers, prev_hash))
+    }
+
+    /// Receive a proposal and check for equivocation.
+    /// A leader who proposes different blocks at the same height is equivocating.
+    pub fn receive_proposal(&mut self, block: &NullifierBlock) -> Result<(), ConsensusError> {
+        let key = (block.height, block.leader);
+        match self.seen_proposals.get(&key) {
+            Some(prev) if *prev != block.hash => {
+                return Err(ConsensusError::Equivocation {
+                    leader: block.leader,
+                    height: block.height,
+                });
+            }
+            None => { self.seen_proposals.insert(key, block.hash); }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Receive and authenticate a vote.
@@ -275,6 +301,9 @@ pub enum ConsensusError {
 
     #[error("duplicate vote from voter {0}")]
     DuplicateVote(NodeId),
+
+    #[error("equivocation detected: leader {leader} proposed different blocks at height {height}")]
+    Equivocation { leader: NodeId, height: u64 },
 }
 
 #[cfg(test)]

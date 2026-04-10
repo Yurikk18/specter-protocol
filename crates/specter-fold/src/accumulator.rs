@@ -29,6 +29,9 @@ pub struct AccumulatedProof {
     pub state_hash: [u8; 32],
     /// Number of steps accumulated.
     pub steps: u32,
+    /// Rolling hash of all PKs used in the proof chain.
+    /// Binds each PK to the derivation history, preventing PK forgery.
+    pub pk_chain_hash: [u8; 32],
 }
 
 /// State snapshot at a given transfer step.
@@ -86,6 +89,12 @@ pub fn create_initial_proof(genesis_state: &TransferState) -> AccumulatedProof {
     let mut state_hash = [0u8; 32];
     transcript.squeeze_bytes(b"state-hash", &mut state_hash);
 
+    // Initial PK chain hash
+    let mut pk_chain_hash = [0u8; 32];
+    let mut chain_transcript = Transcript::new(b"specter-pk-chain");
+    chain_transcript.absorb(b"pk", pk.compress().as_bytes());
+    chain_transcript.squeeze_bytes(b"chain", &mut pk_chain_hash);
+
     AccumulatedProof {
         s,
         e,
@@ -93,6 +102,7 @@ pub fn create_initial_proof(genesis_state: &TransferState) -> AccumulatedProof {
         pk,
         state_hash,
         steps: 0,
+        pk_chain_hash,
     }
 }
 
@@ -128,6 +138,7 @@ pub fn fold_transfer(
     transcript.absorb(b"new-state", &new_state.to_bytes());
     transcript.absorb(b"step", &new_state.step.to_le_bytes());
     transcript.absorb(b"PK", pk.compress().as_bytes());
+    transcript.absorb(b"pk-chain", &current_proof.pk_chain_hash);
     transcript.absorb(b"new-R", new_r.compress().as_bytes());
 
     let new_e = transcript.challenge(b"fold-challenge");
@@ -136,6 +147,13 @@ pub fn fold_transfer(
     let mut new_state_hash = [0u8; 32];
     transcript.squeeze_bytes(b"accumulated-state", &mut new_state_hash);
 
+    // Extend PK chain hash
+    let mut pk_chain_hash = [0u8; 32];
+    let mut chain_transcript = Transcript::new(b"specter-pk-chain");
+    chain_transcript.absorb(b"prev", &current_proof.pk_chain_hash);
+    chain_transcript.absorb(b"pk", pk.compress().as_bytes());
+    chain_transcript.squeeze_bytes(b"chain", &mut pk_chain_hash);
+
     Ok(AccumulatedProof {
         s: new_s,
         e: new_e,
@@ -143,6 +161,7 @@ pub fn fold_transfer(
         pk,
         state_hash: new_state_hash,
         steps: current_proof.steps + 1,
+        pk_chain_hash,
     })
 }
 
@@ -276,6 +295,7 @@ mod tests {
             pk: fake_sk * G,
             state_hash: [99u8; 32],
             steps: 0,
+            pk_chain_hash: [0u8; 32],
         };
         // Must be REJECTED
         assert!(!verify_accumulated_proof(&forged, &g));

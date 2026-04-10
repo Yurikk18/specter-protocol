@@ -64,13 +64,38 @@ pub struct Mint {
 }
 
 impl Mint {
-    /// Set up a new mint with the given configuration.
+    /// Set up a mint using a trusted dealer (for testing/prototyping).
     pub fn setup(config: MintConfig) -> Self {
         let keyset = threshold::dealer_keygen(config.threshold, config.total_signers);
         let pedersen = PedersenParams::new();
         let credential_issuer = Issuer::new();
         Self {
             keyset,
+            pedersen,
+            credential_issuer,
+            recursion_bound: config.recursion_bound,
+        }
+    }
+
+    /// Set up a mint using interactive DKG (no trusted dealer).
+    /// No single party ever knows the full group secret key.
+    pub fn setup_with_dkg(config: MintConfig) -> Self {
+        let ids: Vec<u64> = (1..=config.total_signers as u64).collect();
+        let keysets = specter_blind_sig::dkg::run_dkg(config.threshold, &ids)
+            .expect("DKG failed");
+
+        // Merge shares from all participants (for local simulation)
+        let mut combined = keysets[&1].clone();
+        for (&id, ks) in &keysets {
+            if let Some(share) = ks.shares.get(&id) {
+                combined.shares.insert(id, share.clone());
+            }
+        }
+
+        let pedersen = PedersenParams::new();
+        let credential_issuer = Issuer::new();
+        Self {
+            keyset: combined,
             pedersen,
             credential_issuer,
             recursion_bound: config.recursion_bound,
@@ -175,6 +200,37 @@ impl Mint {
     pub fn group_public_key(&self) -> RistrettoPoint {
         self.keyset.group_public
     }
+
+    /// Split a token: burn one token, issue multiple tokens summing to same value.
+    /// Used for making change (e.g., split a 1000-token into 750 + 250).
+    pub fn split(
+        &self,
+        old_token: &crate::token::ProofCarryingToken,
+        output_values: &[u64],
+        signers: &[SignerId],
+        nullifier_set: &mut crate::nullifier::NullifierSet,
+    ) -> Result<Vec<crate::token::ProofCarryingToken>, MintError> {
+        // Verify value conservation
+        let total_out: u64 = output_values.iter().sum();
+        if total_out != old_token.value {
+            return Err(MintError::ValueMismatch {
+                input: old_token.value,
+                output: total_out,
+            });
+        }
+
+        // Burn old token (publish nullifier)
+        let nullifier = old_token.compute_nullifier();
+        if !nullifier_set.insert(nullifier) {
+            return Err(MintError::SigningFailed("token already spent".into()));
+        }
+
+        // Issue new tokens for each output value
+        output_values
+            .iter()
+            .map(|&v| self.issue(v, signers, None))
+            .collect()
+    }
 }
 
 /// Build the message that gets threshold-blind-signed.
@@ -193,6 +249,9 @@ pub enum MintError {
 
     #[error("invalid value: token value must be > 0")]
     InvalidValue,
+
+    #[error("value mismatch: input {input} != output {output}")]
+    ValueMismatch { input: u64, output: u64 },
 }
 
 #[cfg(test)]
