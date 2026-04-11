@@ -1341,6 +1341,7 @@ dependencies = [
  "specter-primitives",
  "subtle",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

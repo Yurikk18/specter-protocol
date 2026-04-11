@@ -2,7 +2,7 @@
 
 use crate::nullifier::NullifierSet;
 use crate::token::{self, ProofCarryingToken};
-use specter_fold::accumulator::{self, TransferState};
+use specter_fold::accumulator;
 use specter_primitives::pedersen::PedersenParams;
 
 /// Result of a transfer operation.
@@ -49,21 +49,24 @@ pub fn transfer(
     // Advance hash chain
     let new_hash_chain = token::advance_hash_chain(&token.hash_chain_head, &new_owner_secret);
 
-    // Fold the transfer into the accumulated proof
-    let mut owner_hash = [0u8; 32];
-    owner_hash.copy_from_slice(
-        &specter_primitives::scalar_utils::hash_to_scalar(&new_owner_secret).as_bytes()[..32],
-    );
+    // Derive the new owner's public signing key from their fresh secret,
+    // and the CURRENT owner's signing key from the token's owner_secret
+    // — the latter is used to sign the transfer step under the signed
+    // chain protocol.
+    let new_owner_pk = accumulator::derive_owner_signing_pk(&new_owner_secret);
+    let prev_owner_sk = accumulator::derive_owner_signing_key(&token.owner_secret);
+
     let new_count = token.transfer_count.checked_add(1)
         .ok_or(TransferError::FoldFailed("transfer count overflow".to_string()))?;
-    let new_state = TransferState {
-        token_id: token.token_id,
-        owner_hash,
-        step: new_count,
-    };
-    let new_fold_proof = accumulator::fold_transfer(
+
+    // Append a signed step to the chain. fold_transfer_signed cross-
+    // checks that prev_owner_sk matches the current chain tip, so a
+    // cloned token whose owner_secret was swapped will fail here.
+    let new_fold_proof = accumulator::fold_transfer_signed(
         &token.fold_proof,
-        &new_state,
+        &prev_owner_sk,
+        new_owner_pk,
+        &token.token_id,
         token.recursion_bound,
     )
     .map_err(|e| TransferError::FoldFailed(e.to_string()))?;

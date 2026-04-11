@@ -76,17 +76,24 @@ pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
     buf.extend_from_slice(&token.transfer_count.to_le_bytes());      // 4
     buf.extend_from_slice(&token.recursion_bound.to_le_bytes());     // 4
 
-    // Fold proof
-    write_scalar(&mut buf, &token.fold_proof.s);                     // 32
-    write_scalar(&mut buf, &token.fold_proof.e);                     // 32
-    write_point(&mut buf, &token.fold_proof.r);                      // 32
-    write_point(&mut buf, &token.fold_proof.pk);                     // 32
-    buf.extend_from_slice(&token.fold_proof.state_hash);             // 32
-    buf.extend_from_slice(&token.fold_proof.pk_chain_hash);          // 32
-    buf.extend_from_slice(&token.fold_proof.genesis_state_hash);     // 32
-    buf.extend_from_slice(&token.fold_proof.current_owner_hash);    // 32
-    buf.extend_from_slice(&token.fold_proof.steps.to_le_bytes());    // 4
-    buf.extend_from_slice(&token.genesis_owner_hash);               // 32
+    // Fold proof (signed transfer chain format).
+    //
+    // Layout:
+    //   genesis_owner_pk     (32)  — Ristretto compressed
+    //   steps_count          (4)   — u32 LE, must equal chain length and
+    //                                must not exceed recursion_bound
+    //   foreach step in chain:
+    //     new_owner_pk       (32)
+    //     sig_r              (32)
+    //     sig_s              (32, canonical scalar)
+    write_point(&mut buf, &token.fold_proof.genesis_owner_pk);
+    buf.extend_from_slice(&token.fold_proof.steps.to_le_bytes());
+    for step in &token.fold_proof.steps_chain {
+        write_point(&mut buf, &step.new_owner_pk);
+        write_point(&mut buf, &step.sig_r);
+        write_scalar(&mut buf, &step.sig_s);
+    }
+    buf.extend_from_slice(&token.genesis_owner_hash);               // 32 (legacy)
 
     // Optional: credential (flag byte + data)
     match &token.credential {
@@ -191,16 +198,29 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         return Err(SerdeError::Io("transfer_count exceeds recursion_bound".into()));
     }
 
-    // Fold proof
-    let fold_s = read_scalar(data, &mut pos)?;
-    let fold_e = read_scalar(data, &mut pos)?;
-    let fold_r = read_point(data, &mut pos)?;
-    let fold_pk = read_point(data, &mut pos)?;
-    let fold_state_hash = read_array32(data, &mut pos)?;
-    let fold_pk_chain_hash = read_array32(data, &mut pos)?;
-    let fold_genesis_state_hash = read_array32(data, &mut pos)?;
-    let fold_current_owner_hash = read_array32(data, &mut pos)?;
+    // Fold proof (signed transfer chain).
+    let genesis_owner_pk = read_point(data, &mut pos)?;
     let fold_steps = read_u32(data, &mut pos)?;
+    // Bound the chain length to defeat DoS via huge pre-allocation.
+    const MAX_FOLD_STEPS: u32 = 10_000;
+    if fold_steps > MAX_FOLD_STEPS {
+        return Err(SerdeError::Io(format!(
+            "fold steps {} exceeds cap {}",
+            fold_steps, MAX_FOLD_STEPS
+        )));
+    }
+    let mut steps_chain =
+        Vec::<specter_fold::accumulator::TransferStep>::with_capacity(fold_steps as usize);
+    for _ in 0..fold_steps {
+        let new_owner_pk = read_point(data, &mut pos)?;
+        let sig_r = read_point(data, &mut pos)?;
+        let sig_s = read_scalar(data, &mut pos)?;
+        steps_chain.push(specter_fold::accumulator::TransferStep {
+            new_owner_pk,
+            sig_r,
+            sig_s,
+        });
+    }
     let genesis_owner_hash = read_array32(data, &mut pos)?;
 
     // Optional: credential
@@ -310,14 +330,8 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         transfer_count,
         recursion_bound,
         fold_proof: AccumulatedProof {
-            s: fold_s,
-            e: fold_e,
-            r: fold_r,
-            pk: fold_pk,
-            state_hash: fold_state_hash,
-            pk_chain_hash: fold_pk_chain_hash,
-            genesis_state_hash: fold_genesis_state_hash,
-            current_owner_hash: fold_current_owner_hash,
+            genesis_owner_pk,
+            steps_chain,
             steps: fold_steps,
         },
         genesis_owner_hash,
@@ -668,14 +682,25 @@ mod tests {
 
     #[test]
     fn test_real_token_sizes() {
+        // With the signed-chain accumulator (replaces the old constant-
+        // size Schnorr accumulator whose step > 0 soundness was broken),
+        // the fold proof now grows linearly with the number of transfers:
+        // each step adds ~96 bytes (new_owner_pk + sig_r + sig_s).
+        //
+        // This is a deliberate trade-off: proof size for cryptographic
+        // soundness. The growth is bounded by `recursion_bound`.
+        //
+        // The test now asserts the growth rate is within expected bounds.
+        const PER_STEP_BYTES: usize = 96;
+        const STEP_GROWTH_TOLERANCE: usize = 8; // serialization rounding
+
         let mint = test_mint();
 
         // Basic token (no credential, no VDF, no bond)
         let basic = mint.issue(1000, &[1, 2], None).unwrap();
         let basic_size = serialized_size(&basic);
         println!("Basic token size: {} bytes", basic_size);
-        assert!(basic_size > 300);
-        assert!(basic_size < 600);
+        assert!(basic_size > 300 && basic_size < 800, "basic size = {}", basic_size);
 
         // Full token (credential + VDF + bond)
         let full = mint
@@ -683,22 +708,31 @@ mod tests {
             .unwrap();
         let full_size = serialized_size(&full);
         println!("Full token size:  {} bytes", full_size);
-        assert!(full_size > basic_size);
-        assert!(full_size < 2000);
+        assert!(full_size > basic_size && full_size < 2200);
 
-        // After 10 transfers (should be same size - constant!)
-        // Issue a fresh identical token for transfer (PCT is non-Clone by design)
+        // After 10 transfers: each transfer adds PER_STEP_BYTES.
         let mut ns = crate::nullifier::NullifierSet::new();
         let mut transferred = mint
             .issue_full(1000, &[1, 2], Some(&test_attrs()), Some(50), Some([1u8; 32]))
             .unwrap();
+        let start_size = serialized_size(&transferred);
         for _ in 0..10 {
             transferred = transfer::transfer(transferred, &mut ns).unwrap().token;
         }
         let transferred_size = serialized_size(&transferred);
-        println!("After 10 transfers: {} bytes", transferred_size);
-        // Size should be approximately the same (constant-size proof)
-        assert!((transferred_size as i64 - full_size as i64).unsigned_abs() < 50);
+        println!(
+            "After 10 transfers: {} bytes (start {} bytes)",
+            transferred_size, start_size
+        );
+        let growth = transferred_size - start_size;
+        let expected_growth = 10 * PER_STEP_BYTES;
+        assert!(
+            growth <= expected_growth + STEP_GROWTH_TOLERANCE
+                && growth + STEP_GROWTH_TOLERANCE >= expected_growth,
+            "unexpected growth: {} vs expected ~{}",
+            growth,
+            expected_growth
+        );
     }
 
     // ─── Encrypted serialization tests ──────────────────────────────

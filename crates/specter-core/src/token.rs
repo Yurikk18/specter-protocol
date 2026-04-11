@@ -177,17 +177,23 @@ mod tests {
         let blinding = random_scalar();
         let commitment = params.commit(&scalar_from_u64(value), &blinding);
 
+        // Derive the genesis owner pk from a fixed owner_secret so tests
+        // are deterministic. The signed-chain accumulator anchors the
+        // proof to this pk via its hash.
+        let owner_secret = [1u8; 32];
+        let genesis_owner_pk =
+            specter_fold::accumulator::derive_owner_signing_pk(&owner_secret);
+        let owner_hash =
+            specter_fold::accumulator::owner_pk_hash(&genesis_owner_pk);
         let genesis = specter_fold::accumulator::TransferState {
             token_id: [42u8; 32],
-            owner_hash: [1u8; 32],
+            owner_hash,
             step: 0,
         };
-        let fold_proof = specter_fold::accumulator::create_initial_proof(&genesis);
+        let fold_proof =
+            specter_fold::accumulator::create_initial_proof_with_pk(&genesis, genesis_owner_pk);
 
         let value_proof = params.prove_value(&scalar_from_u64(value), &blinding);
-
-        let mut owner_hash = [0u8; 32];
-        owner_hash.copy_from_slice(&specter_primitives::scalar_utils::hash_to_scalar(&[1u8; 32]).as_bytes()[..32]);
 
         ProofCarryingToken {
             token_id: [42u8; 32],
@@ -198,7 +204,7 @@ mod tests {
                 s: random_scalar(),
                 e: random_scalar(),
             },
-            owner_secret: [1u8; 32],
+            owner_secret,
             hash_chain_head: [0u8; 32],
             transfer_count: 0,
             recursion_bound: 20,

@@ -648,62 +648,6 @@ mod identity_tests {
     }
 }
 
-/// Perform ephemeral ECDH and derive a shared ChaCha20-Poly1305 key.
-///
-/// # Security Warning
-///
-/// This is an UNAUTHENTICATED ephemeral DH exchange. It protects against
-/// passive eavesdropping but NOT against active MitM attacks. Prefer
-/// [`authenticated_handshake`], which performs SIGMA-I mutual auth over
-/// long-term identity keys. This function is retained for demos and for
-/// environments where out-of-band identity distribution is unavailable.
-#[allow(dead_code)]
-fn dh_handshake(stream: &mut std::net::TcpStream, is_initiator: bool) -> Option<[u8; 32]> {
-    eprintln!("WARNING: Unauthenticated DH handshake — vulnerable to MitM. Use authenticated_handshake for production.");
-
-    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
-    use curve25519_dalek::ristretto::CompressedRistretto;
-    use std::io::{Read, Write};
-    use std::time::Duration;
-    use zeroize::Zeroize;
-
-    // Set timeouts to prevent slow-peer DoS
-    let timeout = Some(Duration::from_secs(30));
-    stream.set_read_timeout(timeout).ok()?;
-    stream.set_write_timeout(timeout).ok()?;
-
-    let mut my_sk = specter_primitives::scalar_utils::random_scalar();
-    let my_pk = (my_sk * G).compress();
-
-    // Helper: send own pubkey then read peer pubkey.
-    let exchange_pubkeys = |stream: &mut std::net::TcpStream| -> Option<[u8; 32]> {
-        if is_initiator {
-            stream.write_all(my_pk.as_bytes()).ok()?;
-            stream.flush().ok()?;
-        }
-        let mut their_pk_bytes = [0u8; 32];
-        stream.read_exact(&mut their_pk_bytes).ok()?;
-        if !is_initiator {
-            stream.write_all(my_pk.as_bytes()).ok()?;
-            stream.flush().ok()?;
-        }
-        Some(their_pk_bytes)
-    };
-
-    let result = exchange_pubkeys(stream)
-        .and_then(|their_bytes| CompressedRistretto(their_bytes).decompress())
-        .map(|their_pk| {
-            let shared = my_sk * their_pk;
-            let key = sha2::Sha256::digest(shared.compress().as_bytes());
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&key);
-            out
-        });
-
-    my_sk.zeroize();
-    result
-}
-
 /// Encrypt bytes with a shared key using ChaCha20-Poly1305.
 fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
     use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};

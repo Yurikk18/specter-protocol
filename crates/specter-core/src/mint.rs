@@ -150,20 +150,29 @@ impl Mint {
         let blinding = user_secrets.value_blinding;
         let value_commitment = user_secrets.value_commitment;
 
-        // Threshold blind sign
-        let signed_msg = build_signed_message(&token_id, &value_commitment);
+        // Derive the genesis owner's public signing key from the
+        // owner_secret. The mint signed message binds the token to
+        // this pk via its hash, so any later forged chain has to
+        // recover a valid mint signature for the same genesis pk.
+        let genesis_owner_pk = accumulator::derive_owner_signing_pk(&owner_secret);
+        let genesis_owner_pk_hash = accumulator::owner_pk_hash(&genesis_owner_pk);
+
+        // Threshold blind sign (token_id || value_commitment || genesis_pk_hash)
+        let signed_msg =
+            build_signed_message(&token_id, &value_commitment, &genesis_owner_pk_hash);
         let signature = threshold::threshold_blind_sign(&self.keyset, signers, &signed_msg)
             .map_err(|e| MintError::SigningFailed(e.to_string()))?;
 
-        // Create initial fold proof
-        let mut owner_hash = [0u8; 32];
-        owner_hash.copy_from_slice(&specter_primitives::scalar_utils::hash_to_scalar(&owner_secret).as_bytes()[..32]);
+        // Create the initial (empty-chain) accumulated proof anchored
+        // at the genesis owner pk.
         let genesis_state = TransferState {
             token_id,
-            owner_hash,
+            owner_hash: genesis_owner_pk_hash,
             step: 0,
         };
-        let fold_proof = accumulator::create_initial_proof(&genesis_state);
+        let fold_proof =
+            accumulator::create_initial_proof_with_pk(&genesis_state, genesis_owner_pk);
+        let owner_hash = genesis_owner_pk_hash;
 
         // Issue compliance credential if attributes provided
         let credential = attributes.map(|attrs| self.credential_issuer.issue(attrs));
@@ -323,11 +332,24 @@ impl Mint {
     }
 }
 
-/// Build the message that gets threshold-blind-signed.
-pub fn build_signed_message(token_id: &[u8; 32], value_commitment: &RistrettoPoint) -> Vec<u8> {
-    let mut msg = Vec::new();
+/// Build the message that gets threshold-blind-signed by the mint.
+///
+/// Binds three fields:
+/// 1. `token_id` — unique 32-byte identifier
+/// 2. `value_commitment` — Pedersen commitment to the token's value
+/// 3. `genesis_owner_pk_hash` — hash of the owner's signing public key
+///    at issuance time. This anchors the signed transfer chain (see
+///    [`specter_fold::accumulator`]) so any forged chain must either
+///    match the original genesis pk or forge a new mint signature.
+pub fn build_signed_message(
+    token_id: &[u8; 32],
+    value_commitment: &RistrettoPoint,
+    genesis_owner_pk_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(32 + 32 + 32);
     msg.extend_from_slice(token_id);
     msg.extend_from_slice(value_commitment.compress().as_bytes());
+    msg.extend_from_slice(genesis_owner_pk_hash);
     msg
 }
 

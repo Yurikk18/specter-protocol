@@ -90,8 +90,15 @@ pub fn verify_token(
         };
     }
 
-    // 1. Verify mint signature
-    let signed_msg = mint::build_signed_message(&token.token_id, &token.value_commitment);
+    // 1. Verify mint signature. The signed message binds token_id,
+    //    value_commitment, AND the genesis owner's public-key hash —
+    //    the anchor for the signed transfer chain.
+    let genesis_pk_hash = accumulator::owner_pk_hash(&token.fold_proof.genesis_owner_pk);
+    let signed_msg = mint::build_signed_message(
+        &token.token_id,
+        &token.value_commitment,
+        &genesis_pk_hash,
+    );
     let signature_valid = schnorr_blind::verify(group_public_key, &signed_msg, &token.mint_signature);
 
     // 2. Verify value commitment
@@ -106,44 +113,30 @@ pub fn verify_token(
     // 3. Check transfer count
     let within_bound = token.transfer_count <= token.recursion_bound;
 
-    // 4. Verify fold proof
+    // 4. Verify the signed transfer chain.
     //
-    // The fold proof binds both the genesis owner (via genesis_state_hash)
-    // and the CURRENT owner (via fold_proof.current_owner_hash). We check
-    // both:
+    // Two independent checks, evaluated unconditionally for timing
+    // uniformity (PASS 10 fix — short-circuiting would leak which
+    // sub-check failed first):
     //
-    //   a) At step 0, genesis_owner_hash must match the current owner
-    //      (freshly minted — nobody has transferred it yet).
-    //   b) At any step, fold_proof.current_owner_hash must match
-    //      H(token.owner_secret). This catches the clone-by-swap attack
-    //      where an attacker copies token bytes and modifies owner_secret
-    //      to produce a distinct nullifier.
-    let mut computed_current_owner = [0u8; 32];
-    computed_current_owner.copy_from_slice(
-        &specter_primitives::scalar_utils::hash_to_scalar(&token.owner_secret).as_bytes()[..32],
-    );
-    let owner_binding_valid = {
-        use subtle::ConstantTimeEq;
-        bool::from(computed_current_owner.ct_eq(&token.fold_proof.current_owner_hash))
-    };
+    //   a) current_owner_binding: the token's `owner_secret` must
+    //      derive a signing key whose public part matches the LAST
+    //      entry in the signed chain (or genesis_owner_pk when the
+    //      chain is empty). Closes the clone-by-swap attack where an
+    //      attacker changes owner_secret to get a new nullifier.
+    //
+    //   b) accum_valid: the chain itself must verify — anchor check
+    //      against the mint-bound genesis pk hash, plus every Schnorr
+    //      signature in the chain.
+    let current_owner_pk = accumulator::derive_owner_signing_pk(&token.owner_secret);
+    let owner_binding_valid =
+        current_owner_pk == token.fold_proof.current_owner_pk();
 
-    let genesis_owner_hash = if token.fold_proof.steps == 0 {
-        // At genesis, the original owner IS the current owner.
-        computed_current_owner
-    } else {
-        // After transfers, use the stored genesis hash (original owner is gone)
-        token.genesis_owner_hash
-    };
     let genesis_state = accumulator::TransferState {
         token_id: token.token_id,
-        owner_hash: genesis_owner_hash,
+        owner_hash: genesis_pk_hash,
         step: 0,
     };
-    // PASS 10 timing-oracle fix: evaluate both sub-checks unconditionally
-    // so verify_token's runtime does not vary based on which check
-    // failed first. Short-circuit `&&` here would have allowed a remote
-    // attacker to distinguish "owner-binding fail" from "Schnorr-accum
-    // fail" by timing the verify call.
     let accum_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
     let fold_valid = owner_binding_valid & accum_valid;
 

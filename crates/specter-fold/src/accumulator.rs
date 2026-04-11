@@ -1,90 +1,118 @@
-//! Proof Accumulator - constant-size transfer history proofs with
-//! cryptographic verification.
+//! Signed Transfer Chain — the PCT proof-of-history primitive.
 //!
-//! Each proof is a Schnorr signature where the "secret key" is derived
-//! deterministically from the state. This allows verification by
-//! recomputing the expected public key and checking the Schnorr equation:
-//! s*G == R + e*PK.
+//! # Design
+//!
+//! Each Proof-Carrying Token carries a [`AccumulatedProof`] which records
+//! the full chain of transfers. Each transfer step is a **Schnorr
+//! signature** by the previous owner's derived signing key, authorizing
+//! the hand-off to the next owner. The verifier walks the chain from the
+//! genesis owner public key (anchored in the mint signed message) down
+//! to the current owner, checking every signature along the way.
+//!
+//! ## Why this, not a Schnorr accumulator
+//!
+//! The earlier design used a "Schnorr accumulator" whose step > 0 check
+//! was structurally unsound: an attacker who knew the genesis state could
+//! regenerate a valid-looking proof from scratch because the verifier
+//! couldn't check intermediate PK derivations. The audit flagged this as
+//! a documented limitation (IACR 2024/232-style forgery class).
+//!
+//! The signed chain closes that gap:
+//!
+//! - Every step carries an explicit Schnorr signature `(R, s)` by the
+//!   previous owner's secret key. The verifier checks each signature.
+//! - Forgery of any step requires computing a discrete log over
+//!   Ristretto255, which is infeasible under ECDLP.
+//! - The chain is anchored at step 0 by the mint signed message, which
+//!   commits to the genesis owner's public-key hash.
+//! - The proof size grows linearly with the number of transfers but is
+//!   bounded by the token's `recursion_bound` (typically 20–50), so the
+//!   worst-case size is a few KB — well within practical limits.
+//!
+//! ## Owner key derivation
+//!
+//! Tokens store a 32-byte `owner_secret`. The signing key is derived
+//! deterministically via SHAKE-256 with a dedicated domain tag
+//! (`specter-owner-signing:`) so it cannot collide with other protocol
+//! derivations (nullifier, hash-to-scalar, etc.).
+//!
+//! ## Anchoring to the mint
+//!
+//! The mint signs `token_id || value_commitment || H(genesis_owner_pk)`
+//! (see `mint::build_signed_message`). This binds the genesis owner to
+//! the mint-authorized token, so a forged chain cannot repurpose a
+//! different genesis pk for the same mint signature.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 use curve25519_dalek::{RistrettoPoint, Scalar};
+use sha2::{Digest, Sha512};
+use sha3::{digest::{ExtendableOutput, Update as ShakeUpdate, XofReader}, Shake256};
 use subtle::ConstantTimeEq;
 
 use specter_primitives::scalar_utils::random_scalar;
-use crate::transcript::Transcript;
 
-/// Constant-time equality on 32-byte arrays. Applied to all verifier-side
-/// comparisons of hashes and binding digests even when the values
-/// themselves are public, so the pattern of "compare two 32-byte blobs"
-/// never accidentally leaks through a short-circuiting `==`.
-#[inline]
-fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    bool::from(a.ct_eq(b))
+/// A single transfer step in the chain.
+///
+/// Represents a hand-off from the previous owner to `new_owner_pk`,
+/// authorized by a Schnorr signature under the previous owner's
+/// derived signing key.
+#[derive(Clone, Debug)]
+pub struct TransferStep {
+    /// Public key of the new owner at this step (derived from the
+    /// incoming owner's secret via [`derive_owner_signing_key`]).
+    pub new_owner_pk: RistrettoPoint,
+    /// Schnorr nonce commitment R = k * G.
+    pub sig_r: RistrettoPoint,
+    /// Schnorr response s = k + e * prev_owner_sk.
+    pub sig_s: Scalar,
 }
 
-/// An accumulated proof of transfer history.
+/// Proof of a token's transfer history.
 ///
-/// Constant size regardless of transfer count.
-///
-/// # Security Boundary
-///
-/// For step 0 (genesis): full cryptographic verification — PK derivation,
-/// Fiat-Shamir transcript, and Schnorr equation are all checked.
-///
-/// For step > 0: structural integrity only — Schnorr equation + Fiat-Shamir
-/// binding prove the prover knew the DLP of PK, but the verifier cannot
-/// confirm PK was legitimately derived without intermediate states.
-/// The `genesis_state_hash` field binds the proof chain to its origin.
-///
-/// **The primary trust anchors are the mint blind signature (unforgeable)
-/// and the nullifier set (prevents double-spend), not the fold proof alone.**
-///
-/// The `current_owner_hash` field exposes the owner hash of the most recent
-/// transfer step so that callers of `verify_token` can bind a concrete
-/// `owner_secret` to the proof. Without this field an attacker could clone
-/// a token by swapping `owner_secret`: the nullifier would change
-/// (bypassing double-spend detection) while the Schnorr accumulator, which
-/// does not recompute intermediate state hashes, would still verify.
+/// Contains the genesis owner's public key (anchored in the mint signed
+/// message) plus a vector of signed transfer steps. Verification is
+/// linear in `steps` but each step is a constant-time Schnorr check.
 #[derive(Clone, Debug)]
 pub struct AccumulatedProof {
-    /// Schnorr response scalar.
-    pub s: Scalar,
-    /// Challenge scalar.
-    pub e: Scalar,
-    /// Nonce commitment point R.
-    pub r: RistrettoPoint,
-    /// Public key used in this proof (PK = secret * G).
-    pub pk: RistrettoPoint,
-    /// Rolling state hash (commits to entire history).
-    pub state_hash: [u8; 32],
-    /// Number of steps accumulated.
+    /// Public key of the original owner at mint time.
+    /// Anchored in the mint's signed message via its compressed-bytes hash.
+    pub genesis_owner_pk: RistrettoPoint,
+    /// Signed transfer steps, in order.
+    pub steps_chain: Vec<TransferStep>,
+    /// Number of steps (== steps_chain.len()). Kept as a separate field
+    /// because the old API exposed it directly.
     pub steps: u32,
-    /// Rolling hash of all PKs used in the proof chain.
-    /// Binds each PK to the derivation history, preventing PK forgery.
-    pub pk_chain_hash: [u8; 32],
-    /// Hash of the genesis state — carries through all folds so the verifier
-    /// can confirm the proof chain originated from the correct genesis.
-    pub genesis_state_hash: [u8; 32],
-    /// Hash of the current owner's identity (hash_to_scalar(owner_secret) truncated
-    /// to 32 bytes). Bound into the Fiat-Shamir challenge so a naive attacker
-    /// cannot swap the token's `owner_secret` without regenerating the Schnorr
-    /// proof. Checked by `verify_token` against `H(token.owner_secret)`.
-    pub current_owner_hash: [u8; 32],
 }
 
-/// State snapshot at a given transfer step.
+impl AccumulatedProof {
+    /// Return the current owner's public key — this is the key a valid
+    /// token holder must prove ownership of when spending.
+    pub fn current_owner_pk(&self) -> RistrettoPoint {
+        self.steps_chain
+            .last()
+            .map(|s| s.new_owner_pk)
+            .unwrap_or(self.genesis_owner_pk)
+    }
+
+    /// Hash the genesis owner's compressed public key — this is what
+    /// the mint signs to anchor the chain.
+    pub fn genesis_owner_pk_hash(&self) -> [u8; 32] {
+        owner_pk_hash(&self.genesis_owner_pk)
+    }
+}
+
+/// State snapshot at a given transfer step (kept for API compatibility
+/// with the previous accumulator interface — only `token_id` and
+/// `owner_hash` are actually used).
 #[derive(Clone, Debug)]
 pub struct TransferState {
-    /// Token ID.
     pub token_id: [u8; 32],
-    /// Hash of the current owner's public data.
+    /// Hash of the owner's derived public key at this step.
     pub owner_hash: [u8; 32],
-    /// Transfer index.
     pub step: u32,
 }
 
 impl TransferState {
-    /// Serialize the state for hashing.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(68);
         bytes.extend_from_slice(&self.token_id);
@@ -94,108 +122,103 @@ impl TransferState {
     }
 }
 
-/// Derive a deterministic "secret key" from state data.
-/// This key is used to create Schnorr proofs that can be verified
-/// by anyone who knows the state.
+// ─── Owner key derivation ──────────────────────────────────────────────
+
+/// Derive a Ristretto signing scalar from the owner's raw secret bytes.
 ///
-/// Uses a dedicated domain tag separate from the generic hash_to_scalar
-/// to prevent cross-protocol confusion (e.g., with nullifier derivation).
-fn derive_proof_secret(state_data: &[u8]) -> Scalar {
-    use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
+/// Uses SHAKE-256 with a dedicated domain tag. The scalar auto-zeroizes
+/// via curve25519-dalek's `ZeroizeOnDrop` impl.
+pub fn derive_owner_signing_key(owner_secret: &[u8; 32]) -> Scalar {
     let mut hasher = Shake256::default();
-    hasher.update(b"specter-fold-proof-secret:");
-    hasher.update(&(state_data.len() as u64).to_le_bytes());
-    hasher.update(state_data);
+    ShakeUpdate::update(&mut hasher, b"specter-owner-signing:");
+    ShakeUpdate::update(&mut hasher, owner_secret);
     let mut reader = hasher.finalize_xof();
     let mut wide = [0u8; 64];
     reader.read(&mut wide);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
 }
 
-/// Create the initial accumulated proof at token issuance.
+/// Derive the public signing key from an owner secret.
+pub fn derive_owner_signing_pk(owner_secret: &[u8; 32]) -> RistrettoPoint {
+    let sk = derive_owner_signing_key(owner_secret);
+    sk * G
+}
+
+/// 32-byte SHAKE-256 hash of a compressed Ristretto point — the
+/// canonical commitment used to anchor the genesis owner into the mint
+/// signed message.
+pub fn owner_pk_hash(pk: &RistrettoPoint) -> [u8; 32] {
+    let mut hasher = Shake256::default();
+    ShakeUpdate::update(&mut hasher, b"specter-owner-pk-hash:");
+    ShakeUpdate::update(&mut hasher, pk.compress().as_bytes());
+    let mut reader = hasher.finalize_xof();
+    let mut out = [0u8; 32];
+    reader.read(&mut out);
+    out
+}
+
+// ─── Chain construction ────────────────────────────────────────────────
+
+/// Create the initial accumulated proof for a freshly minted token.
 pub fn create_initial_proof(genesis_state: &TransferState) -> AccumulatedProof {
-    let state_bytes = genesis_state.to_bytes();
-
-    // Deterministic secret derived from genesis state
-    let secret = derive_proof_secret(&state_bytes);
-    let pk = secret * G;
-
-    // Random nonce for Schnorr
-    let k = random_scalar();
-    let r = k * G;
-
-    // Build transcript for challenge
-    let mut transcript = Transcript::new(b"specter-fold-genesis");
-    transcript.absorb(b"state", &state_bytes);
-    transcript.absorb(b"PK", pk.compress().as_bytes());
-    transcript.absorb(b"R", r.compress().as_bytes());
-    transcript.absorb(b"owner-hash", &genesis_state.owner_hash);
-
-    let e = transcript.challenge(b"genesis-challenge");
-
-    // Schnorr response: s = k + e * secret
-    let s = k + e * secret;
-
-    let mut state_hash = [0u8; 32];
-    transcript.squeeze_bytes(b"state-hash", &mut state_hash);
-
-    // Initial PK chain hash
-    let mut pk_chain_hash = [0u8; 32];
-    let mut chain_transcript = Transcript::new(b"specter-pk-chain");
-    chain_transcript.absorb(b"pk", pk.compress().as_bytes());
-    chain_transcript.squeeze_bytes(b"chain", &mut pk_chain_hash);
-
-    // Compute genesis state hash for chain binding
-    let mut genesis_hash = [0u8; 32];
-    let mut gh_transcript = Transcript::new(b"specter-genesis-binding");
-    gh_transcript.absorb(b"genesis-state", &state_bytes);
-    gh_transcript.absorb(b"genesis-pk", pk.compress().as_bytes());
-    gh_transcript.squeeze_bytes(b"genesis-hash", &mut genesis_hash);
-
+    // Reconstruct the genesis owner public key from the owner_hash in
+    // the genesis state. For prototyping, the genesis_state carries the
+    // owner_pk bytes directly via owner_hash — see `mint::issue_full`.
+    //
+    // For the initial proof there are no transfer steps to sign yet; the
+    // chain starts empty and the verifier anchors it to `genesis_owner_pk`.
+    //
+    // NOTE: genesis_state.owner_hash is the 32-byte hash of the pk.
+    //       The verifier will compare against `owner_pk_hash(genesis_pk)`.
+    //
+    // For callers that need to supply the pk directly, use
+    // `create_initial_proof_with_pk`.
+    let _ = random_scalar(); // reserve an RNG call so tests don't drift
     AccumulatedProof {
-        s,
-        e,
-        r,
-        pk,
-        state_hash,
+        genesis_owner_pk: genesis_state_owner_pk_or_identity(genesis_state),
+        steps_chain: Vec::new(),
         steps: 0,
-        pk_chain_hash,
-        genesis_state_hash: genesis_hash,
-        current_owner_hash: genesis_state.owner_hash,
     }
 }
 
-/// Compute the fold challenge deterministically from stored proof fields.
-/// Both prover and verifier use this identical function, ensuring the challenge
-/// is bound to all proof fields and cannot be freely chosen by an attacker.
-///
-/// `current_owner_hash` is absorbed so that any modification of the token's
-/// owner identity (e.g. a clone attempting to swap `owner_secret`) breaks the
-/// Schnorr equation unless the attacker also regenerates the entire fold
-/// proof from scratch. This does not close the documented step > 0 forge
-/// vector but raises the bar significantly against byte-level cloning.
-fn compute_fold_challenge(
-    state_hash: &[u8; 32],
-    pk: &RistrettoPoint,
-    pk_chain_hash: &[u8; 32],
-    r: &RistrettoPoint,
-    steps: u32,
-    current_owner_hash: &[u8; 32],
-) -> Scalar {
-    let mut transcript = Transcript::new(b"specter-fold-challenge-v3");
-    transcript.absorb(b"state-hash", state_hash);
-    transcript.absorb(b"PK", pk.compress().as_bytes());
-    transcript.absorb(b"pk-chain", pk_chain_hash);
-    transcript.absorb(b"R", r.compress().as_bytes());
-    transcript.absorb(b"steps", &steps.to_le_bytes());
-    transcript.absorb(b"owner-hash", current_owner_hash);
-    transcript.challenge(b"fold-e")
+/// Alternate constructor where the caller already has the genesis
+/// owner's public key. Used by `mint::issue_full`.
+pub fn create_initial_proof_with_pk(
+    _genesis_state: &TransferState,
+    genesis_owner_pk: RistrettoPoint,
+) -> AccumulatedProof {
+    AccumulatedProof {
+        genesis_owner_pk,
+        steps_chain: Vec::new(),
+        steps: 0,
+    }
 }
 
-/// Fold a new transfer step into the accumulated proof.
-pub fn fold_transfer(
+/// Helper: if a caller constructs `TransferState` with `owner_hash` set
+/// to the 32-byte compressed public key (as the test suite sometimes
+/// does), decompress it. Otherwise return the identity point so the
+/// verifier can still fail gracefully.
+fn genesis_state_owner_pk_or_identity(state: &TransferState) -> RistrettoPoint {
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    CompressedRistretto(state.owner_hash)
+        .decompress()
+        .unwrap_or_default()
+}
+
+/// Append a new transfer step, signed by the previous owner.
+///
+/// The caller is responsible for ensuring `prev_owner_signing_sk` is the
+/// derived signing key of the CURRENT holder (who is about to transfer).
+/// The function signs the tuple `(token_id, step, new_owner_pk)` and
+/// returns a proof extended by one step.
+pub fn fold_transfer_signed(
     current_proof: &AccumulatedProof,
-    new_state: &TransferState,
+    prev_owner_signing_sk: &Scalar,
+    new_owner_pk: RistrettoPoint,
+    token_id: &[u8; 32],
     recursion_bound: u32,
 ) -> Result<AccumulatedProof, FoldError> {
     if current_proof.steps >= recursion_bound {
@@ -205,172 +228,148 @@ pub fn fold_transfer(
         });
     }
 
-    // The new secret is derived from the accumulated state + new state
-    let mut secret_input = Vec::new();
-    secret_input.extend_from_slice(&current_proof.state_hash);
-    secret_input.extend_from_slice(&new_state.to_bytes());
-    let secret = derive_proof_secret(&secret_input);
-    let pk = secret * G;
+    let new_step_number = current_proof
+        .steps
+        .checked_add(1)
+        .ok_or(FoldError::BoundExceeded {
+            steps: current_proof.steps,
+            bound: recursion_bound,
+        })?;
 
-    // 1. Compute new state_hash (binds to full transfer context)
-    let mut state_transcript = Transcript::new(b"specter-fold-state-v2");
-    state_transcript.absorb(b"prev-state-hash", &current_proof.state_hash);
-    state_transcript.absorb(b"prev-pk", current_proof.pk.compress().as_bytes());
-    state_transcript.absorb(b"new-state", &new_state.to_bytes());
-    state_transcript.absorb(b"step", &new_state.step.to_le_bytes());
-    let mut new_state_hash = [0u8; 32];
-    state_transcript.squeeze_bytes(b"state-hash", &mut new_state_hash);
+    // Compute the public key of the previous signer from their secret.
+    let prev_owner_pk = prev_owner_signing_sk * G;
 
-    // 2. Extend PK chain hash
-    let mut pk_chain_hash = [0u8; 32];
-    let mut chain_transcript = Transcript::new(b"specter-pk-chain");
-    chain_transcript.absorb(b"prev", &current_proof.pk_chain_hash);
-    chain_transcript.absorb(b"pk", pk.compress().as_bytes());
-    chain_transcript.squeeze_bytes(b"chain", &mut pk_chain_hash);
+    // Check: the previous owner must be the current chain tip.
+    let expected_prev = current_proof.current_owner_pk();
+    if prev_owner_pk != expected_prev {
+        return Err(FoldError::PrevOwnerMismatch);
+    }
 
-    // 3. Compute challenge from ONLY stored proof fields (verifier can recompute)
+    // Schnorr signature over H(token_id || step || new_owner_pk).
+    let msg = transfer_message(token_id, new_step_number, &new_owner_pk);
     let k = random_scalar();
-    let new_r = k * G;
-    let new_steps = current_proof.steps.checked_add(1)
-        .ok_or(FoldError::BoundExceeded { steps: current_proof.steps, bound: recursion_bound })?;
-    let new_e = compute_fold_challenge(
-        &new_state_hash,
-        &pk,
-        &pk_chain_hash,
-        &new_r,
-        new_steps,
-        &new_state.owner_hash,
-    );
+    let sig_r = k * G;
+    let e = transfer_challenge(&sig_r, &prev_owner_pk, &msg);
+    let sig_s = k + e * prev_owner_signing_sk;
 
-    // 4. Schnorr response: s = k + e * secret
-    let new_s = k + new_e * secret;
+    let mut new_chain = current_proof.steps_chain.clone();
+    new_chain.push(TransferStep {
+        new_owner_pk,
+        sig_r,
+        sig_s,
+    });
 
     Ok(AccumulatedProof {
-        s: new_s,
-        e: new_e,
-        r: new_r,
-        pk,
-        state_hash: new_state_hash,
-        steps: new_steps,
-        pk_chain_hash,
-        genesis_state_hash: current_proof.genesis_state_hash,
-        current_owner_hash: new_state.owner_hash,
+        genesis_owner_pk: current_proof.genesis_owner_pk,
+        steps_chain: new_chain,
+        steps: new_step_number,
     })
 }
 
-/// Verify an accumulated proof.
+/// Legacy wrapper retained for backward-compatible API.
 ///
-/// Checks:
-/// 1. Schnorr equation: s*G == R + e*PK
-/// 2. For genesis (step 0): PK is correctly derived from genesis_state
-/// 3. For genesis: challenge was computed via the correct transcript
-/// 4. state_hash is non-zero
-/// 5. pk_chain_hash is non-zero for step > 0
-/// 6. For step > 0: challenge e is bound to the full proof state via transcript
+/// This signature exists because existing call sites in the repo expect
+/// a `fold_transfer(proof, new_state, bound)` shape. Since the signed
+/// chain requires access to the previous owner's signing key, the legacy
+/// API cannot securely produce a valid step and is therefore DEPRECATED.
+#[deprecated(
+    since = "0.3.0",
+    note = "Use fold_transfer_signed with the previous owner's signing key."
+)]
+pub fn fold_transfer(
+    current_proof: &AccumulatedProof,
+    _new_state: &TransferState,
+    recursion_bound: u32,
+) -> Result<AccumulatedProof, FoldError> {
+    // Rejection path — this entry point exists only so legacy tests
+    // still compile. Production transfer logic must use the signed
+    // variant via [`fold_transfer_signed`].
+    if current_proof.steps >= recursion_bound {
+        return Err(FoldError::BoundExceeded {
+            steps: current_proof.steps,
+            bound: recursion_bound,
+        });
+    }
+    Err(FoldError::DeprecatedUnsignedFold)
+}
+
+// ─── Verification ──────────────────────────────────────────────────────
+
+/// Verify an accumulated proof against the genesis state.
+///
+/// Walks every signed transfer step and checks the Schnorr signature
+/// under the previous owner's public key. Any single invalid signature
+/// causes rejection.
+///
+/// `genesis_state.owner_hash` must equal the hash of the proof's
+/// `genesis_owner_pk` for the anchor to line up with the mint signed
+/// message.
 pub fn verify_accumulated_proof(
     proof: &AccumulatedProof,
     genesis_state: &TransferState,
 ) -> bool {
-    if ct_eq_32(&proof.state_hash, &[0u8; 32]) {
+    // 1. Anchor check: the proof's genesis pk must hash to the anchor
+    //    supplied by the caller (in practice the mint signed message).
+    let expected_anchor = owner_pk_hash(&proof.genesis_owner_pk);
+    if !bool::from(expected_anchor.ct_eq(&genesis_state.owner_hash)) {
         return false;
     }
 
-    // Schnorr equation check
-    let lhs = proof.s * G;
-    let rhs = proof.r + proof.e * proof.pk;
-    if lhs != rhs {
+    // 2. Step count consistency.
+    if proof.steps as usize != proof.steps_chain.len() {
         return false;
     }
 
-    // For genesis proofs: verify PK derivation and transcript
-    if proof.steps == 0 {
-        let state_bytes = genesis_state.to_bytes();
-        let expected_secret = derive_proof_secret(&state_bytes);
-        let expected_pk = expected_secret * G;
-        if proof.pk != expected_pk {
+    // 3. Walk the chain, verifying each step's Schnorr signature under
+    //    the PREVIOUS owner's public key. The verifier tracks the
+    //    rolling "current pk" from genesis down to the final step.
+    let mut current_pk = proof.genesis_owner_pk;
+    for (i, step) in proof.steps_chain.iter().enumerate() {
+        let step_number = (i as u32) + 1;
+        let msg = transfer_message(&genesis_state.token_id, step_number, &step.new_owner_pk);
+        let e = transfer_challenge(&step.sig_r, &current_pk, &msg);
+        let lhs = step.sig_s * G;
+        let rhs = step.sig_r + e * current_pk;
+        if lhs != rhs {
             return false;
         }
-
-        // At genesis, the current owner must be the genesis owner.
-        if !ct_eq_32(&proof.current_owner_hash, &genesis_state.owner_hash) {
-            return false;
-        }
-
-        // Recompute the full transcript and verify BOTH the challenge AND
-        // the squeezed state_hash. Previously only the challenge was
-        // cross-checked, leaving `state_hash` as an unverified field at
-        // step 0 — a proptest-caught weakness (prop_tampered_state_hash
-        // _rejected_at_genesis). Tampering state_hash at step 0 would
-        // have propagated into the secret derivation at step 1 and
-        // corrupted the chain without being caught locally.
-        let mut transcript = Transcript::new(b"specter-fold-genesis");
-        transcript.absorb(b"state", &state_bytes);
-        transcript.absorb(b"PK", proof.pk.compress().as_bytes());
-        transcript.absorb(b"R", proof.r.compress().as_bytes());
-        transcript.absorb(b"owner-hash", &genesis_state.owner_hash);
-        let expected_e = transcript.challenge(b"genesis-challenge");
-        if proof.e != expected_e {
-            return false;
-        }
-        let mut expected_state_hash = [0u8; 32];
-        transcript.squeeze_bytes(b"state-hash", &mut expected_state_hash);
-        if !ct_eq_32(&proof.state_hash, &expected_state_hash) {
-            return false;
-        }
-
-        // Verify genesis pk_chain_hash
-        let mut chain_transcript = Transcript::new(b"specter-pk-chain");
-        chain_transcript.absorb(b"pk", proof.pk.compress().as_bytes());
-        let mut expected_chain = [0u8; 32];
-        chain_transcript.squeeze_bytes(b"chain", &mut expected_chain);
-        if !ct_eq_32(&proof.pk_chain_hash, &expected_chain) {
-            return false;
-        }
-    } else {
-        // For step > 0: pk_chain_hash must be non-zero
-        if ct_eq_32(&proof.pk_chain_hash, &[0u8; 32]) {
-            return false;
-        }
-
-        // Verify genesis binding: the proof's genesis_state_hash must match
-        // what the verifier computes from the provided genesis_state.
-        // This ensures the proof chain originated from the correct genesis,
-        // even though the verifier can't check intermediate PK derivations.
-        let state_bytes = genesis_state.to_bytes();
-        let expected_genesis_secret = derive_proof_secret(&state_bytes);
-        let expected_genesis_pk = expected_genesis_secret * G;
-        let mut expected_genesis_hash = [0u8; 32];
-        let mut gh_transcript = Transcript::new(b"specter-genesis-binding");
-        gh_transcript.absorb(b"genesis-state", &state_bytes);
-        gh_transcript.absorb(b"genesis-pk", expected_genesis_pk.compress().as_bytes());
-        gh_transcript.squeeze_bytes(b"genesis-hash", &mut expected_genesis_hash);
-        if !ct_eq_32(&proof.genesis_state_hash, &expected_genesis_hash) {
-            return false;
-        }
-
-        // Recompute challenge from stored proof fields and verify it matches.
-        // This binds the challenge to (state_hash, PK, pk_chain_hash, R, steps)
-        // via Fiat-Shamir. Combined with the Schnorr equation, this proves the
-        // prover knew the DLP of PK at proof creation time.
-        //
-        // SECURITY NOTE: An attacker who knows the genesis state can still
-        // forge proofs at step > 0 by choosing their own PK. The primary
-        // defenses against transfer history forgery are the mint's blind
-        // signature (unforgeable) and the nullifier set (prevents double-spend).
-        let expected_e = compute_fold_challenge(
-            &proof.state_hash,
-            &proof.pk,
-            &proof.pk_chain_hash,
-            &proof.r,
-            proof.steps,
-            &proof.current_owner_hash,
-        );
-        if proof.e != expected_e {
-            return false;
-        }
+        current_pk = step.new_owner_pk;
     }
-
     true
+}
+
+// ─── Internal helpers ──────────────────────────────────────────────────
+
+fn transfer_message(
+    token_id: &[u8; 32],
+    step: u32,
+    new_owner_pk: &RistrettoPoint,
+) -> [u8; 32] {
+    let mut hasher = Shake256::default();
+    ShakeUpdate::update(&mut hasher, b"specter-transfer-step:");
+    ShakeUpdate::update(&mut hasher, token_id);
+    ShakeUpdate::update(&mut hasher, &step.to_le_bytes());
+    ShakeUpdate::update(&mut hasher, new_owner_pk.compress().as_bytes());
+    let mut reader = hasher.finalize_xof();
+    let mut out = [0u8; 32];
+    reader.read(&mut out);
+    out
+}
+
+fn transfer_challenge(
+    r: &RistrettoPoint,
+    pk: &RistrettoPoint,
+    msg: &[u8; 32],
+) -> Scalar {
+    let hash = Sha512::new()
+        .chain_update(b"specter-transfer-challenge:")
+        .chain_update(r.compress().as_bytes())
+        .chain_update(pk.compress().as_bytes())
+        .chain_update(msg)
+        .finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&hash);
+    Scalar::from_bytes_mod_order_wide(&wide)
 }
 
 /// Errors during fold operations.
@@ -378,246 +377,221 @@ pub fn verify_accumulated_proof(
 pub enum FoldError {
     #[error("recursion bound exceeded: {steps}/{bound}")]
     BoundExceeded { steps: u32, bound: u32 },
+
+    #[error("previous owner pk does not match chain tip")]
+    PrevOwnerMismatch,
+
+    #[error("unsigned fold entry point is deprecated — use fold_transfer_signed")]
+    DeprecatedUnsignedFold,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn genesis() -> TransferState {
-        TransferState {
-            token_id: [42u8; 32],
-            owner_hash: [1u8; 32],
-            step: 0,
-        }
+    fn owner(seed: u8) -> ([u8; 32], RistrettoPoint) {
+        let secret = [seed; 32];
+        let pk = derive_owner_signing_pk(&secret);
+        (secret, pk)
     }
 
-    fn transfer_state(step: u32) -> TransferState {
-        let mut owner_hash = [0u8; 32];
-        owner_hash[0] = step as u8;
+    fn genesis_state_for(token_id: [u8; 32], genesis_pk: &RistrettoPoint) -> TransferState {
         TransferState {
-            token_id: [42u8; 32],
-            owner_hash,
-            step,
+            token_id,
+            owner_hash: owner_pk_hash(genesis_pk),
+            step: 0,
         }
     }
 
     #[test]
     fn test_initial_proof_verifies() {
-        let state = genesis();
-        let proof = create_initial_proof(&state);
+        let (_s0, pk0) = owner(1);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let proof = create_initial_proof_with_pk(&gs, pk0);
         assert_eq!(proof.steps, 0);
-        assert!(verify_accumulated_proof(&proof, &state));
+        assert!(verify_accumulated_proof(&proof, &gs));
     }
 
     #[test]
     fn test_single_fold_verifies() {
-        let g = genesis();
-        let proof = create_initial_proof(&g);
-        let new_state = transfer_state(1);
-        let folded = fold_transfer(&proof, &new_state, 20).unwrap();
-        assert_eq!(folded.steps, 1);
-        assert!(verify_accumulated_proof(&folded, &g));
+        let (s0, pk0) = owner(1);
+        let (_s1, pk1) = owner(2);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk0 = derive_owner_signing_key(&s0);
+        let p1 = fold_transfer_signed(&p0, &sk0, pk1, &token_id, 50).unwrap();
+        assert_eq!(p1.steps, 1);
+        assert!(verify_accumulated_proof(&p1, &gs));
+        assert_eq!(p1.current_owner_pk(), pk1);
     }
 
     #[test]
-    fn test_multiple_folds_constant_size() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
+    fn test_multiple_folds_verify() {
+        let secrets: Vec<[u8; 32]> = (0..10).map(|i| [i as u8; 32]).collect();
+        let pks: Vec<RistrettoPoint> =
+            secrets.iter().map(derive_owner_signing_pk).collect();
+        let token_id = [99u8; 32];
+        let gs = genesis_state_for(token_id, &pks[0]);
 
-        for i in 1..=20 {
-            let state = transfer_state(i);
-            let prev_size = std::mem::size_of_val(&proof);
-            proof = fold_transfer(&proof, &state, 50).unwrap();
-            assert_eq!(proof.steps, i);
-            // Size remains constant across folds
-            assert_eq!(std::mem::size_of_val(&proof), prev_size);
+        let mut proof = create_initial_proof_with_pk(&gs, pks[0]);
+        for i in 0..9 {
+            let prev_sk = derive_owner_signing_key(&secrets[i]);
+            proof = fold_transfer_signed(&proof, &prev_sk, pks[i + 1], &token_id, 50).unwrap();
         }
-        assert!(verify_accumulated_proof(&proof, &g));
+        assert_eq!(proof.steps, 9);
+        assert!(verify_accumulated_proof(&proof, &gs));
+        assert_eq!(proof.current_owner_pk(), pks[9]);
     }
 
     #[test]
-    fn test_bound_enforced() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
-        for i in 1..=5 {
-            proof = fold_transfer(&proof, &transfer_state(i), 5).unwrap();
-        }
-        assert!(fold_transfer(&proof, &transfer_state(6), 5).is_err());
+    fn test_forged_step_rejected() {
+        let (s0, pk0) = owner(1);
+        let (_s1, pk1) = owner(2);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk0 = derive_owner_signing_key(&s0);
+        let mut p1 = fold_transfer_signed(&p0, &sk0, pk1, &token_id, 50).unwrap();
+
+        // Tamper: flip a bit in the signature.
+        let mut s_bytes = *p1.steps_chain[0].sig_s.as_bytes();
+        s_bytes[0] ^= 0x01;
+        p1.steps_chain[0].sig_s =
+            curve25519_dalek::Scalar::from_bytes_mod_order(s_bytes);
+
+        assert!(!verify_accumulated_proof(&p1, &gs));
     }
 
     #[test]
-    fn test_forged_proof_rejected() {
-        let g = genesis();
-        // Forge a proof with random values - Schnorr equation won't hold
-        let fake_sk = random_scalar();
-        let forged = AccumulatedProof {
-            s: random_scalar(),
-            e: random_scalar(),
-            r: random_scalar() * G,
-            pk: fake_sk * G,
-            state_hash: [99u8; 32],
-            steps: 0,
-            pk_chain_hash: [0u8; 32],
-            genesis_state_hash: [0u8; 32],
-            current_owner_hash: [0u8; 32],
-        };
-        // Must be REJECTED
-        assert!(!verify_accumulated_proof(&forged, &g));
+    fn test_forged_recipient_rejected() {
+        let (s0, pk0) = owner(1);
+        let (_s1, pk1) = owner(2);
+        let (_s2, pk2) = owner(3);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk0 = derive_owner_signing_key(&s0);
+        let mut p1 = fold_transfer_signed(&p0, &sk0, pk1, &token_id, 50).unwrap();
+
+        // Substitute the signed recipient with a different pk — the
+        // signature was bound to pk1 so it must fail.
+        p1.steps_chain[0].new_owner_pk = pk2;
+        assert!(!verify_accumulated_proof(&p1, &gs));
     }
 
     #[test]
-    fn test_owner_hash_swap_rejected_at_step_0() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
-        // Try to swap the current_owner_hash — must break verification
-        proof.current_owner_hash = [0xAB; 32];
-        assert!(!verify_accumulated_proof(&proof, &g));
+    fn test_wrong_prev_owner_rejected_at_fold_time() {
+        let (_s0, pk0) = owner(1);
+        let (_s_wrong, _pk_wrong) = owner(42);
+        let (_s1, pk1) = owner(2);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk_wrong = derive_owner_signing_key(&[42u8; 32]);
+        let err = fold_transfer_signed(&p0, &sk_wrong, pk1, &token_id, 50).unwrap_err();
+        assert!(matches!(err, FoldError::PrevOwnerMismatch));
     }
 
     #[test]
-    fn test_owner_hash_swap_rejected_after_fold() {
-        let g = genesis();
-        let p0 = create_initial_proof(&g);
-        let mut p1 = fold_transfer(&p0, &transfer_state(1), 20).unwrap();
-        // Swap the current_owner_hash without re-signing — must break
-        p1.current_owner_hash = [0xCD; 32];
-        assert!(!verify_accumulated_proof(&p1, &g));
+    fn test_tampered_genesis_pk_rejected() {
+        let (s0, pk0) = owner(1);
+        let (_s1, pk1) = owner(2);
+        let (_s_other, pk_other) = owner(99);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk0 = derive_owner_signing_key(&s0);
+        let mut p1 = fold_transfer_signed(&p0, &sk0, pk1, &token_id, 50).unwrap();
+        // Swap the genesis pk — the anchor check must reject.
+        p1.genesis_owner_pk = pk_other;
+        assert!(!verify_accumulated_proof(&p1, &gs));
     }
 
     #[test]
-    fn test_tampered_proof_rejected() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
-        // Tamper with s
-        proof.s += Scalar::ONE;
-        assert!(!verify_accumulated_proof(&proof, &g));
+    fn test_chain_bound_enforced() {
+        let (s0, pk0) = owner(1);
+        let (_s1, pk1) = owner(2);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk0 = derive_owner_signing_key(&s0);
+        let p1 = fold_transfer_signed(&p0, &sk0, pk1, &token_id, 1).unwrap();
+        assert_eq!(p1.steps, 1);
+        // Attempting a second fold past bound=1 must fail.
+        let sk1 = derive_owner_signing_key(&[2u8; 32]);
+        let err = fold_transfer_signed(&p1, &sk1, pk0, &token_id, 1).unwrap_err();
+        assert!(matches!(err, FoldError::BoundExceeded { .. }));
     }
 
     #[test]
-    fn test_tampered_s_rejected() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
-        proof.s += Scalar::ONE; // tamper with response
-        assert!(!verify_accumulated_proof(&proof, &g));
+    fn test_empty_chain_current_owner_is_genesis() {
+        let (_s0, pk0) = owner(1);
+        let gs = genesis_state_for([7u8; 32], &pk0);
+        let proof = create_initial_proof_with_pk(&gs, pk0);
+        assert_eq!(proof.current_owner_pk(), pk0);
     }
 
     #[test]
-    fn test_tampered_e_rejected() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
-        proof.e += Scalar::ONE; // tamper with challenge
-        assert!(!verify_accumulated_proof(&proof, &g));
+    fn test_steps_count_consistency_enforced() {
+        let (s0, pk0) = owner(1);
+        let (_s1, pk1) = owner(2);
+        let token_id = [42u8; 32];
+        let gs = genesis_state_for(token_id, &pk0);
+        let p0 = create_initial_proof_with_pk(&gs, pk0);
+        let sk0 = derive_owner_signing_key(&s0);
+        let mut p1 = fold_transfer_signed(&p0, &sk0, pk1, &token_id, 50).unwrap();
+        // Tamper the step counter without adding steps — consistency check fails.
+        p1.steps = 5;
+        assert!(!verify_accumulated_proof(&p1, &gs));
     }
-
-    #[test]
-    fn test_different_histories_different_proofs() {
-        let g = genesis();
-        let mut proof_a = create_initial_proof(&g);
-        let mut proof_b = create_initial_proof(&g);
-
-        proof_a = fold_transfer(&proof_a, &TransferState {
-            token_id: [42u8; 32], owner_hash: [10u8; 32], step: 1,
-        }, 20).unwrap();
-        proof_b = fold_transfer(&proof_b, &TransferState {
-            token_id: [42u8; 32], owner_hash: [20u8; 32], step: 1,
-        }, 20).unwrap();
-
-        assert_ne!(proof_a.state_hash, proof_b.state_hash);
-    }
-
-    #[test]
-    fn test_long_chain_verification() {
-        let g = genesis();
-        let mut proof = create_initial_proof(&g);
-        for i in 1..=100 {
-            proof = fold_transfer(&proof, &transfer_state(i), 200).unwrap();
-        }
-        assert_eq!(proof.steps, 100);
-        assert!(verify_accumulated_proof(&proof, &g));
-    }
-
-    /// PASS 14: the AccumulatedProof struct is constant-size across
-    /// step counts. `size_of_val` captures the stack size of the struct
-    /// which must be independent of the number of accumulated steps.
-    ///
-    /// The absolute sanity bound accounts for dalek's expanded point
-    /// representation (EdwardsPoint uses 4 x FieldElement internally,
-    /// which is ~160 bytes each on 64-bit targets) plus two scalars,
-    /// four `[u8; 32]` arrays, and a `u32` step counter.
-    #[test]
-    fn test_accumulated_proof_is_constant_size() {
-        let g = genesis();
-        let p0 = create_initial_proof(&g);
-        let p1 = fold_transfer(&p0, &transfer_state(1), 200).unwrap();
-        let p50 = {
-            let mut cur = p0.clone();
-            for i in 1..=50 {
-                cur = fold_transfer(&cur, &transfer_state(i), 200).unwrap();
-            }
-            cur
-        };
-        // Stack size of the struct is invariant of step count.
-        assert_eq!(
-            std::mem::size_of_val(&p0),
-            std::mem::size_of_val(&p1)
-        );
-        assert_eq!(
-            std::mem::size_of_val(&p0),
-            std::mem::size_of_val(&p50)
-        );
-        // Sanity: struct is not secretly unbounded. 1 KiB is a generous
-        // ceiling given dalek's expanded point layout.
-        assert!(
-            std::mem::size_of::<AccumulatedProof>() < 1024,
-            "AccumulatedProof unexpectedly large: {}",
-            std::mem::size_of::<AccumulatedProof>()
-        );
-    }
-
-    // ── Property tests ─────────────────────────────────────────────────
 
     use proptest::prelude::*;
 
     proptest! {
-        /// Every honestly-generated fold chain verifies against its genesis.
         #[test]
-        fn prop_honest_chain_verifies(steps in 0usize..30) {
-            let g = genesis();
-            let mut proof = create_initial_proof(&g);
-            for i in 1..=steps {
-                proof = fold_transfer(&proof, &transfer_state(i as u32), 100).unwrap();
+        fn prop_honest_chain_verifies(depth in 0usize..12) {
+            let secrets: Vec<[u8; 32]> = (0..=depth).map(|i| [i as u8; 32]).collect();
+            let pks: Vec<RistrettoPoint> =
+                secrets.iter().map(derive_owner_signing_pk).collect();
+            let token_id = [depth as u8; 32];
+            let gs = genesis_state_for(token_id, &pks[0]);
+            let mut proof = create_initial_proof_with_pk(&gs, pks[0]);
+            for i in 0..depth {
+                let prev_sk = derive_owner_signing_key(&secrets[i]);
+                proof = fold_transfer_signed(&proof, &prev_sk, pks[i + 1], &token_id, 50)
+                    .expect("honest fold");
             }
-            prop_assert!(verify_accumulated_proof(&proof, &g));
-            prop_assert_eq!(proof.steps as usize, steps);
+            prop_assert!(verify_accumulated_proof(&proof, &gs));
+            prop_assert_eq!(proof.steps as usize, depth);
         }
 
-        /// Any single-byte tamper of a finalized fold proof's state_hash
-        /// must invalidate verification at step 0 (where derivation is
-        /// checked against the genesis). At step > 0 the attacker can
-        /// trivially forge (documented limitation) so we only assert at
-        /// step 0.
         #[test]
-        fn prop_tampered_state_hash_rejected_at_genesis(byte_idx in 0usize..32, xor in 1u8..255) {
-            let g = genesis();
-            let mut proof = create_initial_proof(&g);
-            proof.state_hash[byte_idx] ^= xor;
-            prop_assert!(!verify_accumulated_proof(&proof, &g));
-        }
-
-        /// The current_owner_hash binding (PASS 2) rejects any swap at
-        /// step 0 or later — the Schnorr challenge absorbs owner-hash.
-        #[test]
-        fn prop_current_owner_hash_tamper_rejected(
-            byte_idx in 0usize..32, xor in 1u8..255, depth in 0usize..10
+        fn prop_tampered_signature_rejected(
+            depth in 1usize..8,
+            step_idx in 0usize..8,
+            byte_idx in 0usize..32,
+            xor in 1u8..255
         ) {
-            let g = genesis();
-            let mut proof = create_initial_proof(&g);
-            for i in 1..=depth {
-                proof = fold_transfer(&proof, &transfer_state(i as u32), 100).unwrap();
+            prop_assume!(step_idx < depth);
+            let secrets: Vec<[u8; 32]> = (0..=depth).map(|i| [i as u8; 32]).collect();
+            let pks: Vec<RistrettoPoint> =
+                secrets.iter().map(derive_owner_signing_pk).collect();
+            let token_id = [depth as u8; 32];
+            let gs = genesis_state_for(token_id, &pks[0]);
+            let mut proof = create_initial_proof_with_pk(&gs, pks[0]);
+            for i in 0..depth {
+                let prev_sk = derive_owner_signing_key(&secrets[i]);
+                proof = fold_transfer_signed(&proof, &prev_sk, pks[i + 1], &token_id, 50)
+                    .expect("honest fold");
             }
-            proof.current_owner_hash[byte_idx] ^= xor;
-            prop_assert!(!verify_accumulated_proof(&proof, &g));
+            let mut s_bytes = *proof.steps_chain[step_idx].sig_s.as_bytes();
+            s_bytes[byte_idx] ^= xor;
+            proof.steps_chain[step_idx].sig_s =
+                curve25519_dalek::Scalar::from_bytes_mod_order(s_bytes);
+            prop_assert!(!verify_accumulated_proof(&proof, &gs));
         }
     }
 }
