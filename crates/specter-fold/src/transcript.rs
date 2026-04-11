@@ -21,7 +21,11 @@ impl Transcript {
     }
 
     /// Absorb a labeled byte string into the transcript.
+    ///
+    /// Both label and data are length-prefixed for unambiguous parsing,
+    /// preventing cross-field boundary attacks in the Fiat-Shamir hash.
     pub fn absorb(&mut self, label: &[u8], data: &[u8]) {
+        self.hasher.update(&(label.len() as u64).to_le_bytes());
         self.hasher.update(label);
         self.hasher.update(&(data.len() as u64).to_le_bytes());
         self.hasher.update(data);

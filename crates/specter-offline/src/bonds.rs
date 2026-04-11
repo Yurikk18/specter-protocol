@@ -151,9 +151,19 @@ impl BondRegistry {
 
     /// Slash a bond due to detected double-spending.
     ///
+    /// Requires two conflicting nullifiers as evidence of double-spend.
     /// The bond is deactivated and the collateral is forfeited.
     /// Returns the slashed bond amount.
-    pub fn slash(&mut self, owner_id: &[u8; 32]) -> Result<u64, BondError> {
+    pub fn slash(
+        &mut self,
+        owner_id: &[u8; 32],
+        evidence_nullifier_a: &[u8; 32],
+        evidence_nullifier_b: &[u8; 32],
+    ) -> Result<u64, BondError> {
+        // Evidence must be two DIFFERENT nullifiers (proving double-spend)
+        if evidence_nullifier_a == evidence_nullifier_b {
+            return Err(BondError::InsufficientEvidence);
+        }
         let bond_id = self.owner_bonds.get(owner_id).ok_or(BondError::NoBond)?;
         let bond = self.bonds.get_mut(bond_id).ok_or(BondError::NoBond)?;
 
@@ -249,6 +259,9 @@ pub enum BondError {
 
     #[error("owner already has an active bond")]
     AlreadyHasBond,
+
+    #[error("insufficient evidence for slash: must provide two distinct conflicting nullifiers")]
+    InsufficientEvidence,
 }
 
 #[cfg(test)]
@@ -301,10 +314,20 @@ mod tests {
         let mut reg = BondRegistry::new();
         reg.deposit(owner(1), 1000).unwrap();
 
-        let slashed = reg.slash(&owner(1)).unwrap();
+        let evidence_a = [1u8; 32];
+        let evidence_b = [2u8; 32];
+        let slashed = reg.slash(&owner(1), &evidence_a, &evidence_b).unwrap();
         assert_eq!(slashed, 1000);
         assert!(!reg.check_coverage(&owner(1), 1)); // bond is inactive
-        assert!(reg.slash(&owner(1)).is_err()); // already slashed
+        assert!(reg.slash(&owner(1), &evidence_a, &evidence_b).is_err()); // already slashed
+    }
+
+    #[test]
+    fn test_slash_requires_distinct_evidence() {
+        let mut reg = BondRegistry::new();
+        reg.deposit(owner(1), 1000).unwrap();
+        let same = [1u8; 32];
+        assert!(reg.slash(&owner(1), &same, &same).is_err()); // same evidence rejected
     }
 
     #[test]
@@ -347,7 +370,7 @@ mod tests {
         reg.request_withdrawal(&owner(1), 1000).unwrap();
 
         // Slash works during lock period (that's the point)
-        let slashed = reg.slash(&owner(1)).unwrap();
+        let slashed = reg.slash(&owner(1), &[1u8; 32], &[2u8; 32]).unwrap();
         assert_eq!(slashed, 1000);
 
         // Can't withdraw a slashed bond

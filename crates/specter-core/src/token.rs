@@ -22,7 +22,11 @@ use specter_offline::vdf::VdfProof;
 ///
 /// This is the fundamental unit of value in the Specter protocol.
 /// It is a bearer instrument: whoever holds it can spend it.
-#[derive(Clone)]
+///
+/// ProofCarryingToken does NOT implement Clone. This is a deliberate
+/// security choice: as a bearer instrument, cloning would duplicate
+/// economic value. Use `transfer()` (move semantics) for spending.
+/// Serialization uses `serde_token::serialize_token(&token)`.
 pub struct ProofCarryingToken {
     /// Unique token identifier (32 bytes, random).
     pub token_id: [u8; 32],

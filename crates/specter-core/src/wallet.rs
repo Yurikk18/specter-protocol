@@ -16,9 +16,18 @@ impl Wallet {
         Self { tokens: Vec::new() }
     }
 
+    /// Maximum tokens per wallet (DoS protection).
+    const MAX_TOKENS: usize = 100_000;
+
     /// Add a token to the wallet.
-    pub fn add_token(&mut self, token: ProofCarryingToken) {
+    ///
+    /// Returns false if the wallet is at capacity (MAX_TOKENS).
+    pub fn add_token(&mut self, token: ProofCarryingToken) -> bool {
+        if self.tokens.len() >= Self::MAX_TOKENS {
+            return false;
+        }
         self.tokens.push(token);
+        true
     }
 
     /// Remove a token by its ID. Returns the removed token if found.
@@ -40,7 +49,7 @@ impl Wallet {
         self.tokens.len()
     }
 
-    /// Select the best token for spending a given amount.
+    /// Select the best token for spending a given amount (reference only).
     ///
     /// Strategy: smallest token that covers the amount and has
     /// remaining transfer capacity (not needing renewal).
@@ -49,6 +58,20 @@ impl Wallet {
             .iter()
             .filter(|t| t.value >= amount && !t.needs_renewal())
             .min_by_key(|t| t.value)
+    }
+
+    /// Select and remove the best token for spending (takes ownership).
+    ///
+    /// This is the primary way to obtain a token for transfer, since
+    /// ProofCarryingToken is non-Clone by design.
+    pub fn take_token(&mut self, amount: u64) -> Option<ProofCarryingToken> {
+        let idx = self.tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.value >= amount && !t.needs_renewal())
+            .min_by_key(|(_, t)| t.value)
+            .map(|(i, _)| i)?;
+        Some(self.tokens.remove(idx))
     }
 
     /// Get all tokens that need renewal (exceeded transfer bound).
@@ -101,7 +124,8 @@ impl Wallet {
         }
 
         // Encrypt the entire payload
-        let encrypted = crate::secure_store::encrypt(&payload, passphrase);
+        let encrypted = crate::secure_store::encrypt(&payload, passphrase)
+            .expect("passphrase must be at least 8 bytes");
 
         // Pack EncryptedData into a single byte vector
         let mut output = Vec::new();

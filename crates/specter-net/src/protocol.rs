@@ -19,9 +19,14 @@ pub enum Message {
     },
 
     /// Broadcast a spent nullifier to the network.
+    /// Includes a Schnorr signature proving the sender authored this broadcast.
     NullifierBroadcast {
         nullifier: [u8; 32],
         sender: NodeId,
+        /// Schnorr signature (R, s) over SHA-256("specter-gossip:" || nullifier || sender).
+        /// Verifiers check this against the sender's registered public key.
+        signature_r: [u8; 32],
+        signature_s: [u8; 32],
     },
 
     /// Request the current nullifier set (or a diff since a known state).

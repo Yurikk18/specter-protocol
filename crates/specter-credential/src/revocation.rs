@@ -9,35 +9,60 @@ use curve25519_dalek::RistrettoPoint;
 
 use crate::credential::Credential;
 
-/// A list of revoked credential commitments.
+/// A list of revoked credential commitments and holder identifiers.
+///
+/// Supports two revocation modes:
+/// 1. By commitment hash (requires the specific credential object)
+/// 2. By holder ID (revokes ALL credentials for a given holder)
+///
+/// Holder-ID-based revocation solves the problem where the revoker
+/// doesn't have the specific credential commitment (which uses a
+/// random blinding factor the holder controls).
 pub struct RevocationList {
     /// Set of revoked credential commitment hashes (compressed point bytes).
-    revoked: HashSet<[u8; 32]>,
+    revoked_commitments: HashSet<[u8; 32]>,
+    /// Set of revoked holder identifiers (e.g., KYC provider's user ID hash).
+    revoked_holders: HashSet<[u8; 32]>,
 }
 
 impl RevocationList {
     /// Create an empty revocation list.
     pub fn new() -> Self {
         Self {
-            revoked: HashSet::new(),
+            revoked_commitments: HashSet::new(),
+            revoked_holders: HashSet::new(),
         }
     }
 
-    /// Revoke a credential by its commitment.
+    /// Revoke a specific credential by its commitment.
     pub fn revoke(&mut self, credential: &Credential) {
         let hash = commitment_hash(&credential.commitment);
-        self.revoked.insert(hash);
+        self.revoked_commitments.insert(hash);
     }
 
-    /// Check if a credential has been revoked.
+    /// Revoke all credentials for a holder by their identifier.
+    ///
+    /// The holder_id is typically H(holder_pubkey) or a KYC provider's
+    /// internal user identifier. This allows revocation without needing
+    /// the specific credential commitment.
+    pub fn revoke_holder(&mut self, holder_id: [u8; 32]) {
+        self.revoked_holders.insert(holder_id);
+    }
+
+    /// Check if a credential has been revoked (by commitment).
     pub fn is_revoked(&self, credential: &Credential) -> bool {
         let hash = commitment_hash(&credential.commitment);
-        self.revoked.contains(&hash)
+        self.revoked_commitments.contains(&hash)
     }
 
-    /// Number of revoked credentials.
+    /// Check if a holder has been revoked (by holder ID).
+    pub fn is_holder_revoked(&self, holder_id: &[u8; 32]) -> bool {
+        self.revoked_holders.contains(holder_id)
+    }
+
+    /// Number of revoked credentials + holders.
     pub fn count(&self) -> usize {
-        self.revoked.len()
+        self.revoked_commitments.len() + self.revoked_holders.len()
     }
 }
 

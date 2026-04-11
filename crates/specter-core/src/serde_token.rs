@@ -309,17 +309,34 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
     })
 }
 
-/// Serialize a PCT for network transmission (blinding factor zeroed for privacy).
+/// Serialize a PCT for network transmission (secrets zeroed for safety).
 ///
-/// The blinding factor is holder-private and not needed for verification.
-/// Zeroing it prevents leaking the holder's private value during network transfer,
-/// while keeping the serialization format backward-compatible.
+/// Zeros both the credential blinding factor AND the owner_secret in the
+/// output. The receiver will generate their own owner_secret during the
+/// transfer protocol. This avoids cloning the token (which is deliberately
+/// non-Clone as a bearer instrument).
 pub fn serialize_token_public(token: &ProofCarryingToken) -> Vec<u8> {
-    let mut token_copy = token.clone();
-    if let Some(ref mut cred) = token_copy.credential {
-        cred.blinding = Scalar::ZERO;
+    let mut buf = serialize_token(token);
+    // Zero owner_secret in the serialized buffer.
+    // Layout: MAGIC(4) + VERSION(1) + token_id(32) + value(8) + value_commitment(32)
+    //         + vp_commitment(32) + vp_response(32) + sig_s(32) + sig_e(32)
+    //         = offset 205 for owner_secret (32 bytes)
+    const OWNER_SECRET_OFFSET: usize = 4 + 1 + 32 + 8 + 32 + 32 + 32 + 32 + 32;
+    if buf.len() >= OWNER_SECRET_OFFSET + 32 {
+        buf[OWNER_SECRET_OFFSET..OWNER_SECRET_OFFSET + 32].fill(0);
     }
-    serialize_token(&token_copy)
+    // Zero credential blinding factor if present.
+    // After owner_secret(32) + hash_chain_head(32) + transfer_count(4) + recursion_bound(4)
+    // + fold_proof(s32+e32+r32+pk32+state_hash32+pk_chain_hash32+steps4) = 196 bytes
+    // Then: credential flag(1). If 1, commitment(32), then blinding(32).
+    const CRED_FLAG_OFFSET: usize = OWNER_SECRET_OFFSET + 32 + 32 + 4 + 4 + 32 + 32 + 32 + 32 + 32 + 32 + 4;
+    if buf.len() > CRED_FLAG_OFFSET && buf[CRED_FLAG_OFFSET] == 1 {
+        let blinding_offset = CRED_FLAG_OFFSET + 1 + 32; // skip flag + commitment
+        if buf.len() >= blinding_offset + 32 {
+            buf[blinding_offset..blinding_offset + 32].fill(0);
+        }
+    }
+    buf
 }
 
 /// Get the actual serialized size of a token in bytes.
@@ -400,6 +417,7 @@ pub fn serialize_encrypted(
 ) -> crate::secure_store::EncryptedData {
     let plaintext = serialize_token(token);
     crate::secure_store::encrypt(&plaintext, passphrase)
+        .expect("passphrase validation should be done by caller")
 }
 
 /// Decrypt and deserialize a token with a passphrase.
@@ -604,8 +622,11 @@ mod tests {
         assert!(full_size < 2000);
 
         // After 10 transfers (should be same size - constant!)
+        // Issue a fresh identical token for transfer (PCT is non-Clone by design)
         let mut ns = crate::nullifier::NullifierSet::new();
-        let mut transferred = full.clone();
+        let mut transferred = mint
+            .issue_full(1000, &[1, 2], Some(&test_attrs()), Some(50), Some([1u8; 32]))
+            .unwrap();
         for _ in 0..10 {
             transferred = transfer::transfer(transferred, &mut ns).unwrap().token;
         }

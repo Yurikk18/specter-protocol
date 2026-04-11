@@ -164,7 +164,8 @@ pub fn fold_transfer(
     // 3. Compute challenge from ONLY stored proof fields (verifier can recompute)
     let k = random_scalar();
     let new_r = k * G;
-    let new_steps = current_proof.steps + 1;
+    let new_steps = current_proof.steps.checked_add(1)
+        .ok_or(FoldError::BoundExceeded { steps: current_proof.steps, bound: recursion_bound })?;
     let new_e = compute_fold_challenge(&new_state_hash, &pk, &pk_chain_hash, &new_r, new_steps);
 
     // 4. Schnorr response: s = k + e * secret

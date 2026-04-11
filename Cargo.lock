@@ -1376,6 +1376,7 @@ dependencies = [
  "sha2",
  "sha3",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

@@ -44,6 +44,7 @@ pub const ATTR_KYC_PASSED: usize = 0;
 pub const ATTR_NOT_SANCTIONED: usize = 1;
 pub const ATTR_JURISDICTION: usize = 2;
 pub const ATTR_AGE_OVER_18: usize = 3;
+pub const ATTR_EXPIRES_AT: usize = 4;
 
 /// Create a selective disclosure presentation.
 ///
@@ -67,6 +68,11 @@ pub fn create_presentation(
             RistrettoPoint::from_uniform_bytes(&wide)
         })
         .collect();
+
+    // Validate disclosure indices are within bounds
+    for &i in disclose_indices {
+        assert!(i < n, "disclose index {} out of bounds (max {})", i, n - 1);
+    }
 
     // Separate disclosed and hidden attributes
     let disclosed: Vec<(usize, Scalar)> = disclose_indices
@@ -166,6 +172,10 @@ pub fn verify_presentation(
         .collect();
 
     let disclosed_indices: Vec<usize> = presentation.disclosed.iter().map(|(i, _)| *i).collect();
+    // Reject out-of-bounds indices from untrusted presentations (prevents panic)
+    if disclosed_indices.iter().any(|&i| i >= n) {
+        return false;
+    }
     let hidden_indices: Vec<usize> = (0..n)
         .filter(|i| !disclosed_indices.contains(i))
         .collect();

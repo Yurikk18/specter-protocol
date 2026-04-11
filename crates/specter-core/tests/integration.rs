@@ -65,10 +65,10 @@ fn test_double_spend_detection() {
     let mint = setup_mint(2, 3, 20);
     let token = mint.issue(1000, &[1, 2], None).unwrap();
     let mut ns = NullifierSet::new();
-    let _s1 = transfer::transfer(token.clone(), &mut ns).unwrap();
-    // Second transfer of the same token should fail with DoubleSpend
-    let s2 = transfer::transfer(token, &mut ns);
-    assert!(s2.is_err());
+    let nullifier = token.compute_nullifier();
+    let _s1 = transfer::transfer(token, &mut ns).unwrap();
+    // Same nullifier re-inserted = double-spend detected
+    assert!(!ns.insert(nullifier), "double-spend must be detected");
 }
 
 #[test]

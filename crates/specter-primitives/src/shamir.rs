@@ -5,16 +5,32 @@
 //! threshold signature schemes.
 
 use curve25519_dalek::Scalar;
+use zeroize::Zeroize;
 
 use crate::scalar_utils::random_scalar;
 
 /// A single share of a secret, identified by its x-coordinate.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Share {
     /// The x-coordinate (evaluator index), must be nonzero.
     pub x: Scalar,
-    /// The y-coordinate (polynomial evaluation at x).
+    /// The y-coordinate (polynomial evaluation at x). SECRET.
     pub y: Scalar,
+}
+
+impl std::fmt::Debug for Share {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Share")
+            .field("x", &self.x)
+            .field("y", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        self.y.zeroize();
+    }
 }
 
 /// Errors for Shamir secret sharing.

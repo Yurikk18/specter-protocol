@@ -129,8 +129,12 @@ impl NullifierSet {
             return false; // already known
         }
         if let Some(ref mut file) = self.file {
-            // Gracefully handle I/O errors — keep nullifier in memory even if disk fails
-            if let Err(e) = file.write_all(&nullifier).and_then(|_| file.flush()) {
+            // Write + flush + fsync for crash safety.
+            // fsync ensures data reaches durable storage, not just the OS page cache.
+            if let Err(e) = file.write_all(&nullifier)
+                .and_then(|_| file.flush())
+                .and_then(|_| file.sync_all())  // fsync: durable to disk
+            {
                 eprintln!("WARNING: failed to persist nullifier to disk: {}", e);
                 // Nullifier is still in the in-memory set, preventing double-spend
             }

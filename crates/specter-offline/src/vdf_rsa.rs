@@ -106,6 +106,9 @@ pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> RsaV
     }
 }
 
+/// Maximum allowed iterations for RSA VDF verification.
+pub const MAX_RSA_VDF_ITERATIONS: u64 = 10_000_000;
+
 /// Verify a VDF proof using Wesolowski's verification.
 ///
 /// Check: pi^l * x^r == y mod N
@@ -114,6 +117,19 @@ pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> RsaV
 /// This is O(log T) - much faster than recomputing the full chain.
 pub fn verify(params: &RsaVdfParams, proof: &RsaVdfProof) -> bool {
     let n = &params.modulus;
+
+    // Reject zero iterations (trivial proof — no time delay)
+    if proof.iterations == 0 {
+        return false;
+    }
+    // Reject excessive iterations (DoS protection)
+    if proof.iterations > MAX_RSA_VDF_ITERATIONS {
+        return false;
+    }
+    // Reject degenerate inputs (0 and 1 have trivially known outputs)
+    if proof.input <= BigUint::from(1u64) {
+        return false;
+    }
 
     // Recompute challenge
     let l = derive_challenge(&proof.input, &proof.output, proof.iterations);

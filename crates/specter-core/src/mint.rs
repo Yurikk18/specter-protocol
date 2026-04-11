@@ -26,6 +26,14 @@ pub struct UserTokenSecrets {
     pub value_commitment: RistrettoPoint,
 }
 
+impl Drop for UserTokenSecrets {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.owner_secret.zeroize();
+        self.value_blinding.zeroize();
+    }
+}
+
 impl UserTokenSecrets {
     /// Generate fresh private values for a new token.
     pub fn generate(value: u64, pedersen: &PedersenParams) -> Self {

@@ -52,9 +52,13 @@ impl GossipProtocol {
         }
 
         // Queue broadcast to all peers (with rate limiting)
+        // Signature fields are zero-filled at the gossip layer.
+        // The node layer (NetworkNode) is responsible for signing before transmission.
         let msg = Message::NullifierBroadcast {
             nullifier,
             sender: self.node_id,
+            signature_r: [0u8; 32],
+            signature_s: [0u8; 32],
         };
         for peer_id in &self.peers {
             if let Some(queue) = self.outbox.get_mut(peer_id) {
@@ -82,6 +86,8 @@ impl GossipProtocol {
         let msg = Message::NullifierBroadcast {
             nullifier,
             sender: self.node_id,
+            signature_r: [0u8; 32],
+            signature_s: [0u8; 32],
         };
         for peer_id in &self.peers {
             if *peer_id != from {
@@ -172,19 +178,19 @@ mod tests {
 
         // Deliver messages from node 1 to peers
         for msg in node1.drain_messages_for(2) {
-            if let Message::NullifierBroadcast { nullifier, sender } = msg {
+            if let Message::NullifierBroadcast { nullifier, sender, .. } = msg {
                 node2.handle_nullifier_broadcast(nullifier, sender);
             }
         }
         for msg in node1.drain_messages_for(3) {
-            if let Message::NullifierBroadcast { nullifier, sender } = msg {
+            if let Message::NullifierBroadcast { nullifier, sender, .. } = msg {
                 node3.handle_nullifier_broadcast(nullifier, sender);
             }
         }
 
         // Node 2 should forward to node 4
         for msg in node2.drain_messages_for(4) {
-            if let Message::NullifierBroadcast { nullifier, sender } = msg {
+            if let Message::NullifierBroadcast { nullifier, sender, .. } = msg {
                 node4.handle_nullifier_broadcast(nullifier, sender);
             }
         }

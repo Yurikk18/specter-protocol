@@ -26,9 +26,9 @@ pub struct EncryptedData {
 /// Derive an encryption key from a passphrase using Argon2id.
 fn derive_key(passphrase: &[u8], salt: &[u8; 16]) -> [u8; 32] {
     let params = argon2::Params::new(
-        65536,  // 64 MB memory
-        3,      // 3 iterations
-        4,      // 4 lanes (parallelism) - forces 4x resources per brute-force attempt
+        131072, // 128 MB memory — financial-grade key derivation
+        4,      // 4 iterations
+        4,      // 4 lanes (parallelism) — forces 4x resources per brute-force attempt
         Some(32), // 32-byte output
     )
     .expect("valid argon2 params");
@@ -47,13 +47,14 @@ pub const MIN_PASSPHRASE_LEN: usize = 8;
 
 /// Encrypt data with a passphrase.
 ///
-/// Requires passphrase of at least MIN_PASSPHRASE_LEN bytes.
-pub fn encrypt(plaintext: &[u8], passphrase: &[u8]) -> EncryptedData {
-    assert!(
-        passphrase.len() >= MIN_PASSPHRASE_LEN,
-        "passphrase must be at least {} bytes",
-        MIN_PASSPHRASE_LEN,
-    );
+/// Returns an error if the passphrase is shorter than MIN_PASSPHRASE_LEN.
+pub fn encrypt(plaintext: &[u8], passphrase: &[u8]) -> Result<EncryptedData, SecureStoreError> {
+    if passphrase.len() < MIN_PASSPHRASE_LEN {
+        return Err(SecureStoreError::PassphraseTooShort {
+            min: MIN_PASSPHRASE_LEN,
+            got: passphrase.len(),
+        });
+    }
     // Generate random salt and nonce
     let mut salt = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
@@ -74,11 +75,11 @@ pub fn encrypt(plaintext: &[u8], passphrase: &[u8]) -> EncryptedData {
     // Zeroize key from memory
     key.zeroize();
 
-    EncryptedData {
+    Ok(EncryptedData {
         salt,
         nonce: nonce_bytes,
         ciphertext,
-    }
+    })
 }
 
 /// Decrypt data with a passphrase.
@@ -106,6 +107,9 @@ pub fn fingerprint(data: &EncryptedData) -> String {
 pub enum SecureStoreError {
     #[error("decryption failed - wrong passphrase or corrupted data")]
     DecryptionFailed,
+
+    #[error("passphrase too short: need at least {min} bytes, got {got}")]
+    PassphraseTooShort { min: usize, got: usize },
 }
 
 #[cfg(test)]
@@ -117,7 +121,7 @@ mod tests {
         let data = b"secret wallet data with private keys";
         let passphrase = b"my-strong-passphrase-123";
 
-        let encrypted = encrypt(data, passphrase);
+        let encrypted = encrypt(data, passphrase).unwrap();
         let decrypted = decrypt(&encrypted, passphrase).unwrap();
 
         assert_eq!(decrypted, data);
@@ -126,7 +130,7 @@ mod tests {
     #[test]
     fn test_wrong_passphrase_fails() {
         let data = b"secret data";
-        let encrypted = encrypt(data, b"correct-passphrase");
+        let encrypted = encrypt(data, b"correct-passphrase").unwrap();
         let result = decrypt(&encrypted, b"wrong-passphrase");
         assert!(result.is_err());
     }
@@ -134,7 +138,7 @@ mod tests {
     #[test]
     fn test_tampered_ciphertext_fails() {
         let data = b"secret data";
-        let mut encrypted = encrypt(data, b"passphrase-min8");
+        let mut encrypted = encrypt(data, b"passphrase-min8").unwrap();
         if !encrypted.ciphertext.is_empty() {
             encrypted.ciphertext[0] ^= 0xFF;
         }
@@ -144,22 +148,22 @@ mod tests {
 
     #[test]
     fn test_different_plaintexts_different_ciphertexts() {
-        let e1 = encrypt(b"data one", b"pass-min8");
-        let e2 = encrypt(b"data two", b"pass-min8");
+        let e1 = encrypt(b"data one", b"pass-min8").unwrap();
+        let e2 = encrypt(b"data two", b"pass-min8").unwrap();
         assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     #[test]
     fn test_same_plaintext_different_ciphertexts() {
         // Random salt + nonce means same input produces different ciphertext
-        let e1 = encrypt(b"same data", b"pass-min8");
-        let e2 = encrypt(b"same data", b"pass-min8");
+        let e1 = encrypt(b"same data", b"pass-min8").unwrap();
+        let e2 = encrypt(b"same data", b"pass-min8").unwrap();
         assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     #[test]
     fn test_empty_plaintext() {
-        let encrypted = encrypt(b"", b"pass-min8");
+        let encrypted = encrypt(b"", b"pass-min8").unwrap();
         let decrypted = decrypt(&encrypted, b"pass-min8").unwrap();
         assert!(decrypted.is_empty());
     }
@@ -167,14 +171,20 @@ mod tests {
     #[test]
     fn test_large_plaintext() {
         let data = vec![0x42u8; 10_000];
-        let encrypted = encrypt(&data, b"pass-min8");
+        let encrypted = encrypt(&data, b"pass-min8").unwrap();
         let decrypted = decrypt(&encrypted, b"pass-min8").unwrap();
         assert_eq!(decrypted, data);
     }
 
     #[test]
+    fn test_short_passphrase_returns_error() {
+        let result = encrypt(b"data", b"short");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_fingerprint() {
-        let encrypted = encrypt(b"data", b"pass-min8");
+        let encrypted = encrypt(b"data", b"pass-min8").unwrap();
         let fp = fingerprint(&encrypted);
         assert_eq!(fp.len(), 16); // 8 bytes hex = 16 chars
     }

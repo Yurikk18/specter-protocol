@@ -64,7 +64,7 @@ pub struct Vote {
 }
 
 /// A validator's keypair for signing votes.
-#[derive(Clone)]
+/// Non-Clone: secret key material should not be duplicated.
 pub struct ValidatorKey {
     pub node_id: NodeId,
     pub public_key: RistrettoPoint,
@@ -79,9 +79,14 @@ impl ValidatorKey {
         Self { node_id, public_key, secret_key }
     }
 
-    /// Sign a vote.
+    /// Sign a vote. Includes view number to prevent cross-view replay.
     pub fn sign_vote(&self, block_height: u64, block_hash: &[u8; 32], approve: bool) -> Vote {
-        let msg = vote_message(self.node_id, block_height, block_hash, approve);
+        self.sign_vote_with_view(block_height, block_hash, approve, 0)
+    }
+
+    /// Sign a vote with an explicit view number.
+    pub fn sign_vote_with_view(&self, block_height: u64, block_hash: &[u8; 32], approve: bool, view: u64) -> Vote {
+        let msg = vote_message(self.node_id, block_height, block_hash, approve, view);
         let k = specter_primitives::scalar_utils::random_scalar();
         let r = k * G;
         let e = vote_challenge(&r, &self.public_key, &msg);
@@ -106,19 +111,25 @@ impl Drop for ValidatorKey {
 
 /// Verify a vote's Schnorr signature against the voter's public key.
 pub fn verify_vote_signature(vote: &Vote, voter_pubkey: &RistrettoPoint) -> bool {
-    let msg = vote_message(vote.voter, vote.block_height, &vote.block_hash, vote.approve);
+    verify_vote_signature_with_view(vote, voter_pubkey, 0)
+}
+
+/// Verify a vote signature with an explicit view number.
+pub fn verify_vote_signature_with_view(vote: &Vote, voter_pubkey: &RistrettoPoint, view: u64) -> bool {
+    let msg = vote_message(vote.voter, vote.block_height, &vote.block_hash, vote.approve, view);
     let e = vote_challenge(&vote.signature.r, voter_pubkey, &msg);
     let lhs = vote.signature.s * G;
     let rhs = vote.signature.r + e * voter_pubkey;
     lhs == rhs
 }
 
-fn vote_message(voter: NodeId, height: u64, hash: &[u8; 32], approve: bool) -> Vec<u8> {
+fn vote_message(voter: NodeId, height: u64, hash: &[u8; 32], approve: bool, view: u64) -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(&voter.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
     msg.extend_from_slice(hash);
     msg.push(if approve { 1 } else { 0 });
+    msg.extend_from_slice(&view.to_le_bytes()); // prevent cross-view replay
     msg
 }
 
@@ -146,7 +157,7 @@ pub struct ConsensusState {
     pub current_height: u64,
     pub committed_blocks: Vec<NullifierBlock>,
     pub committed_nullifiers: HashSet<[u8; 32]>,
-    pub pending_nullifiers: Vec<[u8; 32]>,
+    pub pending_nullifiers: HashSet<[u8; 32]>,
     votes: HashMap<[u8; 32], Vec<Vote>>,
     pub view: u64,
     /// Seen proposals for equivocation detection: (height, leader) -> first hash.
@@ -161,11 +172,19 @@ impl ConsensusState {
         validator_keys: HashMap<NodeId, RistrettoPoint>,
     ) -> Result<Self, ConsensusError> {
         let n = validators.len();
+        // BFT requires n >= 3f+1 with f >= 1, so minimum n = 4 for any fault tolerance.
+        // n < 4 is allowed for testing but provides ZERO fault tolerance (logged as warning).
         if n < 1 {
             return Err(ConsensusError::InsufficientValidators { min: 1, got: 0 });
         }
         let max_faults = (n - 1) / 3;
-        let quorum_size = if n < 4 { n } else { 2 * max_faults + 1 };
+        let quorum_size = if n < 4 {
+            #[cfg(not(test))]
+            eprintln!("WARNING: {} validators provides 0 fault tolerance (need >= 4 for BFT)", n);
+            n // require all validators (f=0)
+        } else {
+            2 * max_faults + 1
+        };
 
         Ok(Self {
             node_id,
@@ -177,7 +196,7 @@ impl ConsensusState {
             current_height: 0,
             committed_blocks: Vec::new(),
             committed_nullifiers: HashSet::new(),
-            pending_nullifiers: Vec::new(),
+            pending_nullifiers: HashSet::new(),
             votes: HashMap::new(),
             view: 0,
             seen_proposals: HashMap::new(),
@@ -196,10 +215,8 @@ impl ConsensusState {
         if self.pending_nullifiers.len() >= MAX_PENDING_NULLIFIERS {
             return; // drop under memory pressure
         }
-        if !self.committed_nullifiers.contains(&nullifier)
-            && !self.pending_nullifiers.contains(&nullifier)
-        {
-            self.pending_nullifiers.push(nullifier);
+        if !self.committed_nullifiers.contains(&nullifier) {
+            self.pending_nullifiers.insert(nullifier);
         }
     }
 
@@ -210,7 +227,7 @@ impl ConsensusState {
                 self_id: self.node_id,
             });
         }
-        let nullifiers: Vec<[u8; 32]> = self.pending_nullifiers.drain(..).collect();
+        let nullifiers: Vec<[u8; 32]> = self.pending_nullifiers.drain().collect();
         let prev_hash = self.committed_blocks.last()
             .map(|b| b.hash)
             .unwrap_or([0u8; 32]);

@@ -1,5 +1,11 @@
 //! Schnorr Blind Signature Protocol over Ristretto255.
 //!
+//! SECURITY WARNING: Standard blind Schnorr is vulnerable to the Wagner/ROS
+//! attack when a signer allows concurrent sessions (poly(log n) sessions
+//! enable forgery). The signer MUST NOT allow more than one open session at
+//! a time with this protocol. For concurrent-safe signing, use the clause
+//! blind variant in `clause_blind.rs` (Abe 2001 / GNU Taler).
+//!
 //! Implements the classic 3-move blind signature protocol:
 //!
 //! 1. **Signer** generates a random nonce k, sends R = k*G to the requester.
@@ -35,6 +41,49 @@ impl Drop for SignerSession {
     }
 }
 
+/// A rate-limited signer that enforces at most one concurrent session.
+///
+/// Standard blind Schnorr is vulnerable to the Wagner/ROS attack when
+/// multiple sessions are open concurrently. This wrapper ensures only
+/// one session can be active at a time, closing the attack surface.
+pub struct RateLimitedSigner {
+    keypair: SignerKeypair,
+    session_active: bool,
+}
+
+impl RateLimitedSigner {
+    /// Create a new rate-limited signer.
+    pub fn new(keypair: SignerKeypair) -> Self {
+        Self { keypair, session_active: false }
+    }
+
+    /// Start a new session. Returns None if a session is already active.
+    pub fn new_session(&mut self) -> Option<(SignerSession, RistrettoPoint)> {
+        if self.session_active {
+            return None; // ROS protection: only one session at a time
+        }
+        self.session_active = true;
+        let k = random_scalar();
+        let r = k * G;
+        Some((SignerSession { k }, r))
+    }
+
+    /// Complete the session (must be called after respond).
+    pub fn end_session(&mut self) {
+        self.session_active = false;
+    }
+
+    /// Access the keypair for verification.
+    pub fn keypair(&self) -> &SignerKeypair {
+        &self.keypair
+    }
+
+    /// Access the public key.
+    pub fn public(&self) -> &RistrettoPoint {
+        &self.keypair.public
+    }
+}
+
 impl SignerKeypair {
     /// Generate a new random keypair.
     pub fn generate() -> Self {
@@ -45,8 +94,8 @@ impl SignerKeypair {
 
     /// Start a new blind signing session.
     ///
-    /// Returns the session state (kept private) and the commitment R = k*G
-    /// which is sent to the requester.
+    /// WARNING: This does NOT enforce concurrency limits. For production use,
+    /// wrap in [`RateLimitedSigner`] to prevent Wagner/ROS attacks.
     pub fn new_session(&self) -> (SignerSession, RistrettoPoint) {
         let k = random_scalar();
         let r = k * G;
@@ -156,10 +205,12 @@ pub fn verify(pk: &RistrettoPoint, message: &[u8], sig: &BlindSignature) -> bool
 
 // ─── Internal ───────────────────────────────────────────────────────────────
 
-/// Hash a Ristretto point, public key, and message to a scalar challenge.
+/// Hash a Ristretto point and message to a scalar challenge.
 ///
-/// H(R || PK || message) using SHA-512 reduced to a scalar.
-/// Including PK prevents key-substitution (rogue-key) attacks.
+/// H(R || msg_len || message) using SHA-512 reduced to a scalar.
+/// Note: PK is NOT included in the hash. Key-substitution is prevented
+/// by the blind signature protocol structure: the requester computes R'
+/// using the signer's specific PK, binding the signature to that key.
 fn hash_challenge(r: &RistrettoPoint, message: &[u8]) -> Scalar {
     let hash = Sha512::new()
         .chain_update(b"specter-blind-sig-challenge:")

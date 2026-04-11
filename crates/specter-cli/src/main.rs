@@ -22,6 +22,7 @@ use specter_core::verify;
 use specter_core::wallet::Wallet;
 
 const WALLET_FILE: &str = "specter_wallet.dat";
+#[cfg(debug_assertions)]
 const DEFAULT_PASSPHRASE: &[u8] = b"specter-dev-only";
 
 /// Get wallet passphrase from environment.
@@ -192,9 +193,9 @@ fn cmd_transfer() {
         return;
     }
 
-    // Select first available token
-    let token = match wallet.select_token(1) {
-        Some(t) => t.clone(),
+    // Take the first available token (removes from wallet, giving ownership)
+    let token = match wallet.take_token(1) {
+        Some(t) => t,
         None => {
             println!("No transferable tokens (all may need renewal).");
             return;
@@ -205,8 +206,7 @@ fn cmd_transfer() {
     let mut ns = NullifierSet::new();
     let result = transfer::transfer(token, &mut ns).unwrap();
 
-    // Remove old, add new
-    wallet.remove_token(&id);
+    // Add the transferred token back
     wallet.add_token(result.token);
 
     let data = wallet.save(&get_passphrase());
@@ -338,8 +338,8 @@ fn cmd_send(args: &[String]) {
         return;
     }
 
-    let token = match wallet.select_token(1) {
-        Some(t) => t.clone(),
+    let token = match wallet.take_token(1) {
+        Some(t) => t,
         None => {
             println!("No transferable tokens.");
             return;
@@ -353,7 +353,7 @@ fn cmd_send(args: &[String]) {
             use std::io::Write;
 
             // ECDH key exchange (sender is initiator)
-            let shared_key = match dh_handshake(&mut stream, true) {
+            let mut shared_key = match dh_handshake(&mut stream, true) {
                 Some(k) => k,
                 None => { eprintln!("Key exchange failed with {}", addr); return; }
             };
@@ -378,8 +378,11 @@ fn cmd_send(args: &[String]) {
                 return;
             }
 
-            // Only remove from wallet AFTER successful send
-            wallet.remove_token(&id);
+            // Zeroize shared key after use
+            use zeroize::Zeroize;
+            shared_key.zeroize();
+
+            // Token already removed by take_token — save the wallet
             let data = wallet.save(&get_passphrase());
             std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
             println!("Sent token {} to {} (encrypted, {} bytes)", hex::encode(&id[..8]), addr, encrypted.len());
@@ -407,7 +410,7 @@ fn cmd_receive(args: &[String]) {
             use std::io::Read;
 
             // ECDH key exchange (receiver is responder)
-            let shared_key = match dh_handshake(&mut stream, false) {
+            let mut shared_key = match dh_handshake(&mut stream, false) {
                 Some(k) => k,
                 None => { eprintln!("Key exchange failed with {}", peer); return; }
             };
@@ -435,8 +438,15 @@ fn cmd_receive(args: &[String]) {
 
             // Decrypt with shared key
             let buf = match decrypt_with_key(&encrypted_buf, &shared_key) {
-                Some(p) => p,
+                Some(p) => {
+                    // Zeroize shared key after successful decryption
+                    use zeroize::Zeroize;
+                    shared_key.zeroize();
+                    p
+                }
                 None => {
+                    use zeroize::Zeroize;
+                    shared_key.zeroize();
                     eprintln!("Decryption failed from {} - tampered or wrong key", peer);
                     return;
                 }
@@ -543,12 +553,11 @@ fn run_demo() {
     println!("[5/6] Demonstrating double-spend detection...");
     let original = mint.issue(500, &[2, 3], None).unwrap();
     let mut ds_set = NullifierSet::new();
-    let _spend1 = transfer::transfer(original.clone(), &mut ds_set).unwrap();
-    let spend2_result = transfer::transfer(original, &mut ds_set);
-
-    let first_ok = true; // spend1 succeeded above
-    let second_ok = spend2_result.is_ok();
-    println!("  First spend:       {} (valid)", first_ok);
+    let nullifier = original.compute_nullifier();
+    let _spend1 = transfer::transfer(original, &mut ds_set).unwrap();
+    // Attempting to re-insert the same nullifier simulates a double-spend
+    let second_ok = ds_set.insert(nullifier);
+    println!("  First spend:       true (valid)");
     println!("  Second spend:      {} (DOUBLE SPEND DETECTED)", second_ok);
     println!();
 
@@ -591,9 +600,11 @@ fn run_benchmark() {
     println!("Verify (with cred):            {:?} avg", start.elapsed() / n as u32);
 
     let start = Instant::now();
-    for t in tokens.iter() {
+    // Issue fresh tokens for transfer benchmark (PCT is non-Clone by design)
+    for _ in 0..n {
+        let t = mint.issue(1000, &[1, 2], None).unwrap();
         let mut ns = NullifierSet::new();
-        let _ = transfer::transfer(t.clone(), &mut ns).unwrap();
+        let _ = transfer::transfer(t, &mut ns).unwrap();
     }
     println!("Transfer (P2P local):          {:?} avg", start.elapsed() / n as u32);
 

@@ -15,25 +15,21 @@ pub struct NetworkNode {
 }
 
 impl NetworkNode {
-    /// Create a new network node with validator keys.
+    /// Create a new network node.
+    ///
+    /// Takes ownership of the node's own ValidatorKey (non-Clone for security)
+    /// and a map of all validators' public keys for vote verification.
     pub fn new(
         id: NodeId,
         peers: Vec<NodeId>,
-        validator_keys: Vec<ValidatorKey>,
+        own_key: ValidatorKey,
+        all_validators: Vec<NodeId>,
+        all_pubkeys: HashMap<NodeId, curve25519_dalek::RistrettoPoint>,
     ) -> Self {
-        let validators: Vec<NodeId> = validator_keys.iter().map(|k| k.node_id).collect();
-        let pubkeys: HashMap<NodeId, _> = validator_keys.iter()
-            .map(|k| (k.node_id, k.public_key))
-            .collect();
-
-        let own_key = validator_keys.into_iter()
-            .find(|k| k.node_id == id)
-            .expect("node must have its own validator key");
-
         Self {
             id,
             gossip: GossipProtocol::new(id, peers),
-            consensus: ConsensusState::new(id, validators, pubkeys)
+            consensus: ConsensusState::new(id, all_validators, all_pubkeys)
                 .expect("valid consensus params"),
             validator_key: own_key,
         }
@@ -83,15 +79,19 @@ mod tests {
     use super::*;
 
     fn make_network() -> (NetworkNode, NetworkNode, NetworkNode) {
+        // Generate one key per node. Extract pubkeys before moving ownership.
         let k1 = ValidatorKey::generate(1);
         let k2 = ValidatorKey::generate(2);
         let k3 = ValidatorKey::generate(3);
 
-        let keys = vec![k1.clone(), k2.clone(), k3.clone()];
+        let validators = vec![1, 2, 3];
+        let pubkeys: HashMap<crate::protocol::NodeId, curve25519_dalek::RistrettoPoint> = vec![
+            (1, k1.public_key), (2, k2.public_key), (3, k3.public_key),
+        ].into_iter().collect();
 
-        let n1 = NetworkNode::new(1, vec![2, 3], keys.clone());
-        let n2 = NetworkNode::new(2, vec![1, 3], keys.clone());
-        let n3 = NetworkNode::new(3, vec![1, 2], keys);
+        let n1 = NetworkNode::new(1, vec![2, 3], k1, validators.clone(), pubkeys.clone());
+        let n2 = NetworkNode::new(2, vec![1, 3], k2, validators.clone(), pubkeys.clone());
+        let n3 = NetworkNode::new(3, vec![1, 2], k3, validators, pubkeys);
 
         (n1, n2, n3)
     }

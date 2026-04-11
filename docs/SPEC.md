@@ -10,22 +10,24 @@ A PCT is a single cryptographic object containing:
 
 | Field | Size | Purpose |
 |---|---|---|
-| token_id | 32 B | Unique identifier |
-| value | 8 B | Denomination |
+| token_id | 32 B | Unique identifier (CSPRNG) |
+| value | 8 B | Denomination (u64) |
 | value_commitment | 32 B | Pedersen commitment hiding the value |
-| value_blinding | 32 B | Opening factor (holder's secret) |
+| value_proof | 64 B | ZK proof of value (commitment + response scalar) |
 | mint_signature | 64 B | Threshold blind Schnorr signature |
 | owner_secret | 32 B | Current holder's secret (for nullifier) |
 | hash_chain_head | 32 B | Transfer history commitment |
 | transfer_count | 4 B | Number of transfers |
 | recursion_bound | 4 B | Maximum transfers before renewal |
-| fold_proof | ~160 B | Accumulated proof (s, e, R, PK, state_hash) |
-| credential | ~256 B | Anonymous compliance credential (optional) |
+| fold_proof | ~196 B | Accumulated proof (s, e, R, PK, state_hash, pk_chain_hash, steps) |
+| credential | ~288 B | Anonymous compliance credential with 5 attributes (optional) |
 | presentation | ~512 B | Selective disclosure ZK proof (optional) |
 | vdf_proof | ~72 B | Time-lock proof (optional) |
 | bond_owner_id | 32 B | Bond backing reference (optional) |
 
 **Total: 413 bytes (basic) / 1,039 bytes (full features)**
+
+The token is a **non-Clone** bearer instrument in Rust: `ProofCarryingToken` does not implement `Clone`, enforcing single-ownership via move semantics at the type system level.
 
 ## 2. Issuance
 
@@ -42,20 +44,23 @@ No individual signer knows the token content or the final signature.
 
 ## 3. Transfer
 
-1. Sender reveals PCT to receiver
-2. Receiver verifies: signature, value commitment, fold proof, credential, bounds
-3. Sender creates a nullifier: `SHAKE-256(owner_secret || token_id)`
-4. Receiver generates new owner_secret, advances hash chain, folds new proof
-5. Nullifier is published to the network for double-spend detection
+The `transfer()` function takes `ProofCarryingToken` by value (move semantics) — the caller surrenders ownership, preventing reuse at the type level.
 
-Token size remains constant - the fold proof absorbs each transfer without growing.
+1. Sender reveals PCT to receiver (via `serialize_token_public()` which zeros `owner_secret`)
+2. Receiver verifies: signature, value commitment, fold proof, credential, bounds
+3. Nullifier is computed: `SHAKE-256("specter-nullifier:" || owner_secret || token_id)`
+4. Nullifier is atomically checked-and-inserted into the `NullifierSet` (double-spend = immediate rejection)
+5. New owner_secret generated (CSPRNG), hash chain advanced, fold proof accumulated
+6. Nullifier published to network via authenticated gossip for global double-spend detection
+
+Token size remains constant — the fold proof absorbs each transfer without growing.
 
 ## 4. Verification
 
-Six independent checks, all must pass:
+Six independent checks, all computed without early return (no short-circuit):
 
 1. **Signature**: Blind signature valid against group public key
-2. **Value**: Pedersen commitment opens correctly
+2. **Value**: ZK proof of value (Pedersen commitment verified via value_proof, no raw blinding factor needed)
 3. **Bound**: transfer_count <= recursion_bound
 4. **Fold**: Schnorr equation `s*G == R + e*PK` holds
 5. **Credential**: Selective disclosure presentation valid (if present)
@@ -63,14 +68,15 @@ Six independent checks, all must pass:
 
 ## 5. Compliance
 
-Anonymous credentials prove attributes without revealing identity:
+Anonymous credentials prove attributes without revealing identity. Five attributes are committed in a Pedersen vector commitment, signed by the issuer:
 
-- "Holder passed KYC" (without revealing who)
-- "Holder is not sanctioned" (without revealing against which list)
-- "Transaction is within jurisdictional limits" (without revealing amount)
-- "Holder is over 18" (without revealing age)
+1. **KYC passed** — "Holder passed KYC" (without revealing who)
+2. **Not sanctioned** — "Holder is not on a sanctions list" (without revealing against which list)
+3. **Jurisdiction** — "Transaction is within jurisdictional limits" (without revealing amount)
+4. **Age over 18** — "Holder is over 18" (without revealing age)
+5. **Expires at** — Credential expiry timestamp (cryptographically bound — cannot be modified post-issuance)
 
-Verifier learns ONLY the disclosed attribute values. Hidden attributes are protected by a ZK proof of knowledge.
+Verifier learns ONLY the disclosed attribute values. Hidden attributes are protected by a ZK proof of knowledge. Credentials can be revoked by commitment hash or by holder ID (covering all credentials for a given user).
 
 ## 6. Offline Payments
 
@@ -86,8 +92,11 @@ Nullifier-only BFT consensus:
 
 - Append-only log of spent nullifiers (not a full blockchain)
 - HotStuff-2-inspired leader rotation with view change
-- Quorum: 2f+1 out of 3f+1 validators
+- Quorum: 2f+1 out of 3f+1 validators (minimum 4 for fault tolerance; n<4 emits a warning)
 - Authenticated votes: Schnorr signatures verified against registered validator keys
+- View number included in vote signature to prevent cross-view replay
+- Equivocation detection: conflicting proposals from the same leader at the same height
+- Pending nullifiers stored in a HashSet with 100K cap (O(1) lookup, DoS-resistant)
 - Forged, tampered, and duplicate votes are rejected
 
 ## 8. Security Properties
@@ -100,8 +109,11 @@ Nullifier-only BFT consensus:
 | Double-spend detection | Deterministic nullifiers via SHAKE-256 |
 | Constant-size proof | Recursive Schnorr folding (bounded depth) |
 | Memory safety | Zeroize secrets on drop |
-| Authenticated consensus | Schnorr-signed votes |
-| Encrypted storage | Argon2id + ChaCha20-Poly1305 |
+| Authenticated consensus | Schnorr-signed votes with view replay protection |
+| Authenticated gossip | Signed nullifier broadcasts |
+| Non-Clone bearer tokens | Move semantics prevent value duplication |
+| Encrypted storage | Argon2id (128 MB) + ChaCha20-Poly1305 |
+| Crash-safe persistence | fsync on nullifier writes |
 
 ## 9. Cryptographic Primitives
 
@@ -116,7 +128,7 @@ Nullifier-only BFT consensus:
 | VDF (production) | RSA repeated squaring + Wesolowski | Sequential under factoring |
 | Nullifier | SHAKE-256(secret \|\| token_id) | Collision-resistant |
 | Encryption | ChaCha20-Poly1305 | IND-CCA2 |
-| KDF | Argon2id (64 MB, 3 iterations) | Memory-hard |
+| KDF | Argon2id (128 MB, 4 iterations) | Memory-hard |
 
 ## 10. Specter Security Framework
 

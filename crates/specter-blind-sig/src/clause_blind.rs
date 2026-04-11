@@ -139,6 +139,7 @@ fn hash_challenge(r: &RistrettoPoint, message: &[u8]) -> Scalar {
     let hash = Sha512::new()
         .chain_update(b"specter-clause-blind-challenge:")
         .chain_update(r.compress().as_bytes())
+        .chain_update((message.len() as u64).to_le_bytes())
         .chain_update(message)
         .finalize();
     let mut wide = [0u8; 64];
