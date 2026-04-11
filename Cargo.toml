@@ -10,6 +10,7 @@ members = [
     "crates/specter-net",
     "crates/specter-cli",
 ]
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 curve25519-dalek = { version = ">=4.1.3", features = ["serde", "rand_core", "zeroize"] }

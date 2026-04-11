@@ -209,24 +209,25 @@ impl AttestationChain {
 
     /// Verify the chain integrity (each attestation links to the previous).
     pub fn verify_integrity(&self) -> bool {
+        use subtle::ConstantTimeEq;
         for (i, att) in self.attestations.iter().enumerate() {
             // Check position
             if att.chain_position != i as u32 {
                 return false;
             }
 
-            // Check prev_hash linkage
+            // Check prev_hash linkage (constant-time)
             let expected_prev = if i == 0 {
                 [0u8; 32]
             } else {
                 self.attestations[i - 1].hash
             };
-            if att.prev_hash != expected_prev {
+            if !bool::from(att.prev_hash.ct_eq(&expected_prev)) {
                 return false;
             }
 
-            // Check token_id consistency
-            if att.token_id != self.token_id {
+            // Check token_id consistency (constant-time)
+            if !bool::from(att.token_id.ct_eq(&self.token_id)) {
                 return false;
             }
 

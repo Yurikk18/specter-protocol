@@ -22,6 +22,7 @@ use specter_core::verify;
 use specter_core::wallet::Wallet;
 
 const WALLET_FILE: &str = "specter_wallet.dat";
+const IDENTITY_FILE: &str = "specter_identity.dat";
 #[cfg(debug_assertions)]
 const DEFAULT_PASSPHRASE: &[u8] = b"specter-dev-only-min12";
 
@@ -70,6 +71,11 @@ fn get_passphrase() -> Vec<u8> {
 }
 
 fn main() {
+    // A6: disable core dumps at startup so an unexpected crash cannot
+    // persist decrypted wallet secrets to disk. Unix-only; Windows WER
+    // is governed by registry policy and this is a no-op there.
+    let _ = specter_core::memory_guard::disable_core_dumps();
+
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
@@ -99,12 +105,12 @@ fn print_help() {
     println!("Usage: specter-cli <command> [args]");
     println!();
     println!("Commands:");
-    println!("  setup               Create a new mint and empty wallet");
-    println!("  mint <value>        Mint a token with given value");
-    println!("  balance             Show wallet balance and tokens");
-    println!("  transfer            Transfer first available token");
-    println!("  send <addr>         Send a token via TCP (default: 127.0.0.1:7878)");
-    println!("  receive <addr>      Listen for a token via TCP (default: 127.0.0.1:7878)");
+    println!("  setup                        Create a new mint and empty wallet");
+    println!("  mint <value>                 Mint a token with given value");
+    println!("  balance                      Show wallet balance and tokens");
+    println!("  transfer                     Transfer first available token");
+    println!("  send <addr> [peer_pubkey]    Send a token via TCP (SIGMA-I authenticated)");
+    println!("  receive <addr>               Listen for a token via TCP (prints own pubkey)");
     println!("  save                Save wallet to encrypted file");
     println!("  load                Load wallet from encrypted file");
     println!("  demo                Run full protocol demonstration");
@@ -271,25 +277,392 @@ fn cmd_load() {
     println!("  Tokens:  {}", wallet.token_count());
 }
 
-/// Perform ECDH key exchange and derive a shared ChaCha20-Poly1305 key.
+// ────────────────────────────────────────────────────────────────────
+// Long-term node identity for authenticated CLI channels
+// ────────────────────────────────────────────────────────────────────
+
+/// A long-term CLI identity: a Ristretto keypair used for mutual
+/// authentication in [`authenticated_handshake`].
+///
+/// Persisted to `IDENTITY_FILE` under the same passphrase as the wallet.
+/// The file format is: ASCII "SID1" magic || encrypted blob
+/// (secure_store::EncryptedData containing the secret scalar bytes).
+struct NodeIdentity {
+    secret: curve25519_dalek::Scalar,
+    public: curve25519_dalek::RistrettoPoint,
+}
+
+impl NodeIdentity {
+    fn generate() -> Self {
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+        let secret = specter_primitives::scalar_utils::random_scalar();
+        let public = secret * G;
+        Self { secret, public }
+    }
+
+    /// Load the CLI identity from IDENTITY_FILE, creating it on first use.
+    fn load_or_create(passphrase: &[u8]) -> Self {
+        use std::fs;
+        match fs::read(IDENTITY_FILE) {
+            Ok(data) => match Self::decode(&data, passphrase) {
+                Some(id) => id,
+                None => {
+                    eprintln!(
+                        "WARNING: could not decrypt {} — regenerating identity",
+                        IDENTITY_FILE
+                    );
+                    let id = Self::generate();
+                    let _ = fs::write(IDENTITY_FILE, id.encode(passphrase));
+                    id
+                }
+            },
+            Err(_) => {
+                let id = Self::generate();
+                if let Err(e) = fs::write(IDENTITY_FILE, id.encode(passphrase)) {
+                    eprintln!("WARNING: failed to persist identity: {}", e);
+                }
+                id
+            }
+        }
+    }
+
+    fn encode(&self, passphrase: &[u8]) -> Vec<u8> {
+        let sk_bytes = self.secret.as_bytes();
+        let enc = specter_core::secure_store::encrypt(sk_bytes, passphrase)
+            .expect("identity passphrase validation mirrors wallet save");
+        let mut out = Vec::with_capacity(4 + 16 + 12 + 4 + enc.ciphertext.len());
+        out.extend_from_slice(b"SID1");
+        out.extend_from_slice(&enc.salt);
+        out.extend_from_slice(&enc.nonce);
+        out.extend_from_slice(&(enc.ciphertext.len() as u32).to_le_bytes());
+        out.extend_from_slice(&enc.ciphertext);
+        out
+    }
+
+    fn decode(data: &[u8], passphrase: &[u8]) -> Option<Self> {
+        if data.len() < 4 + 16 + 12 + 4 || &data[0..4] != b"SID1" {
+            return None;
+        }
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&data[4..20]);
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&data[20..32]);
+        let ct_len =
+            u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
+        if 36 + ct_len > data.len() {
+            return None;
+        }
+        let ciphertext = data[36..36 + ct_len].to_vec();
+        let enc = specter_core::secure_store::EncryptedData {
+            salt,
+            nonce,
+            ciphertext,
+        };
+        // PASS 7 zeroize-matrix fix: the decrypted plaintext contains the
+        // long-term secret scalar bytes. Both `pt` and the temporary
+        // `sk_arr` must be wiped from memory before return — otherwise a
+        // process-memory dump could recover the identity key even though
+        // the final NodeIdentity struct itself zeroizes on Drop.
+        use zeroize::Zeroize;
+        let mut pt = specter_core::secure_store::decrypt(&enc, passphrase).ok()?;
+        if pt.len() != 32 {
+            pt.zeroize();
+            return None;
+        }
+        let mut sk_arr = [0u8; 32];
+        sk_arr.copy_from_slice(&pt);
+        pt.zeroize();
+        let secret: Option<curve25519_dalek::Scalar> =
+            curve25519_dalek::Scalar::from_canonical_bytes(sk_arr).into();
+        sk_arr.zeroize();
+        let secret = secret?;
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+        let public = secret * G;
+        Some(Self { secret, public })
+    }
+
+    fn public_hex(&self) -> String {
+        hex::encode(self.public.compress().as_bytes())
+    }
+}
+
+impl Drop for NodeIdentity {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+    }
+}
+
+/// Authenticated SIGMA-I handshake over TCP.
+///
+/// Both parties possess a long-term Ristretto identity. They exchange
+/// ephemeral Ristretto pubkeys and then each proves ownership of their
+/// long-term secret by signing a transcript that binds both identities
+/// and both ephemerals. A MitM cannot forge either signature without
+/// knowing one of the long-term secrets.
+///
+/// The initiator MUST supply the expected peer long-term public key
+/// (e.g., via CLI arg). If the observed peer key does not match, the
+/// handshake aborts — this is the anti-MitM check.
+///
+/// Session key = SHA-256("specter-sigma-key:" || shared_dh || transcript).
+///
+/// Returns the 32-byte session key on success.
+fn authenticated_handshake(
+    stream: &mut std::net::TcpStream,
+    my_identity: &NodeIdentity,
+    expected_peer_pk: Option<curve25519_dalek::RistrettoPoint>,
+    is_initiator: bool,
+) -> Option<[u8; 32]> {
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::{RistrettoPoint, Scalar};
+    use sha2::Sha512;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    use zeroize::Zeroize;
+
+    let timeout = Some(Duration::from_secs(30));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+
+    // Ephemeral DH keypair
+    let mut ephem_sk = specter_primitives::scalar_utils::random_scalar();
+    let ephem_pk = (ephem_sk * G).compress();
+
+    let my_id_bytes = my_identity.public.compress();
+
+    // Exchange: each side sends (id_pk || ephem_pk); initiator writes first.
+    let write_hello = |stream: &mut std::net::TcpStream| -> Option<()> {
+        stream.write_all(my_id_bytes.as_bytes()).ok()?;
+        stream.write_all(ephem_pk.as_bytes()).ok()?;
+        stream.flush().ok()
+    };
+    let mut their_id_bytes = [0u8; 32];
+    let mut their_ephem_bytes = [0u8; 32];
+    let read_hello = |stream: &mut std::net::TcpStream,
+                      id_buf: &mut [u8; 32],
+                      ephem_buf: &mut [u8; 32]|
+     -> Option<()> {
+        stream.read_exact(id_buf).ok()?;
+        stream.read_exact(ephem_buf).ok()
+    };
+
+    if is_initiator {
+        write_hello(stream)?;
+        read_hello(stream, &mut their_id_bytes, &mut their_ephem_bytes)?;
+    } else {
+        read_hello(stream, &mut their_id_bytes, &mut their_ephem_bytes)?;
+        write_hello(stream)?;
+    }
+
+    let their_id_pk: RistrettoPoint =
+        CompressedRistretto(their_id_bytes).decompress()?;
+    let their_ephem_pk: RistrettoPoint =
+        CompressedRistretto(their_ephem_bytes).decompress()?;
+
+    // Anti-MitM: if the caller specified an expected peer identity,
+    // compare it to what we received. Constant-time comparison is not
+    // strictly required (these are public keys) but we use it for
+    // clarity and to avoid accidental timing side channels.
+    if let Some(expected) = expected_peer_pk {
+        use subtle::ConstantTimeEq;
+        let ours = their_id_pk.compress();
+        let want = expected.compress();
+        if !bool::from(ours.as_bytes().ct_eq(want.as_bytes())) {
+            ephem_sk.zeroize();
+            eprintln!(
+                "SIGMA-I: peer identity mismatch (expected {}, got {})",
+                hex::encode(want.as_bytes()),
+                hex::encode(ours.as_bytes())
+            );
+            return None;
+        }
+    }
+
+    // DH-shared secret
+    let shared = ephem_sk * their_ephem_pk;
+    let shared_bytes = shared.compress();
+
+    // Transcript: both identities + both ephemerals, in a canonical order
+    // (sorted by the compressed bytes of the identity pubkeys) so both
+    // sides compute the same transcript regardless of initiator role.
+    let (id_a, id_b, ephem_a, ephem_b) = {
+        let mine_id: [u8; 32] = *my_id_bytes.as_bytes();
+        let mine_e: [u8; 32] = *ephem_pk.as_bytes();
+        let theirs_id: [u8; 32] = their_id_bytes;
+        let theirs_e: [u8; 32] = their_ephem_bytes;
+        if mine_id < theirs_id {
+            (mine_id, theirs_id, mine_e, theirs_e)
+        } else {
+            (theirs_id, mine_id, theirs_e, mine_e)
+        }
+    };
+
+    let transcript_msg = {
+        let mut h = Sha512::new();
+        h.update(b"specter-sigma-transcript:");
+        h.update(id_a);
+        h.update(id_b);
+        h.update(ephem_a);
+        h.update(ephem_b);
+        h.update(shared_bytes.as_bytes());
+        let out = h.finalize();
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&out[..32]);
+        buf
+    };
+
+    // Schnorr signature over the transcript under my long-term secret.
+    let sig_challenge = |r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8; 32]| -> Scalar {
+        let hash = Sha512::new()
+            .chain_update(b"specter-sigma-sig:")
+            .chain_update(r.compress().as_bytes())
+            .chain_update(pk.compress().as_bytes())
+            .chain_update(msg)
+            .finalize();
+        let mut wide = [0u8; 64];
+        wide.copy_from_slice(&hash);
+        Scalar::from_bytes_mod_order_wide(&wide)
+    };
+
+    let mut k = specter_primitives::scalar_utils::random_scalar();
+    let r_point = k * G;
+    let e = sig_challenge(&r_point, &my_identity.public, &transcript_msg);
+    let s = k + e * my_identity.secret;
+    k.zeroize();
+    let r_bytes = r_point.compress();
+    let s_bytes: [u8; 32] = *s.as_bytes();
+
+    // Exchange signatures: initiator writes first.
+    let write_sig = |stream: &mut std::net::TcpStream| -> Option<()> {
+        stream.write_all(r_bytes.as_bytes()).ok()?;
+        stream.write_all(&s_bytes).ok()?;
+        stream.flush().ok()
+    };
+    let mut their_r = [0u8; 32];
+    let mut their_s = [0u8; 32];
+    let read_sig = |stream: &mut std::net::TcpStream,
+                    rb: &mut [u8; 32],
+                    sb: &mut [u8; 32]|
+     -> Option<()> {
+        stream.read_exact(rb).ok()?;
+        stream.read_exact(sb).ok()
+    };
+    if is_initiator {
+        write_sig(stream)?;
+        read_sig(stream, &mut their_r, &mut their_s)?;
+    } else {
+        read_sig(stream, &mut their_r, &mut their_s)?;
+        write_sig(stream)?;
+    }
+
+    // Verify peer's Schnorr signature against their long-term pubkey and
+    // the shared transcript. An attacker who intercepted the handshake
+    // with a different ephemeral would derive a different shared secret,
+    // compute a different transcript, and the peer's signature would not
+    // verify — this is the SIGMA-I MitM-resistance property.
+    let their_r_point = CompressedRistretto(their_r).decompress()?;
+    let their_s_scalar = {
+        let opt: Option<Scalar> =
+            Scalar::from_canonical_bytes(their_s).into();
+        opt?
+    };
+    let expected_e = sig_challenge(&their_r_point, &their_id_pk, &transcript_msg);
+    let lhs = their_s_scalar * G;
+    let rhs = their_r_point + expected_e * their_id_pk;
+    if lhs != rhs {
+        ephem_sk.zeroize();
+        eprintln!("SIGMA-I: peer signature verification failed");
+        return None;
+    }
+
+    // Derive the session key from the shared DH secret AND the bound
+    // transcript. Binding to the transcript means any variation in the
+    // identities or ephemerals yields a different key.
+    let session_key = {
+        let mut h = Sha512::new();
+        h.update(b"specter-sigma-key:");
+        h.update(shared_bytes.as_bytes());
+        h.update(transcript_msg);
+        let out = h.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&out[..32]);
+        key
+    };
+
+    ephem_sk.zeroize();
+    Some(session_key)
+}
+
+/// Parse a hex-encoded Ristretto pubkey from a CLI argument.
+fn parse_peer_pk(s: &str) -> Option<curve25519_dalek::RistrettoPoint> {
+    let bytes = hex::decode(s.trim()).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    curve25519_dalek::ristretto::CompressedRistretto(arr).decompress()
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn test_identity_encode_decode_roundtrip() {
+        let id = NodeIdentity::generate();
+        let pub_bytes = id.public.compress();
+        let encoded = id.encode(b"strong-pass-min12");
+        let decoded = NodeIdentity::decode(&encoded, b"strong-pass-min12")
+            .expect("decode must succeed with the correct passphrase");
+        assert_eq!(decoded.public.compress(), pub_bytes);
+        // Secret scalars compare in constant time via curve25519-dalek impl.
+        assert_eq!(decoded.secret, id.secret);
+    }
+
+    #[test]
+    fn test_identity_decode_wrong_passphrase_fails() {
+        let id = NodeIdentity::generate();
+        let encoded = id.encode(b"correct-pass12");
+        assert!(NodeIdentity::decode(&encoded, b"wrong-pass123").is_none());
+    }
+
+    #[test]
+    fn test_identity_decode_tampered_magic_fails() {
+        let id = NodeIdentity::generate();
+        let mut encoded = id.encode(b"strong-pass-min12");
+        encoded[0] = b'X';
+        assert!(NodeIdentity::decode(&encoded, b"strong-pass-min12").is_none());
+    }
+
+    #[test]
+    fn test_parse_peer_pk() {
+        let id = NodeIdentity::generate();
+        let hex_str = id.public_hex();
+        let parsed = parse_peer_pk(&hex_str).unwrap();
+        assert_eq!(parsed, id.public);
+        assert!(parse_peer_pk("notahex").is_none());
+        assert!(parse_peer_pk("deadbeef").is_none()); // wrong length
+    }
+}
+
+/// Perform ephemeral ECDH and derive a shared ChaCha20-Poly1305 key.
 ///
 /// # Security Warning
 ///
 /// This is an UNAUTHENTICATED ephemeral DH exchange. It protects against
-/// passive eavesdropping but NOT against active MitM attacks. An attacker
-/// on the network path can intercept, relay, or steal tokens in transit.
-///
-/// For production use, replace with:
-/// - Noise NK/KK protocol pattern (mutual authentication)
-/// - Or sign the DH transcript with long-term node keys
-///
-/// The `cmd_receive()` function verifies received tokens against the mint
-/// signature, so fabricated tokens are rejected — but stolen tokens cannot
-/// be recovered.
+/// passive eavesdropping but NOT against active MitM attacks. Prefer
+/// [`authenticated_handshake`], which performs SIGMA-I mutual auth over
+/// long-term identity keys. This function is retained for demos and for
+/// environments where out-of-band identity distribution is unavailable.
+#[allow(dead_code)]
 fn dh_handshake(stream: &mut std::net::TcpStream, is_initiator: bool) -> Option<[u8; 32]> {
-    eprintln!("WARNING: Unauthenticated key exchange — vulnerable to MitM. For production, use authenticated channels.");
+    eprintln!("WARNING: Unauthenticated DH handshake — vulnerable to MitM. Use authenticated_handshake for production.");
 
     use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+    use curve25519_dalek::ristretto::CompressedRistretto;
     use std::io::{Read, Write};
     use std::time::Duration;
     use zeroize::Zeroize;
@@ -302,45 +675,31 @@ fn dh_handshake(stream: &mut std::net::TcpStream, is_initiator: bool) -> Option<
     let mut my_sk = specter_primitives::scalar_utils::random_scalar();
     let my_pk = (my_sk * G).compress();
 
-    let result = if is_initiator {
-        if stream.write_all(my_pk.as_bytes()).is_err() { None }
-        else if stream.flush().is_err() { None }
-        else {
-            let mut their_pk_bytes = [0u8; 32];
-            if stream.read_exact(&mut their_pk_bytes).is_err() { None }
-            else {
-                curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
-                    .decompress()
-                    .map(|their_pk| {
-                        let shared = my_sk * their_pk;
-                        let key = sha2::Sha256::digest(shared.compress().as_bytes());
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(&key);
-                        out
-                    })
-            }
+    // Helper: send own pubkey then read peer pubkey.
+    let exchange_pubkeys = |stream: &mut std::net::TcpStream| -> Option<[u8; 32]> {
+        if is_initiator {
+            stream.write_all(my_pk.as_bytes()).ok()?;
+            stream.flush().ok()?;
         }
-    } else {
         let mut their_pk_bytes = [0u8; 32];
-        if stream.read_exact(&mut their_pk_bytes).is_err() { None }
-        else {
-            let their_pk = curve25519_dalek::ristretto::CompressedRistretto(their_pk_bytes)
-                .decompress();
-            if their_pk.is_none() { None }
-            else if stream.write_all(my_pk.as_bytes()).is_err() { None }
-            else if stream.flush().is_err() { None }
-            else {
-                let their_pk = their_pk.unwrap();
-                let shared = my_sk * their_pk;
-                let key = sha2::Sha256::digest(shared.compress().as_bytes());
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&key);
-                Some(out)
-            }
+        stream.read_exact(&mut their_pk_bytes).ok()?;
+        if !is_initiator {
+            stream.write_all(my_pk.as_bytes()).ok()?;
+            stream.flush().ok()?;
         }
+        Some(their_pk_bytes)
     };
 
-    // Zeroize ephemeral secret key
+    let result = exchange_pubkeys(stream)
+        .and_then(|their_bytes| CompressedRistretto(their_bytes).decompress())
+        .map(|their_pk| {
+            let shared = my_sk * their_pk;
+            let key = sha2::Sha256::digest(shared.compress().as_bytes());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&key);
+            out
+        });
+
     my_sk.zeroize();
     result
 }
@@ -376,7 +735,19 @@ fn decrypt_with_key(data: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
 
 fn cmd_send(args: &[String]) {
     let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:7878");
+    // Optional 3rd arg: hex-encoded peer long-term pubkey for SIGMA-I
+    // anti-MitM verification. If absent, the handshake still runs but
+    // without identity verification (warned).
+    let expected_peer = args.get(3).and_then(|s| parse_peer_pk(s));
+    if expected_peer.is_none() && args.get(3).is_some() {
+        eprintln!("Warning: peer pubkey arg could not be parsed — proceeding WITHOUT anti-MitM verification");
+    }
+    if expected_peer.is_none() {
+        eprintln!("Warning: no peer pubkey provided — SIGMA-I will not verify peer identity. Pass the receiver's pubkey as the 3rd argument.");
+    }
+
     let mint = default_mint();
+    let my_identity = NodeIdentity::load_or_create(&get_passphrase());
     let mut wallet = load_or_create_wallet(&mint);
 
     if wallet.is_empty() {
@@ -398,11 +769,15 @@ fn cmd_send(args: &[String]) {
         Ok(mut stream) => {
             use std::io::Write;
 
-            // ECDH key exchange (sender is initiator)
-            let mut shared_key = match dh_handshake(&mut stream, true) {
-                Some(k) => k,
-                None => { eprintln!("Key exchange failed with {}", addr); return; }
-            };
+            // SIGMA-I authenticated handshake (sender is initiator).
+            let mut shared_key =
+                match authenticated_handshake(&mut stream, &my_identity, expected_peer, true) {
+                    Some(k) => k,
+                    None => {
+                        eprintln!("Authenticated handshake failed with {}", addr);
+                        return;
+                    }
+                };
 
             // Encrypt token bytes
             let encrypted = match encrypt_with_key(&plaintext, &shared_key) {
@@ -448,6 +823,14 @@ fn cmd_send(args: &[String]) {
 fn cmd_receive(args: &[String]) {
     let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:7878");
 
+    let my_identity = NodeIdentity::load_or_create(&get_passphrase());
+    // Print our long-term pubkey so the sender can be told which peer to
+    // expect (anti-MitM). This is the out-of-band distribution step.
+    println!(
+        "My long-term pubkey (share with sender):\n  {}",
+        my_identity.public_hex()
+    );
+
     let listener = match std::net::TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
@@ -461,11 +844,18 @@ fn cmd_receive(args: &[String]) {
         Ok((mut stream, peer)) => {
             use std::io::Read;
 
-            // ECDH key exchange (receiver is responder)
-            let mut shared_key = match dh_handshake(&mut stream, false) {
-                Some(k) => k,
-                None => { eprintln!("Key exchange failed with {}", peer); return; }
-            };
+            // SIGMA-I handshake (receiver is responder). The receiver
+            // does not pin a specific sender identity — any authenticated
+            // peer is accepted, and the subsequent verify_token step
+            // validates the TOKEN itself against the mint.
+            let mut shared_key =
+                match authenticated_handshake(&mut stream, &my_identity, None, false) {
+                    Some(k) => k,
+                    None => {
+                        eprintln!("Authenticated handshake failed with {}", peer);
+                        return;
+                    }
+                };
 
             // Read encrypted length
             let mut len_buf = [0u8; 4];

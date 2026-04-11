@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Proof-Carrying Token lifecycle for the Specter protocol"
 
+[features]
+default = ["memory-guard"]
+# Enable mlock/VirtualLock + core-dump hardening for wallet secrets.
+memory-guard = ["dep:libc"]
+
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
 specter-blind-sig = { path = "../specter-blind-sig" }
@@ -24,6 +29,7 @@ zeroize = { workspace = true }
 subtle = { workspace = true }
 chacha20poly1305 = { workspace = true }
 argon2 = { workspace = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

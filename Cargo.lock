@@ -1276,6 +1276,7 @@ dependencies = [
  "specter-core",
  "specter-credential",
  "specter-primitives",
+ "subtle",
  "zeroize",
 ]
 
@@ -1288,6 +1289,7 @@ dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
  "hex",
+ "libc",
  "proptest",
  "rand 0.8.5",
  "rand_core 0.6.4",
@@ -1330,12 +1332,14 @@ dependencies = [
  "ff",
  "nova-snark",
  "pasta_curves",
+ "proptest",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "serde",
  "sha2",
  "sha3",
  "specter-primitives",
+ "subtle",
  "thiserror 2.0.18",
 ]
 

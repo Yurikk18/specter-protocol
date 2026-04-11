@@ -351,4 +351,84 @@ mod tests {
             assert!(verify(&signer.public, message.as_bytes(), &sig), "failed at i={}", i);
         }
     }
+
+    // ── Concurrent session blocking tests (A5) ─────────────────────────
+
+    /// RateLimitedSigner MUST refuse a second session while the first is
+    /// still open. This is the protocol-level defense against the
+    /// Wagner/ROS attack on plain blind Schnorr: allowing ℓ ≈ 256
+    /// concurrent sessions lets an attacker forge ℓ+1 signatures from
+    /// ℓ interactions. Enforcing single-session serializes access and
+    /// denies the attacker the required concurrency.
+    #[test]
+    fn test_rate_limited_signer_blocks_concurrent_session() {
+        let kp = SignerKeypair::generate();
+        let mut signer = RateLimitedSigner::new(kp);
+
+        // First session opens.
+        let first = signer.new_session();
+        assert!(first.is_some(), "first session must succeed");
+
+        // Second concurrent session must be rejected.
+        let second = signer.new_session();
+        assert!(second.is_none(), "concurrent session must be rejected");
+
+        // Close first — third session now allowed.
+        drop(first);
+        signer.end_session();
+        let third = signer.new_session();
+        assert!(third.is_some(), "session after end_session must succeed");
+    }
+
+    /// Many sequential sessions interleaved with end_session all succeed.
+    /// This locks in the "one at a time, but no artificial limit on the
+    /// total" invariant.
+    #[test]
+    fn test_rate_limited_signer_sequential_sessions() {
+        let kp = SignerKeypair::generate();
+        let mut signer = RateLimitedSigner::new(kp);
+        for _ in 0..100 {
+            let s = signer.new_session();
+            assert!(s.is_some());
+            drop(s);
+            signer.end_session();
+        }
+    }
+
+    /// Thread-based concurrency test: two threads race to open a session.
+    /// Exactly one must win any given round. We use an `Arc<Mutex<>>`
+    /// wrapper since RateLimitedSigner itself is `&mut`-based.
+    #[test]
+    fn test_rate_limited_signer_parallel_contention() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let kp = SignerKeypair::generate();
+        let signer = Arc::new(Mutex::new(RateLimitedSigner::new(kp)));
+
+        // Open the single session.
+        let _session = {
+            let mut g = signer.lock().unwrap();
+            g.new_session().unwrap()
+        };
+
+        // Spawn contenders — all must observe the "busy" state and get
+        // None back.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&signer);
+            handles.push(thread::spawn(move || {
+                let mut g = s.lock().unwrap();
+                g.new_session().is_none()
+            }));
+        }
+
+        let all_blocked = handles
+            .into_iter()
+            .all(|h| h.join().unwrap());
+        assert!(
+            all_blocked,
+            "all contending threads must be blocked while a session is open"
+        );
+    }
 }

@@ -203,7 +203,7 @@ mod tests {
         let mut node1 = make_node(1);
 
         let token = node1.mint_token(1000, &[1, 2], None, None, None).unwrap();
-        let result = node1.transfer_token(token).unwrap();
+        let _result = node1.transfer_token(token).unwrap();
 
         let block = node1.propose_block().unwrap();
 

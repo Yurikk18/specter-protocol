@@ -180,7 +180,11 @@ impl Mint {
         // Hash chain genesis
         let hash_chain_head = crate::token::advance_hash_chain(&[0u8; 32], &token_id);
 
-        // VDF time-lock (if requested)
+        // VDF time-lock (if requested).
+        // TODO(vdf-rsa): migrate to specter_offline::vdf_rsa; the hash-based
+        // VDF is ASIC-accelerable and the output format (32 bytes) does not
+        // carry a Wesolowski proof. Migration requires a wire-format bump.
+        #[allow(deprecated)]
         let vdf_proof = vdf_iterations.map(|iters| {
             let seed = specter_offline::vdf::create_seed(&token_id, 0);
             specter_offline::vdf::evaluate(&seed, iters)

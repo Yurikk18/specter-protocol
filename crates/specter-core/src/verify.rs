@@ -139,15 +139,20 @@ pub fn verify_token(
         owner_hash: genesis_owner_hash,
         step: 0,
     };
-    let fold_valid = owner_binding_valid
-        && accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
+    // PASS 10 timing-oracle fix: evaluate both sub-checks unconditionally
+    // so verify_token's runtime does not vary based on which check
+    // failed first. Short-circuit `&&` here would have allowed a remote
+    // attacker to distinguish "owner-binding fail" from "Schnorr-accum
+    // fail" by timing the verify call.
+    let accum_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
+    let fold_valid = owner_binding_valid & accum_valid;
 
     // 5. Verify credential presentation (if present) + check expiry
     // Note: current_time == 0 means "skip expiry check" (for testing or when time is unavailable).
     // When current_time > 0 and expires_at > 0, enforce expiry strictly.
     let credential_valid = token.presentation.as_ref().map(|pres| {
         let sig_valid = presentation::verify_presentation(pres, credential_pedersen);
-        let not_expired = token.credential.as_ref().map_or(true, |cred| {
+        let not_expired = token.credential.as_ref().is_none_or(|cred| {
             cred.attributes.expires_at == 0
                 || current_time == 0  // caller explicitly opted out of time check
                 || current_time <= cred.attributes.expires_at
@@ -155,7 +160,10 @@ pub fn verify_token(
         sig_valid && not_expired
     });
 
-    // 6. Verify VDF proof (if present)
+    // 6. Verify VDF proof (if present).
+    // TODO(vdf-rsa): migrate to specter_offline::vdf_rsa — the current
+    // hash-based check is ASIC-accelerable.
+    #[allow(deprecated)]
     let vdf_valid = token.vdf_proof.as_ref().map(|proof| {
         specter_offline::vdf::verify(proof)
     });

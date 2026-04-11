@@ -18,9 +18,13 @@ rand = { workspace = true }
 rand_core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+subtle = { workspace = true }
 
 # Optional Nova IVC dependencies (Linux/macOS only)
 nova-snark = { version = "0.29", features = ["portable"], optional = true }
 bellpepper-core = { version = "0.3", default-features = false, optional = true }
 ff = { version = "0.13", optional = true }
 pasta_curves = { version = "0.5", features = ["repr-c"], optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

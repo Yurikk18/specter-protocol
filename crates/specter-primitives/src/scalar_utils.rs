@@ -3,12 +3,20 @@ use rand_core::OsRng;
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 
 /// Generate a cryptographically random scalar.
+///
+/// PASS 7 zeroize-matrix fix: the 64-byte intermediate buffer is wiped
+/// before return so the raw CSPRNG output cannot linger on the stack.
+/// The returned `Scalar` auto-zeroizes via curve25519-dalek's
+/// `ZeroizeOnDrop` impl (enabled by the `zeroize` feature on the dep).
 pub fn random_scalar() -> Scalar {
+    use zeroize::Zeroize;
     let mut scalar_bytes = [0u8; 64];
     let mut rng = OsRng;
     use rand_core::RngCore;
     rng.fill_bytes(&mut scalar_bytes);
-    Scalar::from_bytes_mod_order_wide(&scalar_bytes)
+    let s = Scalar::from_bytes_mod_order_wide(&scalar_bytes);
+    scalar_bytes.zeroize();
+    s
 }
 
 /// Convert a u64 value to a scalar.

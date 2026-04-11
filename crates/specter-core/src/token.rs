@@ -111,7 +111,9 @@ impl ProofCarryingToken {
     }
 
     /// Check if the VDF time-lock has expired.
+    /// TODO(vdf-rsa): migrate to specter_offline::vdf_rsa.
     pub fn is_vdf_expired(&self, required_iterations: u64) -> bool {
+        #[allow(deprecated)]
         match &self.vdf_proof {
             Some(proof) => specter_offline::vdf::is_expired(proof, required_iterations),
             None => true, // no VDF = always expired for offline use
@@ -163,6 +165,7 @@ pub fn advance_hash_chain(current_head: &[u8; 32], new_data: &[u8]) -> [u8; 32] 
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // token tests exercise the deprecated hash VDF constructors
 mod tests {
     use super::*;
     use specter_primitives::scalar_utils::{random_scalar, scalar_from_u64};

@@ -1,23 +1,28 @@
-//! Verifiable Delay Function (VDF) for time-locked tokens.
+//! Verifiable Delay Function (VDF) for time-locked tokens — **DEPRECATED**.
 //!
 //! A VDF proves that a minimum amount of wall-clock time has passed since
 //! a token was issued or renewed. This prevents tokens from being used
 //! offline indefinitely - after time T, the token expires and must be
 //! renewed online.
 //!
-//! # Security Warning: ASIC Acceleration
+//! # ⚠  Security Warning: ASIC Acceleration ⚠
 //!
 //! This module uses iterated SHA-256 hashing as a prototype VDF.
 //! SHA-256 ASICs (e.g., Bitcoin mining hardware) can compute hash chains
 //! approximately 100x faster than commodity CPUs. This means the
-//! effective time-lock is hardware-dependent, NOT absolute.
+//! effective time-lock is hardware-dependent, NOT absolute. The CRYPTO
+//! 2024 algebraic cryptanalysis of algebraic VDFs (Biryukov et al.) also
+//! underscores that ASIC- and precomputation-resistance are non-trivial
+//! properties that a hash chain simply does not provide.
 //!
-//! **For production deployments**, use the RSA-based VDF in `vdf_rsa.rs`
+//! **Production deployments MUST use the RSA-based VDF in `vdf_rsa.rs`**
 //! which uses repeated squaring in a group of unknown order (RSA-2048).
 //! That construction is provably sequential under the factoring assumption
 //! and supports O(log T) verification via Wesolowski proofs.
 //!
-//! This hash-based VDF is suitable for testing and development only.
+//! Every public function in this module is marked `#[deprecated]`. Call
+//! sites in `specter-core` suppress the warning with `#[allow(deprecated)]`
+//! and a `TODO(vdf-rsa)` marker until the wire format is migrated.
 
 use sha2::{Digest, Sha256};
 
@@ -51,6 +56,10 @@ impl VdfParams {
 ///
 /// This is intentionally slow - it proves that the prover spent time
 /// computing the chain. The output is deterministic.
+#[deprecated(
+    since = "0.2.0",
+    note = "ASIC-accelerable hash VDF. Use specter_offline::vdf_rsa for production."
+)]
 pub fn evaluate(seed: &[u8; 32], iterations: u64) -> VdfProof {
     let mut current = *seed;
 
@@ -74,6 +83,11 @@ const MAX_VDF_ITERATIONS: u64 = 10_000_000;
 /// In this prototype, verification has the same cost as evaluation.
 /// In production (with Wesolowski/Pietrzak), verification would be O(log T).
 /// Rejects proofs with excessive iterations to prevent DoS.
+#[deprecated(
+    since = "0.2.0",
+    note = "ASIC-accelerable hash VDF verify. Use specter_offline::vdf_rsa for production."
+)]
+#[allow(deprecated)]
 pub fn verify(proof: &VdfProof) -> bool {
     if proof.iterations > MAX_VDF_ITERATIONS {
         return false;
@@ -87,11 +101,19 @@ pub fn verify(proof: &VdfProof) -> bool {
 
 /// Check if a VDF proof has "expired" - i.e., it was computed with
 /// fewer iterations than required by the current parameters.
+#[deprecated(
+    since = "0.2.0",
+    note = "ASIC-accelerable hash VDF. Use specter_offline::vdf_rsa for production."
+)]
 pub fn is_expired(proof: &VdfProof, required_iterations: u64) -> bool {
     proof.iterations < required_iterations
 }
 
 /// Create a time-lock seed from a token ID and timestamp.
+#[deprecated(
+    since = "0.2.0",
+    note = "ASIC-accelerable hash VDF. Use specter_offline::vdf_rsa for production."
+)]
 pub fn create_seed(token_id: &[u8; 32], timestamp_secs: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"specter-vdf-seed:");
@@ -104,6 +126,7 @@ pub fn create_seed(token_id: &[u8; 32], timestamp_secs: u64) -> [u8; 32] {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // the tests exercise the deprecated hash VDF on purpose
 mod tests {
     use super::*;
 

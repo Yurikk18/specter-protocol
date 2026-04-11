@@ -1,4 +1,5 @@
 pub mod deterrence;
+pub mod memory_guard;
 pub mod mint;
 pub mod networked;
 pub mod renewal;

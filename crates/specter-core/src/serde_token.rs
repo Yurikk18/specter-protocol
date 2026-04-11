@@ -482,14 +482,20 @@ pub fn serialize_encrypted(
 /// Decrypt and deserialize a token with a passphrase.
 ///
 /// Verifies integrity (wrong passphrase or tampered data = error)
-/// before deserializing.
+/// before deserializing. PASS 7 zeroize-matrix fix: the plaintext buffer
+/// holds the owner_secret (and all other token state) in the clear and
+/// must be wiped before this function returns so a post-decrypt stack
+/// or heap scan cannot recover it.
 pub fn deserialize_encrypted(
     encrypted: &crate::secure_store::EncryptedData,
     passphrase: &[u8],
 ) -> Result<ProofCarryingToken, SerdeError> {
-    let plaintext = crate::secure_store::decrypt(encrypted, passphrase)
+    use zeroize::Zeroize;
+    let mut plaintext = crate::secure_store::decrypt(encrypted, passphrase)
         .map_err(|e| SerdeError::Io(e.to_string()))?;
-    deserialize_token(&plaintext)
+    let result = deserialize_token(&plaintext);
+    plaintext.zeroize();
+    result
 }
 
 #[cfg(test)]
@@ -777,5 +783,48 @@ mod tests {
         let token = mint.issue(100, &[1, 2], None).unwrap();
         // Must return Err, not panic.
         assert!(serialize_encrypted(&token, b"short").is_err());
+    }
+
+    // ── Property tests ─────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// serialize → deserialize → serialize is a fixed point: the bytes
+        /// produced from a parsed token are identical to the originals.
+        #[test]
+        fn prop_serialize_roundtrip_fixed_point(seed in 1u64..100_000) {
+            let mint = test_mint();
+            let token = mint.issue(seed, &[1, 2], None).unwrap();
+            let b1 = serialize_token(&token);
+            let parsed = deserialize_token(&b1).unwrap();
+            let b2 = serialize_token(&parsed);
+            prop_assert_eq!(b1, b2);
+        }
+
+        /// A tampered prefix of a valid token cannot parse AND survive
+        /// verification for a mutated token_id.
+        #[test]
+        fn prop_token_id_tamper_breaks_signature(value in 1u64..10_000, offset in 0u8..32) {
+            let mint = test_mint();
+            let token = mint.issue(value, &[1, 2], None).unwrap();
+            let mut bytes = serialize_token(&token);
+            // token_id sits right after MAGIC(4) + VERSION(1) = offset 5
+            let tok_id_start = 5usize;
+            bytes[tok_id_start + (offset as usize)] ^= 0x01;
+            if let Ok(tampered) = deserialize_token(&bytes) {
+                let vr = crate::verify::verify_token(
+                    &tampered,
+                    &mint.group_public_key(),
+                    &mint.pedersen,
+                    &mint.credential_issuer.pedersen,
+                    0,
+                );
+                prop_assert!(!vr.signature_valid,
+                    "tampered token_id must invalidate mint signature");
+            }
+            // If deserialize fails (due to downstream structural mismatch),
+            // that is also an acceptable outcome.
+        }
     }
 }

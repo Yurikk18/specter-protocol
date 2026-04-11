@@ -1,0 +1,55 @@
+[workspace]
+# Stand-alone fuzz workspace — not a member of the parent workspace
+# so cargo-fuzz can build it without pulling in all other crates.
+
+[package]
+name = "specter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+specter-core = { path = "../crates/specter-core" }
+specter-primitives = { path = "../crates/specter-primitives" }
+specter-credential = { path = "../crates/specter-credential" }
+specter-net = { path = "../crates/specter-net" }
+curve25519-dalek = { version = ">=4.1.3", features = ["serde", "rand_core", "zeroize"] }
+
+[[bin]]
+name = "fuzz_deserialize_token"
+path = "fuzz_targets/fuzz_deserialize_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ristretto_decompress"
+path = "fuzz_targets/fuzz_ristretto_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wallet_decrypt"
+path = "fuzz_targets/fuzz_wallet_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_nullifier_insert"
+path = "fuzz_targets/fuzz_nullifier_insert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_verify_presentation"
+path = "fuzz_targets/fuzz_verify_presentation.rs"
+test = false
+doc = false
+bench = false

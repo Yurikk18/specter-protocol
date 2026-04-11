@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Compute a nullifier from an owner's secret and a token ID.
 ///
@@ -169,9 +170,128 @@ impl Default for NullifierSet {
     }
 }
 
+/// Thread-safe wrapper around [`NullifierSet`].
+///
+/// All operations take `&self` and internally lock a [`Mutex`], so this
+/// handle is `Clone + Send + Sync`. Cloning yields another handle sharing
+/// the same underlying set.
+///
+/// Use this variant in multi-threaded deployments (BFT validators, async
+/// gossip handlers, REST mint services). Single-threaded callers can
+/// continue to use [`NullifierSet`] directly for zero-overhead access.
+///
+/// # Atomicity
+///
+/// `insert` takes the lock, checks membership, appends to the durable
+/// file (if any), and updates the in-memory set — all inside a single
+/// critical section. Two concurrent spenders of the same token race into
+/// `insert` and exactly one sees the new nullifier; the other sees a
+/// double-spend reject. The file-backed `write → flush → sync_all` runs
+/// under the lock so a crash between fsync and map update cannot leave
+/// the file diverged from the set.
+#[derive(Clone, Debug)]
+pub struct ConcurrentNullifierSet {
+    inner: Arc<Mutex<NullifierSet>>,
+}
+
+impl ConcurrentNullifierSet {
+    /// Wrap an existing [`NullifierSet`] behind a shared lock.
+    pub fn new(set: NullifierSet) -> Self {
+        Self { inner: Arc::new(Mutex::new(set)) }
+    }
+
+    /// Create an empty in-memory concurrent set.
+    pub fn empty() -> Self {
+        Self::new(NullifierSet::new())
+    }
+
+    /// File-backed concurrent constructor.
+    pub fn with_file(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        NullifierSet::with_file(path).map(Self::new)
+    }
+
+    /// Atomic check-and-insert. Returns `true` on first spend, `false`
+    /// on double-spend. A poisoned mutex (panic while another thread
+    /// held the lock) is recovered by reading the inner data — the set
+    /// is append-only so recovery is safe.
+    pub fn insert(&self, nullifier: [u8; 32]) -> bool {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(nullifier)
+    }
+
+    /// Check-only membership lookup.
+    pub fn contains(&self, nullifier: &[u8; 32]) -> bool {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.contains(nullifier)
+    }
+
+    /// Number of spent nullifiers under the lock.
+    pub fn len(&self) -> usize {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.len()
+    }
+
+    /// Whether the set is empty under the lock.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for ConcurrentNullifierSet {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_nullifier_deterministic(secret: [u8; 32], token_id: [u8; 32]) {
+            let n1 = compute_nullifier(&secret, &token_id);
+            let n2 = compute_nullifier(&secret, &token_id);
+            prop_assert_eq!(n1, n2);
+        }
+
+        #[test]
+        fn prop_nullifier_collision_resistant(
+            s1: [u8; 32], s2: [u8; 32], t1: [u8; 32], t2: [u8; 32]
+        ) {
+            // Distinct inputs → distinct outputs (with overwhelming probability).
+            if (s1, t1) != (s2, t2) {
+                prop_assert_ne!(
+                    compute_nullifier(&s1, &t1),
+                    compute_nullifier(&s2, &t2)
+                );
+            }
+        }
+
+        #[test]
+        fn prop_nullifier_set_membership_matches_hashset(
+            inserts in proptest::collection::vec(any::<[u8; 32]>(), 0..64)
+        ) {
+            let mut set = NullifierSet::new();
+            let mut reference = std::collections::HashSet::new();
+            for n in &inserts {
+                let first_seen = reference.insert(*n);
+                let inserted = set.insert(*n);
+                prop_assert_eq!(first_seen, inserted);
+            }
+            prop_assert_eq!(set.len(), reference.len());
+        }
+    }
 
     #[test]
     fn test_nullifier_deterministic() {
@@ -337,6 +457,79 @@ mod tests {
         assert!(path.exists());
 
         cleanup(&path);
+    }
+
+    // ---- ConcurrentNullifierSet tests ----
+
+    #[test]
+    fn test_concurrent_basic_insert() {
+        let set = ConcurrentNullifierSet::empty();
+        assert!(set.is_empty());
+        assert!(set.insert([1u8; 32]));
+        assert!(!set.insert([1u8; 32])); // double-spend
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&[1u8; 32]));
+    }
+
+    #[test]
+    fn test_concurrent_parallel_inserts_of_same_nullifier() {
+        use std::thread;
+
+        let set = ConcurrentNullifierSet::empty();
+        let nullifier = [0x42u8; 32];
+        let thread_count = 32;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let s = set.clone();
+                thread::spawn(move || s.insert(nullifier))
+            })
+            .collect();
+
+        let successes: usize = handles
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
+
+        // Exactly one thread must see the "first-insert" path; the rest
+        // must observe a double-spend. No matter the scheduling, never
+        // more than one, never zero.
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent insert of the same nullifier must succeed"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_parallel_inserts_of_distinct_nullifiers() {
+        use std::thread;
+
+        let set = ConcurrentNullifierSet::empty();
+        let thread_count = 16;
+        let per_thread = 32;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|t| {
+                let s = set.clone();
+                thread::spawn(move || {
+                    let mut ok = 0;
+                    for i in 0..per_thread {
+                        let mut n = [0u8; 32];
+                        n[0] = t as u8;
+                        n[1] = i as u8;
+                        if s.insert(n) {
+                            ok += 1;
+                        }
+                    }
+                    ok
+                })
+            })
+            .collect();
+
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, thread_count * per_thread);
+        assert_eq!(set.len(), thread_count * per_thread);
     }
 
     #[test]

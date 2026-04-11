@@ -145,7 +145,12 @@ impl BondRegistry {
             });
         }
 
-        bond.offline_exposure += amount;
+        // PASS 12 fix: assign the pre-computed checked value instead of
+        // re-adding. The raw `+=` would be safe here (checked_add above
+        // already ruled out overflow) but writing the value we already
+        // validated eliminates any chance of arithmetic drift if the
+        // check and the mutation ever diverge.
+        bond.offline_exposure = total_exposure;
         Ok(())
     }
 

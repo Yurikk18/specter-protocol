@@ -67,15 +67,17 @@ pub fn encrypt(plaintext: &[u8], passphrase: &[u8]) -> Result<EncryptedData, Sec
     // Derive key
     let mut key = derive_key(passphrase, &salt);
 
-    // Encrypt
+    // Encrypt — ChaCha20-Poly1305 encrypt can theoretically error on
+    // output buffer overflow; we handle it as a returned error instead
+    // of panicking so the crate's public surface has no panic paths.
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .expect("encryption failed");
+    let ciphertext_result = cipher.encrypt(nonce, plaintext);
 
-    // Zeroize key from memory
+    // Zeroize the derived key on BOTH success and failure paths.
     key.zeroize();
+
+    let ciphertext = ciphertext_result.map_err(|_| SecureStoreError::EncryptionFailed)?;
 
     Ok(EncryptedData {
         salt,
@@ -85,17 +87,23 @@ pub fn encrypt(plaintext: &[u8], passphrase: &[u8]) -> Result<EncryptedData, Sec
 }
 
 /// Decrypt data with a passphrase.
+///
+/// PASS 7 zeroize-matrix fix: the Argon2id-derived key is wiped from
+/// memory on BOTH the success and the failure path. The previous
+/// implementation used `?` to short-circuit on decryption failure,
+/// which left the key resident in memory until the enclosing stack
+/// frame was reused.
 pub fn decrypt(encrypted: &EncryptedData, passphrase: &[u8]) -> Result<Vec<u8>, SecureStoreError> {
     let mut key = derive_key(passphrase, &encrypted.salt);
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let nonce = Nonce::from_slice(&encrypted.nonce);
-    let plaintext = cipher
+    let result = cipher
         .decrypt(nonce, encrypted.ciphertext.as_ref())
-        .map_err(|_| SecureStoreError::DecryptionFailed)?;
+        .map_err(|_| SecureStoreError::DecryptionFailed);
 
     key.zeroize();
-    Ok(plaintext)
+    result
 }
 
 /// Compute a fingerprint of the encrypted data (for display, not security).
@@ -109,6 +117,9 @@ pub fn fingerprint(data: &EncryptedData) -> String {
 pub enum SecureStoreError {
     #[error("decryption failed - wrong passphrase or corrupted data")]
     DecryptionFailed,
+
+    #[error("encryption failed - buffer overflow or AEAD error")]
+    EncryptionFailed,
 
     #[error("passphrase too short: need at least {min} bytes, got {got}")]
     PassphraseTooShort { min: usize, got: usize },

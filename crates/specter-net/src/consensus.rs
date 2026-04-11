@@ -531,6 +531,62 @@ mod tests {
         }
     }
 
+    // ── PASS 13: BFT liveness / view-change safety ─────────────────────
+
+    /// Equivocating leader — same height, two different blocks — must be
+    /// flagged by receive_proposal, not silently accepted.
+    #[test]
+    fn test_equivocation_detected() {
+        let (_, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let block_a = NullifierBlock::new(0, 1, vec![[1u8; 32]], [0u8; 32]);
+        let block_b = NullifierBlock::new(0, 1, vec![[2u8; 32]], [0u8; 32]);
+
+        state.receive_proposal(&block_a).unwrap();
+        let err = state.receive_proposal(&block_b).unwrap_err();
+        match err {
+            ConsensusError::Equivocation { leader: 1, height: 0 } => {}
+            other => panic!("expected Equivocation, got {:?}", other),
+        }
+    }
+
+    /// View change resets vote accumulation — a quorum reached in view 0
+    /// cannot carry over into view 1.
+    #[test]
+    fn test_view_change_resets_votes() {
+        let (keys, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        state.submit_nullifier([9u8; 32]);
+        let block = state.propose_block().unwrap();
+
+        // Collect two votes in view 0 (not enough for quorum=3).
+        let v1 = keys[0].sign_vote(block.height, &block.hash, true, 0);
+        let v2 = keys[1].sign_vote(block.height, &block.hash, true, 0);
+        state.receive_vote(v1).unwrap();
+        state.receive_vote(v2).unwrap();
+
+        // Trigger view change — votes are cleared.
+        state.trigger_view_change();
+
+        // Commit must fail (no votes accumulated in new view).
+        assert!(!state.try_commit(&block).unwrap());
+    }
+
+    /// Block hash integrity — any mismatch between the stored hash and
+    /// the computed hash over block fields must reject try_commit.
+    #[test]
+    fn test_block_hash_integrity_enforced() {
+        let (_, ids, pks) = setup_validators();
+        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut block = NullifierBlock::new(0, 1, vec![[3u8; 32]], [0u8; 32]);
+        block.hash[0] ^= 0x01; // tamper
+        let err = state.try_commit(&block).unwrap_err();
+        match err {
+            ConsensusError::InvalidBlockHash => {}
+            other => panic!("expected InvalidBlockHash, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_view_change() {
         let (_, ids, pks) = setup_validators();
