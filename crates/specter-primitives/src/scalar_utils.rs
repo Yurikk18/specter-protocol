@@ -18,10 +18,12 @@ pub fn scalar_from_u64(v: u64) -> Scalar {
 
 /// Hash arbitrary data to a scalar using SHAKE-256.
 ///
-/// Uses domain separation to produce a deterministic scalar from input bytes.
+/// Uses domain separation and length-prefixed data to produce a deterministic
+/// scalar from input bytes, preventing concatenation ambiguity.
 pub fn hash_to_scalar(data: &[u8]) -> Scalar {
     let mut hasher = Shake256::default();
     hasher.update(b"specter-hash-to-scalar:");
+    hasher.update(&(data.len() as u64).to_le_bytes());
     hasher.update(data);
     let mut reader = hasher.finalize_xof();
     let mut wide = [0u8; 64];

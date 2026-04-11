@@ -1,7 +1,8 @@
 use curve25519_dalek::{RistrettoPoint, Scalar};
 
 /// A signer's keypair for blind Schnorr signatures.
-#[derive(Clone)]
+/// Non-Clone: secret key material must not be duplicated.
+/// Move semantics ensure a single copy exists at any time.
 pub struct SignerKeypair {
     /// Secret signing key (private - never exposed).
     secret: Scalar,

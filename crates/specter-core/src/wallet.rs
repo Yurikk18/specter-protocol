@@ -110,7 +110,12 @@ impl Wallet {
     ///
     /// All tokens are serialized and then encrypted with the passphrase
     /// using Argon2id + ChaCha20-Poly1305. The output is safe to write to disk.
-    pub fn save(&self, passphrase: &[u8]) -> Vec<u8> {
+    ///
+    /// Returns an error if the passphrase fails validation (currently:
+    /// shorter than `secure_store::MIN_PASSPHRASE_LEN`). Previously this
+    /// panicked via `.expect()` — a malicious caller (or a misconfigured
+    /// CLI) could crash the process with a short passphrase.
+    pub fn save(&self, passphrase: &[u8]) -> Result<Vec<u8>, WalletError> {
         // Serialize all tokens
         let mut payload = Vec::new();
         let count = self.tokens.len() as u32;
@@ -125,7 +130,7 @@ impl Wallet {
 
         // Encrypt the entire payload
         let encrypted = crate::secure_store::encrypt(&payload, passphrase)
-            .expect("passphrase must be at least 8 bytes");
+            .map_err(|e| WalletError::TokenError(e.to_string()))?;
 
         // Pack EncryptedData into a single byte vector
         let mut output = Vec::new();
@@ -135,7 +140,7 @@ impl Wallet {
         let ct_len = encrypted.ciphertext.len() as u32;
         output.extend_from_slice(&ct_len.to_le_bytes());
         output.extend_from_slice(&encrypted.ciphertext);
-        output
+        Ok(output)
     }
 
     /// Load a wallet from encrypted bytes and verify every token.
@@ -409,8 +414,8 @@ mod tests {
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
         wallet.add_token(mint.issue(500, &[1, 2], None).unwrap());
 
-        let data = wallet.save(b"my-passphrase-min8");
-        let loaded = load_wallet(&mint, &data, b"my-passphrase-min8").unwrap();
+        let data = wallet.save(b"my-passphrase-min12").unwrap();
+        let loaded = load_wallet(&mint, &data, b"my-passphrase-min12").unwrap();
 
         assert_eq!(loaded.balance(), 600);
         assert_eq!(loaded.token_count(), 2);
@@ -422,8 +427,8 @@ mod tests {
         let mut wallet = Wallet::new();
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
 
-        let data = wallet.save(b"correct-min8");
-        let result = load_wallet(&mint, &data, b"wrong-mn8");
+        let data = wallet.save(b"correct-pass12").unwrap();
+        let result = load_wallet(&mint, &data, b"wrong-mn12-xx");
         assert!(result.is_err());
     }
 
@@ -431,8 +436,8 @@ mod tests {
     fn test_save_load_empty_wallet() {
         let mint = setup_mint();
         let wallet = Wallet::new();
-        let data = wallet.save(b"pass-min8");
-        let loaded = load_wallet(&mint, &data, b"pass-min8").unwrap();
+        let data = wallet.save(b"pass-min12-ok").unwrap();
+        let loaded = load_wallet(&mint, &data, b"pass-min12-ok").unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -445,8 +450,8 @@ mod tests {
         let original_id = token.token_id;
         wallet.add_token(token);
 
-        let data = wallet.save(b"pass-min8");
-        let loaded = load_wallet(&mint, &data, b"pass-min8").unwrap();
+        let data = wallet.save(b"pass-min12-ok").unwrap();
+        let loaded = load_wallet(&mint, &data, b"pass-min12-ok").unwrap();
 
         let info = loaded.list_tokens();
         assert_eq!(info[0].value, 999);
@@ -459,11 +464,22 @@ mod tests {
         let mut wallet = Wallet::new();
         wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
 
-        let mut data = wallet.save(b"pass-min8");
+        let mut data = wallet.save(b"pass-min12-ok").unwrap();
         if data.len() > 40 {
             data[40] ^= 0xFF;
         }
-        let result = load_wallet(&mint, &data, b"pass-min8");
+        let result = load_wallet(&mint, &data, b"pass-min12-ok");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_rejects_short_passphrase() {
+        let mint = setup_mint();
+        let mut wallet = Wallet::new();
+        wallet.add_token(mint.issue(100, &[1, 2], None).unwrap());
+
+        // Short passphrase must return an error, NOT panic.
+        let result = wallet.save(b"short");
+        assert!(result.is_err(), "short passphrase must fail gracefully");
     }
 }

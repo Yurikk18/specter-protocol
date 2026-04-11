@@ -123,23 +123,28 @@ impl NullifierSet {
     /// Insert a nullifier. Returns `true` if the nullifier was new (valid spend).
     /// Returns `false` if the nullifier was already present (double-spend detected).
     ///
-    /// When file-backed, the new nullifier is immediately flushed to disk.
+    /// When file-backed, the nullifier is durably written to disk BEFORE being
+    /// accepted into the in-memory set. If disk write fails, the spend is rejected.
+    /// This prevents double-spend after crash (write-before-accept pattern).
     pub fn insert(&mut self, nullifier: [u8; 32]) -> bool {
-        if !self.nullifiers.insert(nullifier) {
+        // Check in-memory first (fast path for duplicates)
+        if self.nullifiers.contains(&nullifier) {
             return false; // already known
         }
+        // Write to durable storage BEFORE in-memory insert.
+        // If the process crashes after fsync but before HashSet insert,
+        // the nullifier is recovered from file on restart (false positive
+        // on one retry, which is safe — user retries the spend).
         if let Some(ref mut file) = self.file {
-            // Write + flush + fsync for crash safety.
-            // fsync ensures data reaches durable storage, not just the OS page cache.
             if let Err(e) = file.write_all(&nullifier)
                 .and_then(|_| file.flush())
-                .and_then(|_| file.sync_all())  // fsync: durable to disk
+                .and_then(|_| file.sync_all())
             {
-                eprintln!("WARNING: failed to persist nullifier to disk: {}", e);
-                // Nullifier is still in the in-memory set, preventing double-spend
+                eprintln!("ERROR: failed to persist nullifier to disk: {}", e);
+                return false; // Reject spend if we cannot durably record it
             }
         }
-        true
+        self.nullifiers.insert(nullifier)
     }
 
     /// Check if a nullifier has been spent.

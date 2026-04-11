@@ -201,6 +201,7 @@ impl Mint {
             transfer_count: 0,
             recursion_bound: self.recursion_bound,
             fold_proof,
+            genesis_owner_hash: owner_hash,
             credential,
             presentation: pres,
             vdf_proof,
@@ -215,6 +216,13 @@ impl Mint {
 
     /// Split a token: burn one token, issue multiple tokens summing to same value.
     /// Used for making change (e.g., split a 1000-token into 750 + 250).
+    ///
+    /// SECURITY: Fully verifies the input token before trusting `old_token.value`.
+    /// Without this check an attacker could tamper the plaintext `value` field on
+    /// a legitimately-minted token and mint an arbitrary amount of fresh tokens
+    /// (infinite-money attack: the nullifier derives from token_id+owner_secret
+    /// alone, so the same nullifier burns regardless of the tampered value,
+    /// while the new outputs are signed with the attacker's chosen values).
     pub fn split(
         &self,
         old_token: &crate::token::ProofCarryingToken,
@@ -222,6 +230,36 @@ impl Mint {
         signers: &[SignerId],
         nullifier_set: &mut crate::nullifier::NullifierSet,
     ) -> Result<Vec<crate::token::ProofCarryingToken>, MintError> {
+        // 0. Full verification of the input token — the plaintext `value` field
+        // is untrusted until the value-commitment binding is checked.
+        let vr = crate::verify::verify_token(
+            old_token,
+            &self.keyset.group_public,
+            &self.pedersen,
+            &self.credential_issuer.pedersen,
+            0, // skip expiry for split — wallet validates time separately
+        );
+        if !vr.signature_valid {
+            return Err(MintError::SigningFailed(
+                "input token mint signature invalid".into(),
+            ));
+        }
+        if !vr.value_valid {
+            return Err(MintError::SigningFailed(
+                "input token value commitment invalid".into(),
+            ));
+        }
+        if !vr.within_bound {
+            return Err(MintError::SigningFailed(
+                "input token exceeds recursion bound".into(),
+            ));
+        }
+        if !vr.fold_valid {
+            return Err(MintError::SigningFailed(
+                "input token fold proof invalid".into(),
+            ));
+        }
+
         // Validate all output values BEFORE burning the nullifier
         for &v in output_values {
             if v == 0 {
@@ -249,6 +287,27 @@ impl Mint {
             .iter()
             .map(|&v| self.issue(v, signers, None))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Verify commitment-level conservation (defense-in-depth):
+        // Sum of output value commitments should equal the input commitment
+        // when using the same Pedersen parameters, because:
+        //   C_in = v_in*G + r_in*H
+        //   C_out_i = v_i*G + r_i*H
+        //   sum(C_out_i) = sum(v_i)*G + sum(r_i)*H
+        // Since sum(v_i) == v_in (checked above), the difference
+        // sum(C_out) - C_in = (sum(r_i) - r_in)*H, which is non-zero
+        // due to different random blinding factors. So we verify each
+        // output's value proof individually instead.
+        for new_token in &new_tokens {
+            let value_scalar = scalar_from_u64(new_token.value);
+            if !self.pedersen.verify_value_proof(
+                &new_token.value_commitment,
+                &value_scalar,
+                &new_token.value_proof,
+            ) {
+                return Err(MintError::SigningFailed("output value proof invalid".into()));
+            }
+        }
 
         // Burn old token (publish nullifier) only after successful issuance
         let nullifier = old_token.compute_nullifier();

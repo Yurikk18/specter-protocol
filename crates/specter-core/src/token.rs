@@ -59,6 +59,10 @@ pub struct ProofCarryingToken {
     /// Accumulated proof of transfer history (constant size).
     pub fold_proof: AccumulatedProof,
 
+    /// Hash of the original owner at issuance (for fold proof genesis verification).
+    /// This is a hash, not the secret — safe to carry through transfers.
+    pub genesis_owner_hash: [u8; 32],
+
     /// Compliance credential (optional - issued by KYC provider).
     pub credential: Option<Credential>,
 
@@ -179,6 +183,9 @@ mod tests {
 
         let value_proof = params.prove_value(&scalar_from_u64(value), &blinding);
 
+        let mut owner_hash = [0u8; 32];
+        owner_hash.copy_from_slice(&specter_primitives::scalar_utils::hash_to_scalar(&[1u8; 32]).as_bytes()[..32]);
+
         ProofCarryingToken {
             token_id: [42u8; 32],
             value,
@@ -193,6 +200,7 @@ mod tests {
             transfer_count: 0,
             recursion_bound: 20,
             fold_proof,
+            genesis_owner_hash: owner_hash,
             credential: None,
             presentation: None,
             vdf_proof: None,

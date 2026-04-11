@@ -7,6 +7,7 @@ description = "Blind signature schemes for the Specter protocol"
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
 curve25519-dalek = { workspace = true }
+subtle = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }

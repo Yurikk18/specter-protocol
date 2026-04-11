@@ -32,7 +32,14 @@ pub fn renew_token(
     signers: &[SignerId],
     nullifier_set: &mut NullifierSet,
 ) -> Result<RenewalResult, RenewalError> {
-    // Verify the old token is still valid (except for the bound check)
+    // Verify the old token is still valid (except for the bound check — the
+    // whole point of renewal is that the old token is at/past its bound).
+    //
+    // SECURITY: Skipping fold_valid here previously allowed an attacker to
+    // "renew" a tampered/forged token into a fresh one as long as the mint
+    // signature survived — i.e. any field the signature doesn't cover (owner
+    // secret, fold proof, credential) could be substituted. Enforce all
+    // integrity checks before issuing a replacement.
     let vr = verify::verify_token(
         old_token,
         &mint.group_public_key(),
@@ -46,6 +53,15 @@ pub fn renew_token(
     }
     if !vr.value_valid {
         return Err(RenewalError::InvalidValue);
+    }
+    if !vr.fold_valid {
+        return Err(RenewalError::InvalidFoldProof);
+    }
+    // If the old token carries a credential presentation, it must still verify.
+    // A None credential is fine (matches the fresh-mint path), but if one is
+    // attached it must not be forged.
+    if matches!(vr.credential_valid, Some(false)) {
+        return Err(RenewalError::InvalidCredential);
     }
 
     // Compute and publish the old nullifier
@@ -80,6 +96,12 @@ pub enum RenewalError {
 
     #[error("old token has invalid value commitment")]
     InvalidValue,
+
+    #[error("old token has invalid fold proof")]
+    InvalidFoldProof,
+
+    #[error("old token has invalid credential presentation")]
+    InvalidCredential,
 
     #[error("old token has already been spent or renewed")]
     AlreadySpent,

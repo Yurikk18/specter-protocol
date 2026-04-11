@@ -30,6 +30,7 @@ pub struct VerificationResult {
 
 impl VerificationResult {
     /// Returns true only if ALL checks passed.
+    /// Optional fields (credential, VDF) default to valid if absent.
     pub fn all_valid(&self) -> bool {
         self.signature_valid
             && self.value_valid
@@ -37,6 +38,26 @@ impl VerificationResult {
             && self.fold_valid
             && self.credential_valid.unwrap_or(true)
             && self.vdf_valid.unwrap_or(true)
+    }
+
+    /// Verify with policy enforcement.
+    /// When `require_credential` is true, tokens WITHOUT a credential fail.
+    /// When `require_vdf` is true, tokens WITHOUT a VDF proof fail.
+    pub fn all_valid_with_policy(&self, require_credential: bool, require_vdf: bool) -> bool {
+        self.signature_valid
+            && self.value_valid
+            && self.within_bound
+            && self.fold_valid
+            && if require_credential {
+                self.credential_valid == Some(true)
+            } else {
+                self.credential_valid.unwrap_or(true)
+            }
+            && if require_vdf {
+                self.vdf_valid == Some(true)
+            } else {
+                self.vdf_valid.unwrap_or(true)
+            }
     }
 }
 
@@ -55,6 +76,20 @@ pub fn verify_token(
     credential_pedersen: &PedersenParams,
     current_time: u64,
 ) -> VerificationResult {
+    // 0. Reject zero-value tokens (range check: value must be in [1, u64::MAX])
+    // Combined with the value proof below, this guarantees the committed value
+    // is in [1, 2^64-1] — not a negative/wrapped scalar.
+    if token.value == 0 {
+        return VerificationResult {
+            signature_valid: false,
+            value_valid: false,
+            within_bound: false,
+            fold_valid: false,
+            credential_valid: None,
+            vdf_valid: None,
+        };
+    }
+
     // 1. Verify mint signature
     let signed_msg = mint::build_signed_message(&token.token_id, &token.value_commitment);
     let signature_valid = schnorr_blind::verify(group_public_key, &signed_msg, &token.mint_signature);
@@ -72,21 +107,40 @@ pub fn verify_token(
     let within_bound = token.transfer_count <= token.recursion_bound;
 
     // 4. Verify fold proof
-    // For genesis proofs (step 0), reconstruct the genesis state from the token
-    // to verify PK derivation and transcript. For folded proofs (step > 0),
-    // the Schnorr equation s*G == R + e*PK provides structural integrity.
-    let mut genesis_owner_hash = [0u8; 32];
-    if token.fold_proof.steps == 0 {
-        genesis_owner_hash.copy_from_slice(
-            &specter_primitives::scalar_utils::hash_to_scalar(&token.owner_secret).as_bytes()[..32],
-        );
-    }
+    //
+    // The fold proof binds both the genesis owner (via genesis_state_hash)
+    // and the CURRENT owner (via fold_proof.current_owner_hash). We check
+    // both:
+    //
+    //   a) At step 0, genesis_owner_hash must match the current owner
+    //      (freshly minted — nobody has transferred it yet).
+    //   b) At any step, fold_proof.current_owner_hash must match
+    //      H(token.owner_secret). This catches the clone-by-swap attack
+    //      where an attacker copies token bytes and modifies owner_secret
+    //      to produce a distinct nullifier.
+    let mut computed_current_owner = [0u8; 32];
+    computed_current_owner.copy_from_slice(
+        &specter_primitives::scalar_utils::hash_to_scalar(&token.owner_secret).as_bytes()[..32],
+    );
+    let owner_binding_valid = {
+        use subtle::ConstantTimeEq;
+        bool::from(computed_current_owner.ct_eq(&token.fold_proof.current_owner_hash))
+    };
+
+    let genesis_owner_hash = if token.fold_proof.steps == 0 {
+        // At genesis, the original owner IS the current owner.
+        computed_current_owner
+    } else {
+        // After transfers, use the stored genesis hash (original owner is gone)
+        token.genesis_owner_hash
+    };
     let genesis_state = accumulator::TransferState {
         token_id: token.token_id,
         owner_hash: genesis_owner_hash,
         step: 0,
     };
-    let fold_valid = accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
+    let fold_valid = owner_binding_valid
+        && accumulator::verify_accumulated_proof(&token.fold_proof, &genesis_state);
 
     // 5. Verify credential presentation (if present) + check expiry
     // Note: current_time == 0 means "skip expiry check" (for testing or when time is unavailable).

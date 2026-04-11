@@ -44,7 +44,17 @@ const MAGIC: &[u8; 4] = b"SPCT";
 /// Current format version.
 const VERSION: u8 = 1;
 
-/// Serialize a PCT to bytes.
+/// Serialize a PCT to bytes (includes all secrets).
+///
+/// SECURITY WARNING: This function exposes the owner_secret in the output.
+/// Deserializing the output creates a second token with the same nullifier,
+/// effectively duplicating the bearer instrument. The nullifier set prevents
+/// both copies from being spent, but in distributed systems with propagation
+/// delay this creates a double-spend race window.
+///
+/// Prefer `serialize_token_public()` for network transmission (zeros secrets)
+/// or `serialize_encrypted()` for persistent storage (encrypts everything).
+/// Use this function only for wallet-internal storage behind encryption.
 pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1024);
 
@@ -73,7 +83,10 @@ pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
     write_point(&mut buf, &token.fold_proof.pk);                     // 32
     buf.extend_from_slice(&token.fold_proof.state_hash);             // 32
     buf.extend_from_slice(&token.fold_proof.pk_chain_hash);          // 32
+    buf.extend_from_slice(&token.fold_proof.genesis_state_hash);     // 32
+    buf.extend_from_slice(&token.fold_proof.current_owner_hash);    // 32
     buf.extend_from_slice(&token.fold_proof.steps.to_le_bytes());    // 4
+    buf.extend_from_slice(&token.genesis_owner_hash);               // 32
 
     // Optional: credential (flag byte + data)
     match &token.credential {
@@ -185,7 +198,10 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
     let fold_pk = read_point(data, &mut pos)?;
     let fold_state_hash = read_array32(data, &mut pos)?;
     let fold_pk_chain_hash = read_array32(data, &mut pos)?;
+    let fold_genesis_state_hash = read_array32(data, &mut pos)?;
+    let fold_current_owner_hash = read_array32(data, &mut pos)?;
     let fold_steps = read_u32(data, &mut pos)?;
+    let genesis_owner_hash = read_array32(data, &mut pos)?;
 
     // Optional: credential
     let credential = if read_u8(data, &mut pos)? == 1 {
@@ -300,8 +316,11 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
             pk: fold_pk,
             state_hash: fold_state_hash,
             pk_chain_hash: fold_pk_chain_hash,
+            genesis_state_hash: fold_genesis_state_hash,
+            current_owner_hash: fold_current_owner_hash,
             steps: fold_steps,
         },
+        genesis_owner_hash,
         credential,
         presentation,
         vdf_proof,
@@ -315,21 +334,57 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
 /// output. The receiver will generate their own owner_secret during the
 /// transfer protocol. This avoids cloning the token (which is deliberately
 /// non-Clone as a bearer instrument).
+///
+/// Offsets are derived from the `serialize_token` layout — keep these
+/// constants in sync with any change to the wire format. A previous version
+/// of this function computed CRED_FLAG_OFFSET incorrectly (missing
+/// fold.genesis_state_hash and token.genesis_owner_hash) which left the
+/// credential blinding factor un-redacted.
 pub fn serialize_token_public(token: &ProofCarryingToken) -> Vec<u8> {
     let mut buf = serialize_token(token);
-    // Zero owner_secret in the serialized buffer.
-    // Layout: MAGIC(4) + VERSION(1) + token_id(32) + value(8) + value_commitment(32)
-    //         + vp_commitment(32) + vp_response(32) + sig_s(32) + sig_e(32)
-    //         = offset 205 for owner_secret (32 bytes)
+
+    // Layout (byte offsets):
+    //   0    MAGIC(4)
+    //   4    VERSION(1)
+    //   5    token_id(32)
+    //   37   value(8)
+    //   45   value_commitment(32)
+    //   77   vp_commitment(32)
+    //   109  vp_response(32)
+    //   141  sig_s(32)
+    //   173  sig_e(32)
+    //   205  owner_secret(32)              <-- OWNER_SECRET_OFFSET
+    //   237  hash_chain_head(32)
+    //   269  transfer_count(4)
+    //   273  recursion_bound(4)
+    //   277  fold_s(32)
+    //   309  fold_e(32)
+    //   341  fold_r(32)
+    //   373  fold_pk(32)
+    //   405  fold_state_hash(32)
+    //   437  fold_pk_chain_hash(32)
+    //   469  fold_genesis_state_hash(32)
+    //   501  fold_current_owner_hash(32)   <-- new in v3 schema
+    //   533  fold_steps(4)
+    //   537  genesis_owner_hash(32)
+    //   569  credential_flag(1)            <-- CRED_FLAG_OFFSET
+    //   570  credential.commitment(32) (if flag == 1)
+    //   602  credential.blinding(32) (if flag == 1)  <-- zeroed
     const OWNER_SECRET_OFFSET: usize = 4 + 1 + 32 + 8 + 32 + 32 + 32 + 32 + 32;
+    debug_assert_eq!(OWNER_SECRET_OFFSET, 205);
     if buf.len() >= OWNER_SECRET_OFFSET + 32 {
         buf[OWNER_SECRET_OFFSET..OWNER_SECRET_OFFSET + 32].fill(0);
     }
-    // Zero credential blinding factor if present.
-    // After owner_secret(32) + hash_chain_head(32) + transfer_count(4) + recursion_bound(4)
-    // + fold_proof(s32+e32+r32+pk32+state_hash32+pk_chain_hash32+steps4) = 196 bytes
-    // Then: credential flag(1). If 1, commitment(32), then blinding(32).
-    const CRED_FLAG_OFFSET: usize = OWNER_SECRET_OFFSET + 32 + 32 + 4 + 4 + 32 + 32 + 32 + 32 + 32 + 32 + 4;
+    // From OWNER_SECRET_OFFSET to credential flag:
+    // owner_secret(32) + hash_chain_head(32) + transfer_count(4) + recursion_bound(4)
+    // + fold_s(32) + fold_e(32) + fold_r(32) + fold_pk(32) + fold_state_hash(32)
+    // + fold_pk_chain_hash(32) + fold_genesis_state_hash(32)
+    // + fold_current_owner_hash(32) + fold_steps(4) + genesis_owner_hash(32)
+    // = 364
+    const CRED_FLAG_OFFSET: usize = OWNER_SECRET_OFFSET
+        + 32 + 32 + 4 + 4
+        + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 4 + 32;
+    debug_assert_eq!(CRED_FLAG_OFFSET, 569);
     if buf.len() > CRED_FLAG_OFFSET && buf[CRED_FLAG_OFFSET] == 1 {
         let blinding_offset = CRED_FLAG_OFFSET + 1 + 32; // skip flag + commitment
         if buf.len() >= blinding_offset + 32 {
@@ -409,15 +464,19 @@ fn read_scalar(data: &[u8], pos: &mut usize) -> Result<Scalar, SerdeError> {
 
 /// Serialize and encrypt a token with a passphrase.
 ///
-/// The output is fully encrypted - owner_secret and all other sensitive
-/// data are protected. An HMAC verifies integrity before decryption.
+/// The output is fully encrypted — owner_secret and all other sensitive
+/// data are protected by ChaCha20-Poly1305 under an Argon2id-derived key.
+///
+/// Returns an error if the passphrase fails validation (shorter than
+/// `secure_store::MIN_PASSPHRASE_LEN`). Previously panicked with
+/// `.expect()` on short passphrases.
 pub fn serialize_encrypted(
     token: &ProofCarryingToken,
     passphrase: &[u8],
-) -> crate::secure_store::EncryptedData {
+) -> Result<crate::secure_store::EncryptedData, SerdeError> {
     let plaintext = serialize_token(token);
     crate::secure_store::encrypt(&plaintext, passphrase)
-        .expect("passphrase validation should be done by caller")
+        .map_err(|e| SerdeError::Io(e.to_string()))
 }
 
 /// Decrypt and deserialize a token with a passphrase.
@@ -610,7 +669,7 @@ mod tests {
         let basic_size = serialized_size(&basic);
         println!("Basic token size: {} bytes", basic_size);
         assert!(basic_size > 300);
-        assert!(basic_size < 500);
+        assert!(basic_size < 600);
 
         // Full token (credential + VDF + bond)
         let full = mint
@@ -644,7 +703,7 @@ mod tests {
         let token = mint.issue(1000, &[1, 2], Some(&test_attrs())).unwrap();
         let passphrase = b"strong-passphrase-min8-123";
 
-        let encrypted = serialize_encrypted(&token, passphrase);
+        let encrypted = serialize_encrypted(&token, passphrase).unwrap();
         let recovered = deserialize_encrypted(&encrypted, passphrase).unwrap();
 
         assert_eq!(recovered.token_id, token.token_id);
@@ -657,8 +716,8 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
-        let encrypted = serialize_encrypted(&token, b"correct-min8");
-        let result = deserialize_encrypted(&encrypted, b"wrong-mn8");
+        let encrypted = serialize_encrypted(&token, b"correct-min12").unwrap();
+        let result = deserialize_encrypted(&encrypted, b"wrong-mn12-xx");
         assert!(result.is_err());
     }
 
@@ -667,11 +726,11 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(1000, &[1, 2], None).unwrap();
 
-        let mut encrypted = serialize_encrypted(&token, b"pass-min8");
+        let mut encrypted = serialize_encrypted(&token, b"pass-min12-ok").unwrap();
         if !encrypted.ciphertext.is_empty() {
             encrypted.ciphertext[0] ^= 0xFF;
         }
-        let result = deserialize_encrypted(&encrypted, b"pass-min8");
+        let result = deserialize_encrypted(&encrypted, b"pass-min12-ok");
         assert!(result.is_err());
     }
 
@@ -680,8 +739,8 @@ mod tests {
         let mint = test_mint();
         let token = mint.issue(500, &[1, 3], Some(&test_attrs())).unwrap();
 
-        let encrypted = serialize_encrypted(&token, b"passphrase-min8");
-        let recovered = deserialize_encrypted(&encrypted, b"passphrase-min8").unwrap();
+        let encrypted = serialize_encrypted(&token, b"passphrase-min12").unwrap();
+        let recovered = deserialize_encrypted(&encrypted, b"passphrase-min12").unwrap();
 
         let result = crate::verify::verify_token(
             &recovered,
@@ -699,7 +758,7 @@ mod tests {
         let token = mint.issue(1000, &[1, 2], None).unwrap();
         let owner_secret = token.owner_secret;
 
-        let encrypted = serialize_encrypted(&token, b"pass-min8");
+        let encrypted = serialize_encrypted(&token, b"pass-min12-ok").unwrap();
 
         // The owner_secret should NOT appear in the ciphertext
         let secret_in_ciphertext = encrypted
@@ -710,5 +769,13 @@ mod tests {
             !secret_in_ciphertext,
             "owner_secret found in ciphertext - encryption failed"
         );
+    }
+
+    #[test]
+    fn test_serialize_encrypted_rejects_short_passphrase() {
+        let mint = test_mint();
+        let token = mint.issue(100, &[1, 2], None).unwrap();
+        // Must return Err, not panic.
+        assert!(serialize_encrypted(&token, b"short").is_err());
     }
 }

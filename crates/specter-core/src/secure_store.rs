@@ -43,7 +43,9 @@ fn derive_key(passphrase: &[u8], salt: &[u8; 16]) -> [u8; 32] {
 }
 
 /// Minimum passphrase length for encryption.
-pub const MIN_PASSPHRASE_LEN: usize = 8;
+/// 12 bytes provides ~56 bits of entropy for random alphanumeric,
+/// which combined with Argon2id at 128 MB resists offline brute-force.
+pub const MIN_PASSPHRASE_LEN: usize = 12;
 
 /// Encrypt data with a passphrase.
 ///
@@ -138,41 +140,41 @@ mod tests {
     #[test]
     fn test_tampered_ciphertext_fails() {
         let data = b"secret data";
-        let mut encrypted = encrypt(data, b"passphrase-min8").unwrap();
+        let mut encrypted = encrypt(data, b"passphrase-min12").unwrap();
         if !encrypted.ciphertext.is_empty() {
             encrypted.ciphertext[0] ^= 0xFF;
         }
-        let result = decrypt(&encrypted, b"passphrase-min8");
+        let result = decrypt(&encrypted, b"passphrase-min12");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_different_plaintexts_different_ciphertexts() {
-        let e1 = encrypt(b"data one", b"pass-min8").unwrap();
-        let e2 = encrypt(b"data two", b"pass-min8").unwrap();
+        let e1 = encrypt(b"data one", b"pass-min12-ok").unwrap();
+        let e2 = encrypt(b"data two", b"pass-min12-ok").unwrap();
         assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     #[test]
     fn test_same_plaintext_different_ciphertexts() {
         // Random salt + nonce means same input produces different ciphertext
-        let e1 = encrypt(b"same data", b"pass-min8").unwrap();
-        let e2 = encrypt(b"same data", b"pass-min8").unwrap();
+        let e1 = encrypt(b"same data", b"pass-min12-ok").unwrap();
+        let e2 = encrypt(b"same data", b"pass-min12-ok").unwrap();
         assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     #[test]
     fn test_empty_plaintext() {
-        let encrypted = encrypt(b"", b"pass-min8").unwrap();
-        let decrypted = decrypt(&encrypted, b"pass-min8").unwrap();
+        let encrypted = encrypt(b"", b"pass-min12-ok").unwrap();
+        let decrypted = decrypt(&encrypted, b"pass-min12-ok").unwrap();
         assert!(decrypted.is_empty());
     }
 
     #[test]
     fn test_large_plaintext() {
         let data = vec![0x42u8; 10_000];
-        let encrypted = encrypt(&data, b"pass-min8").unwrap();
-        let decrypted = decrypt(&encrypted, b"pass-min8").unwrap();
+        let encrypted = encrypt(&data, b"pass-min12-ok").unwrap();
+        let decrypted = decrypt(&encrypted, b"pass-min12-ok").unwrap();
         assert_eq!(decrypted, data);
     }
 
@@ -184,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_fingerprint() {
-        let encrypted = encrypt(b"data", b"pass-min8").unwrap();
+        let encrypted = encrypt(b"data", b"pass-min12-ok").unwrap();
         let fp = fingerprint(&encrypted);
         assert_eq!(fp.len(), 16); // 8 bytes hex = 16 chars
     }

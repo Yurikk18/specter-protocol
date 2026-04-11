@@ -1255,6 +1255,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "specter-primitives",
+ "subtle",
  "thiserror 2.0.18",
  "zeroize",
 ]
@@ -1299,6 +1300,7 @@ dependencies = [
  "specter-net",
  "specter-offline",
  "specter-primitives",
+ "subtle",
  "thiserror 2.0.18",
  "zeroize",
 ]
@@ -1314,6 +1316,7 @@ dependencies = [
  "sha2",
  "sha3",
  "specter-primitives",
+ "subtle",
  "thiserror 2.0.18",
  "zeroize",
 ]
@@ -1342,10 +1345,12 @@ version = "0.1.0"
 dependencies = [
  "curve25519-dalek",
  "rand 0.8.5",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "sha3",
  "specter-primitives",
+ "subtle",
  "thiserror 2.0.18",
  "zeroize",
 ]

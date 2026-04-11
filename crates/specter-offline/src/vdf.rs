@@ -5,13 +5,19 @@
 //! offline indefinitely - after time T, the token expires and must be
 //! renewed online.
 //!
-//! Implementation: iterated SHA-256 hashing. The prover computes
-//! H(H(H(...H(seed)...))) for T iterations. Verification requires
-//! recomputing the same chain (parallel-resistant by design).
+//! # Security Warning: ASIC Acceleration
 //!
-//! In production, this would use a number-theoretic VDF (e.g., repeated
-//! squaring in a group of unknown order) which allows fast verification
-//! via Wesolowski or Pietrzak proofs.
+//! This module uses iterated SHA-256 hashing as a prototype VDF.
+//! SHA-256 ASICs (e.g., Bitcoin mining hardware) can compute hash chains
+//! approximately 100x faster than commodity CPUs. This means the
+//! effective time-lock is hardware-dependent, NOT absolute.
+//!
+//! **For production deployments**, use the RSA-based VDF in `vdf_rsa.rs`
+//! which uses repeated squaring in a group of unknown order (RSA-2048).
+//! That construction is provably sequential under the factoring assumption
+//! and supports O(log T) verification via Wesolowski proofs.
+//!
+//! This hash-based VDF is suitable for testing and development only.
 
 use sha2::{Digest, Sha256};
 

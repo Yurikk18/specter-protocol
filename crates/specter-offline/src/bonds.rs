@@ -50,6 +50,14 @@ impl BondRegistry {
     /// Deposit a bond (stake collateral).
     /// Returns an error if the owner already has an active bond.
     pub fn deposit(&mut self, owner_id: [u8; 32], amount: u64) -> Result<Bond, BondError> {
+        if amount == 0 {
+            return Err(BondError::InvalidAmount);
+        }
+        // Cap at half u64::MAX to prevent overflow in checked_add during coverage checks
+        const MAX_BOND_AMOUNT: u64 = u64::MAX / 2;
+        if amount > MAX_BOND_AMOUNT {
+            return Err(BondError::InvalidAmount);
+        }
         // Prevent overwriting an existing bond (which would orphan it)
         if let Some(existing_id) = self.owner_bonds.get(&owner_id) {
             if let Some(existing) = self.bonds.get(existing_id) {
@@ -262,6 +270,9 @@ pub enum BondError {
 
     #[error("insufficient evidence for slash: must provide two distinct conflicting nullifiers")]
     InsufficientEvidence,
+
+    #[error("invalid bond amount: must be > 0 and <= MAX_BOND_AMOUNT")]
+    InvalidAmount,
 }
 
 #[cfg(test)]

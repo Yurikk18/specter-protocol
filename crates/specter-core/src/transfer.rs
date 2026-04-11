@@ -78,6 +78,7 @@ pub fn transfer(
         transfer_count: new_count,
         recursion_bound: token.recursion_bound,
         fold_proof: new_fold_proof,
+        genesis_owner_hash: token.genesis_owner_hash,
         credential: token.credential.clone(),
         presentation: token.presentation.clone(),
         vdf_proof: token.vdf_proof.clone(),
@@ -167,5 +168,54 @@ mod tests {
         let _r1 = transfer(token1, &mut ns).unwrap();
         // Manually insert the same nullifier — simulates a replay
         assert!(!ns.insert(nullifier), "double-spend must be detected");
+        let _ = mint; // unused in this test
+    }
+
+    /// Regression test for the PASS 2 clone-by-owner-swap attack.
+    ///
+    /// At step > 0, an attacker could serialize a legitimate token, modify
+    /// the `owner_secret` bytes, and deserialize to get a token with a
+    /// different nullifier but the same mint signature — enabling an
+    /// unbounded cloning attack.
+    ///
+    /// With the current_owner_hash binding enforced in verify_token, the
+    /// cloned token fails verification.
+    #[test]
+    fn test_clone_by_owner_secret_swap_rejected() {
+        let (mint, token) = setup();
+        // Transfer once to reach step 1 (the attack requires step > 0 since
+        // step = 0 always bound the owner_secret via the genesis derivation).
+        let mut ns = NullifierSet::new();
+        let transferred = transfer(token, &mut ns).unwrap().token;
+        assert_eq!(transferred.fold_proof.steps, 1);
+
+        // Serialize and clone by swapping owner_secret.
+        let mut bytes = crate::serde_token::serialize_token(&transferred);
+        const OWNER_SECRET_OFFSET: usize = 4 + 1 + 32 + 8 + 32 + 32 + 32 + 32 + 32;
+        for b in &mut bytes[OWNER_SECRET_OFFSET..OWNER_SECRET_OFFSET + 32] {
+            *b ^= 0xFF;
+        }
+        let cloned = crate::serde_token::deserialize_token(&bytes).unwrap();
+        // The cloned token has a different nullifier — the bare nullifier set
+        // would not catch the double-spend.
+        assert_ne!(transferred.compute_nullifier(), cloned.compute_nullifier());
+
+        // But verify_token rejects it because current_owner_hash no longer
+        // matches H(cloned.owner_secret).
+        let vr = crate::verify::verify_token(
+            &cloned,
+            &mint.group_public_key(),
+            &mint.pedersen,
+            &mint.credential_issuer.pedersen,
+            0,
+        );
+        assert!(
+            !vr.fold_valid,
+            "cloned token with swapped owner_secret must fail owner-binding check"
+        );
+        assert!(
+            !vr.all_valid(),
+            "cloned token must be rejected by full verification"
+        );
     }
 }

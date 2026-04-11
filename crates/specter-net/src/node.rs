@@ -35,10 +35,40 @@ impl NetworkNode {
         }
     }
 
-    /// Submit a nullifier - gossips + submits to consensus.
+    /// Submit a nullifier - signs, gossips, and submits to consensus.
+    ///
+    /// The nullifier broadcast is Schnorr-signed with this node's validator
+    /// key before being queued for gossip. Receiving nodes verify the
+    /// signature before accepting.
     pub fn submit_nullifier(&mut self, nullifier: [u8; 32]) {
-        self.gossip.broadcast_nullifier(nullifier);
+        let (sig_r, sig_s) = crate::gossip::sign_nullifier_broadcast(
+            &nullifier,
+            self.id,
+            self.validator_key.secret_key_ref(),
+            &self.validator_key.public_key,
+        );
+        self.gossip.broadcast_nullifier_signed(nullifier, sig_r, sig_s);
         self.consensus.submit_nullifier(nullifier);
+    }
+
+    /// Receive a nullifier broadcast from a peer with signature verification.
+    ///
+    /// Returns Ok(true) if the nullifier was new and accepted.
+    /// Returns Err if the sender is unknown or the signature is invalid.
+    pub fn receive_nullifier_broadcast(
+        &mut self,
+        nullifier: [u8; 32],
+        from: NodeId,
+        signature_r: &[u8; 32],
+        signature_s: &[u8; 32],
+    ) -> Result<bool, crate::gossip::GossipError> {
+        self.gossip.handle_verified_broadcast(
+            nullifier,
+            from,
+            signature_r,
+            signature_s,
+            &self.consensus.validator_keys,
+        )
     }
 
     /// Check if a nullifier is known.
@@ -47,8 +77,10 @@ impl NetworkNode {
     }
 
     /// Sign a vote on a block using this node's validator key.
+    /// Binds the signature to the current consensus view so votes cannot
+    /// be replayed across view changes.
     pub fn sign_vote(&self, block_height: u64, block_hash: &[u8; 32], approve: bool) -> Vote {
-        self.validator_key.sign_vote(block_height, block_hash, approve)
+        self.validator_key.sign_vote(block_height, block_hash, approve, self.consensus.view)
     }
 
     /// Get node stats.

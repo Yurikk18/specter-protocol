@@ -23,23 +23,34 @@ use specter_core::wallet::Wallet;
 
 const WALLET_FILE: &str = "specter_wallet.dat";
 #[cfg(debug_assertions)]
-const DEFAULT_PASSPHRASE: &[u8] = b"specter-dev-only";
+const DEFAULT_PASSPHRASE: &[u8] = b"specter-dev-only-min12";
 
 /// Get wallet passphrase from environment.
 /// In debug builds, falls back to a dev-mode default with a warning.
 /// In release builds, refuses to proceed without a valid passphrase.
+///
+/// The minimum length is tied to `secure_store::MIN_PASSPHRASE_LEN` (12)
+/// to prevent inconsistency where the CLI accepts a passphrase that
+/// `wallet.save()` would then reject.
 fn get_passphrase() -> Vec<u8> {
+    const MIN_LEN: usize = specter_core::secure_store::MIN_PASSPHRASE_LEN;
     match std::env::var("SPECTER_PASSPHRASE") {
-        Ok(p) if p.len() >= 8 => p.into_bytes(),
+        Ok(p) if p.len() >= MIN_LEN => p.into_bytes(),
         Ok(_) => {
             #[cfg(debug_assertions)]
             {
-                eprintln!("Warning: SPECTER_PASSPHRASE too short, using dev default");
+                eprintln!(
+                    "Warning: SPECTER_PASSPHRASE too short (need >= {} bytes), using dev default",
+                    MIN_LEN
+                );
                 DEFAULT_PASSPHRASE.to_vec()
             }
             #[cfg(not(debug_assertions))]
             {
-                eprintln!("Error: SPECTER_PASSPHRASE must be at least 8 characters");
+                eprintln!(
+                    "Error: SPECTER_PASSPHRASE must be at least {} characters",
+                    MIN_LEN
+                );
                 std::process::exit(1);
             }
         }
@@ -131,8 +142,14 @@ fn cmd_setup() {
     println!("  Group public key: {}", hex::encode(mint.group_public_key().compress().as_bytes()));
 
     let wallet = Wallet::new();
-    let data = wallet.save(&get_passphrase());
-    std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet file");
+    let data = match wallet.save(&get_passphrase()) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("Failed to save wallet: {}", e); std::process::exit(1); }
+    };
+    if let Err(e) = std::fs::write(WALLET_FILE, &data) {
+        eprintln!("Failed to write wallet file: {}", e);
+        std::process::exit(1);
+    }
     println!("  Empty wallet saved to {}", WALLET_FILE);
     println!("Setup complete.");
 }
@@ -154,8 +171,14 @@ fn cmd_mint(args: &[String]) {
     let mut wallet = load_or_create_wallet(&mint);
     wallet.add_token(token);
 
-    let data = wallet.save(&get_passphrase());
-    std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+    let data = match wallet.save(&get_passphrase()) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("Failed to save wallet: {}", e); std::process::exit(1); }
+    };
+    if let Err(e) = std::fs::write(WALLET_FILE, &data) {
+        eprintln!("Failed to write wallet: {}", e);
+        std::process::exit(1);
+    }
     println!("  Added to wallet. Balance: {}", wallet.balance());
 }
 
@@ -204,13 +227,22 @@ fn cmd_transfer() {
 
     let id = token.token_id;
     let mut ns = NullifierSet::new();
-    let result = transfer::transfer(token, &mut ns).unwrap();
+    let result = match transfer::transfer(token, &mut ns) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("Transfer failed: {}", e); std::process::exit(1); }
+    };
 
     // Add the transferred token back
     wallet.add_token(result.token);
 
-    let data = wallet.save(&get_passphrase());
-    std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+    let data = match wallet.save(&get_passphrase()) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("Failed to save wallet: {}", e); std::process::exit(1); }
+    };
+    if let Err(e) = std::fs::write(WALLET_FILE, &data) {
+        eprintln!("Failed to write wallet: {}", e);
+        std::process::exit(1);
+    }
 
     println!("Transferred token {}.", hex::encode(&id[..8]));
     println!("  Nullifier: {}", hex::encode(&result.spent_nullifier[..16]));
@@ -220,8 +252,14 @@ fn cmd_transfer() {
 fn cmd_save() {
     let mint = default_mint();
     let wallet = load_or_create_wallet(&mint);
-    let data = wallet.save(&get_passphrase());
-    std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+    let data = match wallet.save(&get_passphrase()) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("Failed to save wallet: {}", e); std::process::exit(1); }
+    };
+    if let Err(e) = std::fs::write(WALLET_FILE, &data) {
+        eprintln!("Failed to write wallet: {}", e);
+        std::process::exit(1);
+    }
     println!("Wallet saved to {} ({} bytes, {} tokens)", WALLET_FILE, data.len(), wallet.token_count());
 }
 
@@ -234,15 +272,23 @@ fn cmd_load() {
 }
 
 /// Perform ECDH key exchange and derive a shared ChaCha20-Poly1305 key.
-/// Protocol: each side sends their ephemeral public key (32 bytes),
-/// then both derive shared_secret = SHA-256(my_sk * their_pk).
-/// Perform ECDH key exchange with timeouts and key zeroization.
 ///
-/// WARNING: This is an anonymous (unauthenticated) DH exchange. It protects
-/// against passive eavesdropping but NOT against active MitM attacks.
-/// For production use, add mutual authentication (e.g., sign the transcript
-/// with long-term node keys, or use a Noise protocol pattern like NK/KK).
+/// # Security Warning
+///
+/// This is an UNAUTHENTICATED ephemeral DH exchange. It protects against
+/// passive eavesdropping but NOT against active MitM attacks. An attacker
+/// on the network path can intercept, relay, or steal tokens in transit.
+///
+/// For production use, replace with:
+/// - Noise NK/KK protocol pattern (mutual authentication)
+/// - Or sign the DH transcript with long-term node keys
+///
+/// The `cmd_receive()` function verifies received tokens against the mint
+/// signature, so fabricated tokens are rejected — but stolen tokens cannot
+/// be recovered.
 fn dh_handshake(stream: &mut std::net::TcpStream, is_initiator: bool) -> Option<[u8; 32]> {
+    eprintln!("WARNING: Unauthenticated key exchange — vulnerable to MitM. For production, use authenticated channels.");
+
     use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
     use std::io::{Read, Write};
     use std::time::Duration;
@@ -383,8 +429,14 @@ fn cmd_send(args: &[String]) {
             shared_key.zeroize();
 
             // Token already removed by take_token — save the wallet
-            let data = wallet.save(&get_passphrase());
-            std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+            let data = match wallet.save(&get_passphrase()) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("Failed to save wallet: {}", e); return; }
+            };
+            if let Err(e) = std::fs::write(WALLET_FILE, &data) {
+                eprintln!("Failed to write wallet: {}", e);
+                return;
+            }
             println!("Sent token {} to {} (encrypted, {} bytes)", hex::encode(&id[..8]), addr, encrypted.len());
         }
         Err(e) => {
@@ -464,8 +516,17 @@ fn cmd_receive(args: &[String]) {
                         let id = token.token_id;
                         let mut wallet = load_or_create_wallet(&mint);
                         wallet.add_token(token);
-                        let data = wallet.save(&get_passphrase());
-                        std::fs::write(WALLET_FILE, &data).expect("Failed to write wallet");
+                        let data = match wallet.save(&get_passphrase()) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("Failed to save wallet: {}", e);
+                                return;
+                            }
+                        };
+                        if let Err(e) = std::fs::write(WALLET_FILE, &data) {
+                            eprintln!("Failed to write wallet: {}", e);
+                            return;
+                        }
                         println!("Received valid token {} from {} ({} bytes)",
                             hex::encode(&id[..8]), peer, len);
                     } else {
@@ -628,11 +689,11 @@ fn run_benchmark() {
     let mut wallet = Wallet::new();
     for t in cred_tokens { wallet.add_token(t); }
     let start = Instant::now();
-    let saved = wallet.save(b"bench-passphrase");
+    let saved = wallet.save(b"bench-passphrase-ok").expect("bench passphrase meets min length");
     println!("Wallet save (50 tokens):       {:?} ({} bytes)", start.elapsed(), saved.len());
 
     let start = Instant::now();
-    let _ = Wallet::load(&saved, b"bench-passphrase", &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+    let _ = Wallet::load(&saved, b"bench-passphrase-ok", &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
     println!("Wallet load (50 tokens):       {:?}", start.elapsed());
 
     println!("\nToken size (no cred):          {} bytes", serde_token::serialized_size(&tokens[0]));

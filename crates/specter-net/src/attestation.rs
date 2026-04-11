@@ -57,9 +57,14 @@ impl Attestation {
         chain_position: u32,
         prev_hash: [u8; 32],
     ) -> Self {
+        // SECURITY: Bind sender_hash to sender_pubkey by using the pubkey's
+        // compressed form as part of the identity. Callers can still pass a
+        // custom sender_hash (e.g., a commitment), but the pubkey is hashed
+        // into the attestation hash so it cannot be swapped.
         let hash = Self::compute_hash(
             &token_id,
             &sender_hash,
+            &sender_pubkey,
             &receiver_hash,
             chain_position,
             &prev_hash,
@@ -83,7 +88,27 @@ impl Attestation {
     }
 
     /// Verify the sender's Schnorr signature on this attestation.
+    ///
+    /// Also recomputes the attestation hash from stored fields and rejects
+    /// mismatches — prevents an adversary from modifying fields without
+    /// re-signing.
     pub fn verify_signature(&self) -> bool {
+        // Recompute the attestation hash from stored fields and reject
+        // tampered fields (belt-and-suspenders in addition to the Schnorr
+        // equation, which by itself does not bind hash to field values).
+        let expected_hash = Self::compute_hash(
+            &self.token_id,
+            &self.sender_hash,
+            &self.sender_pubkey,
+            &self.receiver_hash,
+            self.chain_position,
+            &self.prev_hash,
+        );
+        use subtle::ConstantTimeEq;
+        if !bool::from(expected_hash.ct_eq(&self.hash)) {
+            return false;
+        }
+
         let challenge = Self::sig_challenge(&self.signature.r, &self.sender_pubkey, &self.hash);
         let lhs = self.signature.s * G;
         let rhs = self.signature.r + challenge * self.sender_pubkey;
@@ -105,14 +130,17 @@ impl Attestation {
     fn compute_hash(
         token_id: &[u8; 32],
         sender: &[u8; 32],
+        sender_pubkey: &RistrettoPoint,
         receiver: &[u8; 32],
         position: u32,
         prev: &[u8; 32],
     ) -> [u8; 32] {
+        // Bumped to v3: includes sender_pubkey to prevent identity-swap framing.
         let digest = Sha256::new()
-            .chain_update(b"specter-attestation-v2:")
+            .chain_update(b"specter-attestation-v3:")
             .chain_update(token_id)
             .chain_update(sender)
+            .chain_update(sender_pubkey.compress().as_bytes())
             .chain_update(receiver)
             .chain_update(position.to_le_bytes())
             .chain_update(prev)
@@ -121,6 +149,13 @@ impl Attestation {
         hash.copy_from_slice(&digest);
         hash
     }
+}
+
+/// Errors for attestation operations.
+#[derive(Debug, thiserror::Error)]
+pub enum AttestationError {
+    #[error("attestation chain exceeded u32::MAX entries")]
+    ChainTooLong,
 }
 
 /// An attestation chain - the full transfer history witnessed by a device.
@@ -142,15 +177,17 @@ impl AttestationChain {
     }
 
     /// Add a signed transfer attestation to the chain.
+    ///
+    /// Returns an error if the chain has reached u32::MAX attestations.
     pub fn add_transfer(
         &mut self,
         sender_hash: [u8; 32],
         sender_secret: &Scalar,
         sender_pubkey: RistrettoPoint,
         receiver_hash: [u8; 32],
-    ) {
+    ) -> Result<(), AttestationError> {
         let position: u32 = self.attestations.len().try_into()
-            .expect("attestation chain exceeded u32::MAX entries");
+            .map_err(|_| AttestationError::ChainTooLong)?;
         let prev_hash = self
             .attestations
             .last()
@@ -167,6 +204,7 @@ impl AttestationChain {
             prev_hash,
         );
         self.attestations.push(attestation);
+        Ok(())
     }
 
     /// Verify the chain integrity (each attestation links to the previous).
@@ -187,24 +225,15 @@ impl AttestationChain {
                 return false;
             }
 
-            // Check hash correctness
-            let expected_hash = Attestation::compute_hash(
-                &att.token_id,
-                &att.sender_hash,
-                &att.receiver_hash,
-                att.chain_position,
-                &att.prev_hash,
-            );
-            if att.hash != expected_hash {
-                return false;
-            }
-
             // Check token_id consistency
             if att.token_id != self.token_id {
                 return false;
             }
 
-            // Verify sender's Schnorr signature
+            // Verify sender's Schnorr signature — verify_signature now
+            // also recomputes the hash from stored fields (incl. pubkey)
+            // and rejects mismatches, closing the identity-swap framing
+            // vector.
             if !att.verify_signature() {
                 return false;
             }
@@ -290,7 +319,7 @@ mod tests {
     fn test_signed_attestation_roundtrip() {
         let (sk, pk) = keypair();
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2)).unwrap();
 
         assert_eq!(chain.witness_count(), 1);
         assert!(chain.verify_integrity());
@@ -304,9 +333,9 @@ mod tests {
         let (sk3, pk3) = keypair();
 
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user_hash(1), &sk1, pk1, user_hash(2));
-        chain.add_transfer(user_hash(2), &sk2, pk2, user_hash(3));
-        chain.add_transfer(user_hash(3), &sk3, pk3, user_hash(4));
+        chain.add_transfer(user_hash(1), &sk1, pk1, user_hash(2)).unwrap();
+        chain.add_transfer(user_hash(2), &sk2, pk2, user_hash(3)).unwrap();
+        chain.add_transfer(user_hash(3), &sk3, pk3, user_hash(4)).unwrap();
 
         assert_eq!(chain.witness_count(), 3);
         assert!(chain.verify_integrity());
@@ -317,10 +346,10 @@ mod tests {
         let (sk1, pk1) = keypair();
 
         let mut chain_bob = AttestationChain::new(token());
-        chain_bob.add_transfer(user_hash(1), &sk1, pk1, user_hash(2));
+        chain_bob.add_transfer(user_hash(1), &sk1, pk1, user_hash(2)).unwrap();
 
         let mut chain_carol = AttestationChain::new(token());
-        chain_carol.add_transfer(user_hash(1), &sk1, pk1, user_hash(3));
+        chain_carol.add_transfer(user_hash(1), &sk1, pk1, user_hash(3)).unwrap();
 
         match detect_double_spend(&chain_bob, &chain_carol) {
             ChainComparison::Conflict { position, cheater_hash } => {
@@ -335,7 +364,7 @@ mod tests {
     fn test_tampered_signature_fails() {
         let (sk, pk) = keypair();
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2)).unwrap();
 
         // Tamper with signature
         chain.attestations[0].signature.s += Scalar::ONE;
@@ -348,7 +377,7 @@ mod tests {
         let (_sk2, pk2) = keypair();
 
         let mut chain = AttestationChain::new(token());
-        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        chain.add_transfer(user_hash(1), &sk, pk, user_hash(2)).unwrap();
 
         // Replace sender pubkey with a different key (forged identity)
         chain.attestations[0].sender_pubkey = pk2;
@@ -360,7 +389,7 @@ mod tests {
         let mut chain = AttestationChain::new(token());
         for i in 0u8..20 {
             let (sk, pk) = keypair();
-            chain.add_transfer(user_hash(i), &sk, pk, user_hash(i + 1));
+            chain.add_transfer(user_hash(i), &sk, pk, user_hash(i + 1)).unwrap();
         }
         assert_eq!(chain.witness_count(), 20);
         assert!(chain.verify_integrity());
@@ -370,9 +399,9 @@ mod tests {
     fn test_different_tokens() {
         let (sk, pk) = keypair();
         let mut a = AttestationChain::new([1u8; 32]);
-        a.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        a.add_transfer(user_hash(1), &sk, pk, user_hash(2)).unwrap();
         let mut b = AttestationChain::new([2u8; 32]);
-        b.add_transfer(user_hash(1), &sk, pk, user_hash(2));
+        b.add_transfer(user_hash(1), &sk, pk, user_hash(2)).unwrap();
         assert_eq!(detect_double_spend(&a, &b), ChainComparison::DifferentTokens);
     }
 }

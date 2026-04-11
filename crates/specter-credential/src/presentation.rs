@@ -69,19 +69,24 @@ pub fn create_presentation(
         })
         .collect();
 
-    // Validate disclosure indices are within bounds
-    for &i in disclose_indices {
-        assert!(i < n, "disclose index {} out of bounds (max {})", i, n - 1);
-    }
+    // Silently drop out-of-bounds indices instead of panicking. Previously
+    // `assert!(i < n)` would panic the process, enabling a DoS where a caller
+    // feeds bogus indices. Out-of-range indices are simply ignored here; the
+    // verifier also rejects out-of-range disclosed indices.
+    let valid_disclose: Vec<usize> = disclose_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < n)
+        .collect();
 
     // Separate disclosed and hidden attributes
-    let disclosed: Vec<(usize, Scalar)> = disclose_indices
+    let disclosed: Vec<(usize, Scalar)> = valid_disclose
         .iter()
         .map(|&i| (i, all_scalars[i]))
         .collect();
 
     let hidden_indices: Vec<usize> = (0..n)
-        .filter(|i| !disclose_indices.contains(i))
+        .filter(|i| !valid_disclose.contains(i))
         .collect();
 
     // ZK proof of knowledge of hidden attributes + blinding factor
@@ -142,7 +147,8 @@ pub fn verify_presentation(
 ) -> bool {
     let n = Attributes::count();
 
-    // 1. Verify credential signature
+    // 1. Verify credential signature (constant-time comparison)
+    use subtle::ConstantTimeEq;
     let r_prime = presentation.cred_signature_s * G
         - presentation.cred_signature_e * presentation.issuer_pk;
     let expected_e = {
@@ -156,7 +162,7 @@ pub fn verify_presentation(
         wide.copy_from_slice(&hash);
         Scalar::from_bytes_mod_order_wide(&wide)
     };
-    if expected_e != presentation.cred_signature_e {
+    if !bool::from(expected_e.as_bytes().ct_eq(presentation.cred_signature_e.as_bytes())) {
         return false;
     }
 
@@ -207,7 +213,8 @@ pub fn verify_presentation(
         &presentation.issuer_pk,
     );
 
-    expected_challenge == presentation.proof_challenge
+    // Constant-time comparison to prevent timing oracle on proof challenge
+    expected_challenge.as_bytes().ct_eq(presentation.proof_challenge.as_bytes()).into()
 }
 
 /// Hash function for presentation challenge.

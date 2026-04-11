@@ -92,11 +92,23 @@ impl SignerKeypair {
         Self::from_parts(secret, public)
     }
 
-    /// Start a new blind signing session.
+    /// Start a new blind signing session — **TEST/INTERNAL ONLY**.
     ///
-    /// WARNING: This does NOT enforce concurrency limits. For production use,
-    /// wrap in [`RateLimitedSigner`] to prevent Wagner/ROS attacks.
-    pub fn new_session(&self) -> (SignerSession, RistrettoPoint) {
+    /// # Security Warning
+    ///
+    /// This does NOT enforce concurrency limits. Plain blind Schnorr is
+    /// vulnerable to the Wagner/ROS attack (Benhamouda et al. 2021) when
+    /// poly(log n) sessions run concurrently — an attacker solving the ROS
+    /// problem can forge `ℓ+1` signatures from `ℓ` sessions.
+    ///
+    /// Production callers MUST use [`RateLimitedSigner::new_session`] which
+    /// enforces a single in-flight session, or the [`clause_blind`] variant
+    /// which is ROS-resistant by construction (Abe 2001).
+    ///
+    /// This method is visible only inside the crate (tests, threshold helpers,
+    /// clause-blind helpers). External users of the crate cannot call it.
+    #[allow(dead_code)] // exercised by #[cfg(test)] units
+    pub(crate) fn new_session(&self) -> (SignerSession, RistrettoPoint) {
         let k = random_scalar();
         let r = k * G;
         (SignerSession { k }, r)
@@ -152,8 +164,8 @@ pub fn blind_challenge(
     // R' = R + alpha*G + beta*PK
     let r_prime = signer_r + alpha * G + beta * signer_pk;
 
-    // e' = H(R' || message)
-    let e_prime = hash_challenge(&r_prime, message);
+    // e' = H(R' || PK || message)
+    let e_prime = hash_challenge(&r_prime, signer_pk, message);
 
     // e = e' + beta (sent to signer)
     let e_blinded = e_prime + beta;
@@ -179,9 +191,9 @@ pub fn unblind_signature(
 ) -> BlindSignature {
     let s = s_prime + factors.alpha;
 
-    // Recompute e' = H(R' || message) where R' = R + alpha*G + beta*PK
+    // Recompute e' = H(R' || PK || message) where R' = R + alpha*G + beta*PK
     let r_prime = signer_r + factors.alpha * G + factors.beta * signer_pk;
-    let e = hash_challenge(&r_prime, message);
+    let e = hash_challenge(&r_prime, signer_pk, message);
 
     BlindSignature { s, e }
 }
@@ -195,26 +207,28 @@ pub fn unblind_signature(
 ///
 /// The verifier does NOT need to know the blinding factors.
 pub fn verify(pk: &RistrettoPoint, message: &[u8], sig: &BlindSignature) -> bool {
+    use subtle::ConstantTimeEq;
     // Recover R' = s*G - e*PK
     let r_prime = sig.s * G - sig.e * pk;
 
-    // Check: H(R' || message) == e
-    let expected_e = hash_challenge(&r_prime, message);
-    expected_e == sig.e
+    // Check: H(R' || PK || message) == e (constant-time to prevent timing oracle)
+    let expected_e = hash_challenge(&r_prime, pk, message);
+    expected_e.as_bytes().ct_eq(sig.e.as_bytes()).into()
 }
 
 // ─── Internal ───────────────────────────────────────────────────────────────
 
-/// Hash a Ristretto point and message to a scalar challenge.
+/// Hash a Ristretto point, public key, and message to a scalar challenge.
 ///
-/// H(R || msg_len || message) using SHA-512 reduced to a scalar.
-/// Note: PK is NOT included in the hash. Key-substitution is prevented
-/// by the blind signature protocol structure: the requester computes R'
-/// using the signer's specific PK, binding the signature to that key.
-fn hash_challenge(r: &RistrettoPoint, message: &[u8]) -> Scalar {
+/// H(R || PK || msg_len || message) using SHA-512 reduced to a scalar.
+/// PK is included in the hash to prevent key-substitution attacks where
+/// an adversary forges PK' such that a valid signature for PK also
+/// verifies under PK'. This is critical in multi-issuer deployments.
+fn hash_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, message: &[u8]) -> Scalar {
     let hash = Sha512::new()
         .chain_update(b"specter-blind-sig-challenge:")
         .chain_update(r.compress().as_bytes())
+        .chain_update(pk.compress().as_bytes())
         .chain_update((message.len() as u64).to_le_bytes())
         .chain_update(message)
         .finalize();

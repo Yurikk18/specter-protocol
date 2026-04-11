@@ -85,9 +85,11 @@ impl Default for Issuer {
 
 /// Verify a credential's Schnorr signature.
 pub fn verify_credential_signature(credential: &Credential) -> bool {
+    use subtle::ConstantTimeEq;
     let r_prime = credential.signature_s * G - credential.signature_e * credential.issuer_pk;
     let expected_e = hash_credential_challenge(&r_prime, &credential.commitment, &credential.issuer_pk);
-    expected_e == credential.signature_e
+    // Constant-time comparison to prevent timing oracle on credential challenges
+    expected_e.as_bytes().ct_eq(credential.signature_e.as_bytes()).into()
 }
 
 /// Hash function for credential challenge.

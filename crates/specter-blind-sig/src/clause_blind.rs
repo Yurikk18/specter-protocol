@@ -73,35 +73,50 @@ impl ClauseSession {
 ///
 /// Randomly selects one of the two nonces. The signer receives
 /// two challenges but cannot determine which is the real one.
+///
+/// The branch-selection bit `b` is SECRET — if a local observer could infer
+/// `b` via timing/cache side channels, they could distinguish the real from
+/// the decoy nonce and defeat unlinkability in the presence of a co-located
+/// adversary. This implementation uses `subtle::ConditionallySelectable` to
+/// keep the scalar/point selection constant-time w.r.t. `b`.
 pub fn clause_blind_challenge(
     r0: &RistrettoPoint,
     r1: &RistrettoPoint,
     signer_pk: &RistrettoPoint,
     message: &[u8],
 ) -> (ClauseBlindingFactors, Scalar, Scalar) {
-    // Random bit selects the real branch
-    let b = random_scalar().as_bytes()[0] & 1;
+    use subtle::{Choice, ConditionallySelectable};
+
+    // Random bit selects the real branch. Read the bit into a Choice so
+    // downstream `conditional_select` calls are constant-time.
+    let b_byte = {
+        let mut buf = [0u8; 1];
+        use rand_core::{OsRng, RngCore};
+        OsRng.fill_bytes(&mut buf);
+        buf[0] & 1
+    };
+    let choice = Choice::from(b_byte);
 
     let alpha = random_scalar();
     let beta = random_scalar();
 
-    // Blind the chosen branch with the real message
-    let r_chosen = if b == 0 { r0 } else { r1 };
+    // Constant-time select of the "real" nonce commitment.
+    // RistrettoPoint implements ConditionallySelectable in dalek 4.x.
+    let r_chosen = RistrettoPoint::conditional_select(r0, r1, choice);
+
     let r_prime = r_chosen + alpha * G + beta * signer_pk;
-    let e_prime = hash_challenge(&r_prime, message);
+    let e_prime = hash_challenge(&r_prime, signer_pk, message);
     let e_real = e_prime + beta;
 
     // Decoy branch: random challenge
     let e_decoy = random_scalar();
 
-    let (e0, e1) = if b == 0 {
-        (e_real, e_decoy)
-    } else {
-        (e_decoy, e_real)
-    };
+    // Constant-time placement of (e_real, e_decoy) into the (e0, e1) slots.
+    let e0 = Scalar::conditional_select(&e_real, &e_decoy, choice);
+    let e1 = Scalar::conditional_select(&e_decoy, &e_real, choice);
 
     let factors = ClauseBlindingFactors {
-        chosen: b,
+        chosen: b_byte,
         alpha,
         beta,
     };
@@ -109,6 +124,10 @@ pub fn clause_blind_challenge(
 }
 
 /// Unblind the signer's response to get the final signature.
+///
+/// Uses constant-time selection on the secret `chosen` branch indicator so
+/// a local side-channel observer cannot learn which of (s0, r0) vs (s1, r1)
+/// was the real branch.
 pub fn clause_unblind(
     s0: &Scalar,
     s1: &Scalar,
@@ -118,27 +137,33 @@ pub fn clause_unblind(
     signer_pk: &RistrettoPoint,
     message: &[u8],
 ) -> BlindSignature {
-    let s_chosen = if factors.chosen == 0 { s0 } else { s1 };
-    let r_chosen = if factors.chosen == 0 { r0 } else { r1 };
+    use subtle::{Choice, ConditionallySelectable};
+    let choice = Choice::from(factors.chosen);
+
+    let s_chosen = Scalar::conditional_select(s0, s1, choice);
+    let r_chosen = RistrettoPoint::conditional_select(r0, r1, choice);
 
     let s = s_chosen + factors.alpha;
     let r_prime = r_chosen + factors.alpha * G + factors.beta * signer_pk;
-    let e = hash_challenge(&r_prime, message);
+    let e = hash_challenge(&r_prime, signer_pk, message);
 
     BlindSignature { s, e }
 }
 
 /// Verify a clause blind signature. Same as standard Schnorr verify.
 pub fn verify(pk: &RistrettoPoint, message: &[u8], sig: &BlindSignature) -> bool {
+    use subtle::ConstantTimeEq;
     let r_prime = sig.s * G - sig.e * pk;
-    let expected_e = hash_challenge(&r_prime, message);
-    expected_e == sig.e
+    let expected_e = hash_challenge(&r_prime, pk, message);
+    // Constant-time comparison to prevent timing oracle on challenge scalar
+    expected_e.as_bytes().ct_eq(sig.e.as_bytes()).into()
 }
 
-fn hash_challenge(r: &RistrettoPoint, message: &[u8]) -> Scalar {
+fn hash_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, message: &[u8]) -> Scalar {
     let hash = Sha512::new()
         .chain_update(b"specter-clause-blind-challenge:")
         .chain_update(r.compress().as_bytes())
+        .chain_update(pk.compress().as_bytes())
         .chain_update((message.len() as u64).to_le_bytes())
         .chain_update(message)
         .finalize();

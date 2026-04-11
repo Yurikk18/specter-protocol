@@ -111,6 +111,7 @@ pub fn reconstruct_secret(shares: &[Share]) -> Option<Scalar> {
             // denominator: (x_i - x_j)
             let num = -xj;
             let den = xi - xj;
+            debug_assert_ne!(den, Scalar::ZERO, "duplicate x-coordinates should have been caught earlier");
             basis *= num * den.invert();
         }
 

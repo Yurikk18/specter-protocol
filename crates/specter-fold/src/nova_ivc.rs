@@ -1,8 +1,19 @@
-//! Nova IVC - true zero-knowledge recursive proof folding.
+//! Nova IVC - recursive proof folding over Pallas/Vesta curves.
 //!
 //! Each transfer step is verified inside a Nova StepCircuit.
-//! The proof is constant-size and zero-knowledge - verifiers learn
-//! nothing about the transfer history except that it is valid.
+//! The proof is constant-size and provides recursive verification.
+//!
+//! # Current Limitation
+//!
+//! The `TransferCircuit` currently constrains only a step counter.
+//! It does NOT embed Ristretto255 operations (Schnorr verification,
+//! Pedersen commitment checks) because those require a different
+//! curve than Pallas/Vesta. Adding cross-curve verification inside
+//! R1CS constraints requires non-native field arithmetic (expensive).
+//!
+//! The step counter proves "N sequential prove_step calls occurred."
+//! Actual transfer validity relies on the Schnorr accumulator
+//! (accumulator.rs), the mint blind signature, and the nullifier set.
 
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
 use nova_snark::{

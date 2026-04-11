@@ -160,6 +160,18 @@ pub fn dkg_round3(
             .get(&sender_id)
             .ok_or(DkgError::MissingCommitments(sender_id))?;
 
+        // Reject commitment vectors that don't match the threshold.
+        // A longer vector encodes a higher-degree polynomial,
+        // silently raising the effective threshold (threshold-raising attack,
+        // Trail of Bits 2024).
+        if sender_commitments.len() != participant.threshold {
+            return Err(DkgError::InvalidCommitmentLength {
+                from: sender_id,
+                expected: participant.threshold,
+                got: sender_commitments.len(),
+            });
+        }
+
         // Expected: share * G == sum(x_i^k * C_{sender,k})
         let expected = evaluate_poly_points(sender_commitments, &x_i);
         let actual = share * G;
@@ -244,6 +256,17 @@ pub fn run_dkg(
         .iter()
         .map(|(&id, p)| (id, p.commitments.clone()))
         .collect();
+
+    // Validate commitment vector lengths before Round 2 (threshold-raising defense)
+    for (&id, commits) in &all_commitments {
+        if commits.len() != threshold {
+            return Err(DkgError::InvalidCommitmentLength {
+                from: id,
+                expected: threshold,
+                got: commits.len(),
+            });
+        }
+    }
 
     // Verify all PoKs before proceeding to Round 2
     for (&pid, commitments) in &all_commitments {
@@ -340,6 +363,9 @@ pub enum DkgError {
 
     #[error("invalid proof-of-knowledge from participant {0}")]
     InvalidProofOfKnowledge(SignerId),
+
+    #[error("invalid commitment vector length from participant {from}: expected {expected}, got {got}")]
+    InvalidCommitmentLength { from: SignerId, expected: usize, got: usize },
 }
 
 #[cfg(test)]

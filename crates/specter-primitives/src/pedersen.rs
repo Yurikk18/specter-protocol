@@ -88,6 +88,9 @@ impl PedersenParams {
     /// WITHOUT revealing the blinding factor.
     ///
     /// Proves knowledge of r such that C = v*G + r*H.
+    /// Note: the value is not used in proof generation -- binding comes from
+    /// the verifier recomputing C - v*G. The parameter is retained for API
+    /// clarity about what is being proved.
     pub fn prove_value(&self, _value: &Scalar, blinding: &Scalar) -> ValueProof {
         let t = crate::scalar_utils::random_scalar();
         let t_commit = t * self.h;

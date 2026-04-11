@@ -167,54 +167,36 @@ pub fn threshold_blind_sign(
         .map(|_| signer_start_session())
         .collect();
 
-    // Step 2: Combine nonce commitments: R = sum(R_i)
-    let combined_r: RistrettoPoint = sessions
-        .iter()
-        .map(|s| s.nonce_commitment)
-        .fold(RistrettoPoint::default(), |acc, r| acc + r);
-
-    // Step 3: Requester blinds the challenge (first pass, will be recomputed)
-    let (_blinding_factors, _blinded_challenge) =
-        schnorr_blind::blind_challenge(&combined_r, &keyset.group_public, message);
-
-    // Step 5: Combine partial responses using Lagrange coefficients
-    // s' = sum(lambda_i * s_i) where lambda_i is the Lagrange coefficient
-    // But for the nonce part, we just sum: sum(k_i)
-    // For the secret part: sum(lambda_i * share_i * challenge) = challenge * secret
-    // So: s' = sum(k_i) + challenge * sum(lambda_i * share_i)
-    //        = sum(k_i) + challenge * group_secret
-
-    // Actually, we need to weight the partial responses by Lagrange coefficients:
-    // s_i = k_i + challenge * y_i
-    // We want: s' = sum(k_i) + challenge * sum(lambda_i * y_i)
-    //            = sum(k_i) + challenge * secret  (by Lagrange reconstruction)
+    // Step 2: Compute Lagrange coefficients for the chosen signer subset.
     //
-    // But s_i already has the y_i term without lambda_i weighting.
-    // So: s' = sum(lambda_i * s_i)
-    //        = sum(lambda_i * k_i) + challenge * sum(lambda_i * y_i)
-    //        = sum(lambda_i * k_i) + challenge * secret
+    // The threshold signature combines partial responses by Lagrange
+    // reconstruction:
+    //   s_i = k_i + e * y_i
+    //   s  = sum(lambda_i * s_i)
+    //      = sum(lambda_i * k_i) + e * sum(lambda_i * y_i)
+    //      = sum(lambda_i * k_i) + e * group_secret
     //
-    // The nonce part sum(lambda_i * k_i) is NOT the same as sum(k_i).
-    // This means the combined R must also use Lagrange coefficients.
-    //
-    // Alternative approach (simpler): weight the nonce commitments too.
-    // R = sum(lambda_i * R_i), then s' = sum(lambda_i * s_i)
-    // This ensures s'*G = R + challenge * PK.
-
+    // The combined nonce R used by the blind-challenge must match what the
+    // verifier derives from s: R = sum(lambda_i * R_i). A naive sum(R_i)
+    // would not satisfy the Schnorr equation. An earlier version of this
+    // file computed blind_challenge twice (once with the naive sum, once
+    // with the weighted sum) and discarded the first result — a dead code
+    // path that wasted entropy and added a minor timing side channel.
     let lagrange_coeffs = compute_lagrange_coefficients(signer_ids, &keyset.shares);
 
-    // Recompute R with Lagrange weighting
+    // Step 3: Combine nonce commitments with Lagrange weighting so the
+    // combined R matches the reconstruction above.
     let weighted_r: RistrettoPoint = sessions
         .iter()
         .zip(signer_ids.iter())
         .map(|(s, &id)| lagrange_coeffs[&id] * s.nonce_commitment)
         .fold(RistrettoPoint::default(), |acc, r| acc + r);
 
-    // Re-blind with the weighted R
+    // Step 4: Requester blinds the challenge using the weighted R.
     let (blinding_factors, blinded_challenge) =
         schnorr_blind::blind_challenge(&weighted_r, &keyset.group_public, message);
 
-    // Re-compute partial responses with the new challenge
+    // Step 5: Partial responses, Lagrange-weighted, summed.
     let s_prime: Scalar = signer_ids
         .iter()
         .zip(sessions.iter())

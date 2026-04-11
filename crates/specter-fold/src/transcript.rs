@@ -13,9 +13,13 @@ pub struct Transcript {
 
 impl Transcript {
     /// Create a new transcript with a domain separator.
+    ///
+    /// The domain is length-prefixed to prevent collisions between
+    /// domains where one is a prefix of another.
     pub fn new(domain: &[u8]) -> Self {
         let mut hasher = Shake256::default();
         hasher.update(b"specter-transcript:");
+        hasher.update(&(domain.len() as u64).to_le_bytes());
         hasher.update(domain);
         Self { hasher }
     }
