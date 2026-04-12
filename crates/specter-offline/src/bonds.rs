@@ -218,7 +218,11 @@ impl BondRegistry {
         if bond.withdrawal_requested_at == 0 {
             return Err(BondError::WithdrawalNotRequested);
         }
-        if current_time < bond.withdrawal_requested_at + self.lock_period_secs {
+        let unlock_time = bond
+            .withdrawal_requested_at
+            .checked_add(self.lock_period_secs)
+            .ok_or(BondError::LockPeriodNotElapsed)?;
+        if current_time < unlock_time {
             return Err(BondError::LockPeriodNotElapsed);
         }
         if bond.offline_exposure > 0 {

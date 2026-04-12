@@ -57,7 +57,7 @@ impl RsaVdfParams {
               34432190114657544454178424020924616515723350778707749817125772467\
               96292638635637328991215483143816789988504044536402352738195137863\
               65643912120103971228221207203578", 10,
-        ).expect("RSA-2048 challenge number");
+        ).unwrap_or_else(|| unreachable!("hardcoded RSA-2048 modulus is valid decimal"));
 
         Self {
             modulus,
@@ -82,6 +82,10 @@ impl RsaVdfParams {
 ///
 /// This is intentionally sequential and cannot be parallelized.
 pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> RsaVdfProof {
+    assert!(
+        iterations <= MAX_RSA_VDF_ITERATIONS,
+        "evaluate: iterations ({iterations}) exceeds cap ({MAX_RSA_VDF_ITERATIONS})"
+    );
     let n = &params.modulus;
 
     // Compute y = x^(2^T) mod N

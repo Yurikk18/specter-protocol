@@ -26,3 +26,9 @@ zeroize = { workspace = true }
 [dev-dependencies]
 hex = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+sha2 = { workspace = true }
+
+[[bench]]
+name = "sbt_bench"
+harness = false

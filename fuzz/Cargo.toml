@@ -17,7 +17,11 @@ specter-core = { path = "../crates/specter-core" }
 specter-primitives = { path = "../crates/specter-primitives" }
 specter-credential = { path = "../crates/specter-credential" }
 specter-net = { path = "../crates/specter-net" }
+specter-sbt = { path = "../crates/specter-sbt" }
 curve25519-dalek = { version = ">=4.1.3", features = ["serde", "rand_core", "zeroize"] }
+serde = { version = "1", features = ["derive"] }
+borsh = { version = "1", features = ["derive"] }
+bincode = "1.3"
 
 [[bin]]
 name = "fuzz_deserialize_token"
@@ -50,6 +54,27 @@ bench = false
 [[bin]]
 name = "fuzz_verify_presentation"
 path = "fuzz_targets/fuzz_verify_presentation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sbt_spend_token"
+path = "fuzz_targets/fuzz_sbt_spend_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sbt_request"
+path = "fuzz_targets/fuzz_sbt_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sbt_evaluation"
+path = "fuzz_targets/fuzz_sbt_evaluation.rs"
 test = false
 doc = false
 bench = false

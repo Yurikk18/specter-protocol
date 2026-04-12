@@ -56,7 +56,7 @@ use specter_primitives::scalar_utils::random_scalar;
 /// Represents a hand-off from the previous owner to `new_owner_pk`,
 /// authorized by a Schnorr signature under the previous owner's
 /// derived signing key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TransferStep {
     /// Public key of the new owner at this step (derived from the
     /// incoming owner's secret via [`derive_owner_signing_key`]).
@@ -65,6 +65,16 @@ pub struct TransferStep {
     pub sig_r: RistrettoPoint,
     /// Schnorr response s = k + e * prev_owner_sk.
     pub sig_s: Scalar,
+}
+
+impl std::fmt::Debug for TransferStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransferStep")
+            .field("new_owner_pk", &self.new_owner_pk.compress())
+            .field("sig_r", &self.sig_r.compress())
+            .field("sig_s", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Proof of a token's transfer history.
@@ -330,7 +340,7 @@ pub fn verify_accumulated_proof(
         let e = transfer_challenge(&step.sig_r, &current_pk, &msg);
         let lhs = step.sig_s * G;
         let rhs = step.sig_r + e * current_pk;
-        if lhs != rhs {
+        if lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).unwrap_u8() == 0 {
             return false;
         }
         current_pk = step.new_owner_pk;
