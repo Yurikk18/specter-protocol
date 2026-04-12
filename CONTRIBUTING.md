@@ -22,7 +22,9 @@ Requires Rust stable toolchain (`stable-x86_64-pc-windows-msvc` on Windows, `sta
 | `specter-core` | PCT lifecycle (mint, transfer, verify, wallet, nullifiers) | `ProofCarryingToken`, `Mint`, `Wallet`, `NullifierSet` |
 | `specter-offline` | VDF time-locks, reputation bonds | `VdfProof`, `RsaVdfProof`, `BondRegistry` |
 | `specter-net` | BFT consensus, gossip, attestation chains | `ConsensusState`, `GossipProtocol`, `AttestationChain` |
-| `specter-cli` | CLI binary (demo, benchmarks, wallet, P2P) | — |
+| `specter-cli` | CLI binary (demo, benchmarks, wallet, hybrid PQ handshake) | — |
+| `specter-tee` | AMD SEV-SNP attestation, TCB policy, portable verify | `AttestationProvider`, `PortableSnpVerifier`, `TcbPolicy` |
+| `specter-sbt` | Symmetric Blind Tokens (threshold DH-OPRF + Chaum-Pedersen NIZK) | `SbtScheme`, `SpendToken`, `OprfEvaluation`, `SbtNullifier` |
 
 ## Security Rules
 

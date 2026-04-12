@@ -130,7 +130,7 @@ audit in `edf799a`.
 - `transfer_checked()` with full 6-check pre-spend verification
 - SIGMA-I authenticated CLI handshake (`NodeIdentity`, peer pubkey pinning)
 - `ConcurrentNullifierSet` (Arc<Mutex> wrapper, 32-thread contention test)
-- 5 fuzz targets via `cargo-fuzz` (`fuzz/`)
+- 8 fuzz targets via `cargo-fuzz` (`fuzz/`)
 - `memory_guard` module with mlock / VirtualLock / disable_core_dumps
 - `mandatory_coverage.rs` integration test suite (section 28 of audit prompt)
 - Proptest coverage for nullifier, serialize roundtrip, fold integrity
