@@ -204,6 +204,51 @@ Security proofs rely on:
 | Gossip            | Schnorr-signed broadcasts + replay rejection | gossip::tests                     |
 | Attestation chain | v3 hash with sender pubkey                 | attestation::tests                  |
 
+## AMD SEV-SNP Threat Model (specter-tee)
+
+### Protects Against
+- Malicious hypervisor reading guest memory (AES-256 HW encryption)
+- Rogue host OS / kernel
+- DMA attacks from co-located guests
+- Replay of attestations (nonce-binding via `user_data_from_pubkey_and_nonce`)
+- Old firmware exploits (TCB policy floor enforcement)
+- Modified guest images (measurement allow-list pinning)
+- Excessive privilege (VMPL cap)
+
+### Does NOT Protect Against
+- Physical die probing
+- Side-channel attacks on the AMD PSP itself
+- Compromise of AMD root signing key
+- Denial-of-service by the hypervisor (can refuse to schedule the VM)
+
+### Verification Model
+- `PortableSnpVerifier` works on ANY platform (Windows, macOS, Linux)
+- `SevSnpProvider` requests reports on Linux only (`/dev/sev-guest`)
+- Full chain verification: ARK self-sig → ARK→ASK → ASK→VCEK → report body (ECDSA-P384)
+
+## Symmetric Blind Token (SBT) Threat Model (specter-sbt)
+
+### Protects Against
+- Mint linkability (OPRF blinding with random α per interaction)
+- Rogue trustee share injection (Chaum-Pedersen DDH-equality proof per trustee)
+- Cross-key token replay (aggregate public key Y bound into TokenProof transcript)
+- Forgery without mint interaction (reduces to Gap-CDH on Ristretto255)
+- Double-spend (deterministic nullifier from HKDF(client_secret, payload))
+- Payload brute-force (client_secret mixing into commitment derivation)
+- Identity-point injection (validated at every entry point)
+- Session replay (session_id bound via ct_eq, spend session must differ from mint)
+
+### Does NOT Protect Against
+- Shor's algorithm (classical DH-OPRF; PQ upgrade path via Leap OPRF + VOLEitH)
+- Publicly verifiable tag origin without pairings (threshold re-combine required)
+- Loss of client_secret (no migration path by design — protects unlinkability)
+
+### Verification Model
+- `verify_token` = client proof + tag origin (requires held secret_key)
+- `verify_client_proof` = Schnorr PoK only (soundness ceiling)
+- `verify_tag_threshold` = decentralized spend-time re-evaluation via OPRF
+- `verify_tag_with_secret_key` = centralized full check (test/single-party)
+
 ## Formal Verification Gaps
 
 The following properties have test coverage but no machine-checked
@@ -213,6 +258,8 @@ proof:
 - `ConcurrentNullifierSet` linearizability under arbitrary schedules
 - Fiat-Shamir completeness of every transcript in the system
 - Blindness of the threshold signer against `t − 1` colluders
+- SBT Chaum-Pedersen DDH-equality soundness (10 audit passes, no machine proof)
+- TCB policy component-wise comparison correctness
 
 These are flagged for future formal verification with Hax / Creusot /
 Kani once the crypto surface stabilizes.

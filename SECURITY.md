@@ -37,7 +37,10 @@ protect, and which adversaries are in scope.
 | ---------- | -------------------------------------- | -------- | -------------------------------------------------- |
 | 2026-04-10 | 5-pass purple-team crypto audit        | 12       | All fixed in `43e2661`                             |
 | 2026-04-11 | 15-pass continuous audit loop          | 3 + R/A  | All fixed in `edf799a`                             |
-| 2026-04-11 | Fundamental fold proof replacement     | 1        | Signed-chain accumulator, pushed in this commit    |
+| 2026-04-11 | Fundamental fold proof replacement     | 1        | Signed-chain accumulator in `eaab68f`              |
+| 2026-04-11 | specter-sbt 10-pass iterative audit    | 15+      | All fixed across `29c3b80`, `64a8137`, `a77ad3a`   |
+| 2026-04-12 | specter-tee security audit             | 5        | All fixed in `64a8137`                             |
+| 2026-04-12 | specter-fold + specter-offline audit   | 5        | All fixed in `a77ad3a`                             |
 
 All historical findings with attack vectors and patches are documented
 inside the commit bodies — run `git log --format=full` on the `main`
@@ -58,8 +61,18 @@ branch for the complete record.
 | Memory hardening       | `mlock` / `VirtualLock` + `zeroize`      | ✅      |
 | Nullifier set          | `NullifierSet` + `ConcurrentNullifierSet`| ✅      |
 | BFT consensus          | HotStuff-like with Schnorr-signed votes  | ✅      |
+| Hybrid PQ consensus    | ML-DSA-65 (FIPS 204) dual-signed votes   | ✅      |
+| Hybrid PQ handshake    | X25519 + ML-KEM-768 (FIPS 203)           | ✅      |
 | Attestation chains     | v3 hash binding sender pubkey            | ✅      |
 | Anonymous credentials  | Schnorr-based selective disclosure       | ✅      |
+| TEE attestation        | AMD SEV-SNP (virtee/sev, crypto_nossl)   | ✅      |
+| TCB policy             | Component-wise floor + measurement pin   | ✅      |
+| Threshold OPRF (SBT)   | 2HashDH + Chaum-Pedersen DDH-equality    | ✅      |
+| Token NIZK (SBT)       | Schnorr PoK + aggregate key binding      | ✅      |
+| Scalar blinding        | DPA-resistant blinded scalar multiply    | ✅      |
+| Range proof            | 64-bit Chaum-Pedersen OR bit-decomp      | ✅      |
+| PQ readiness gate      | compile_error! on pq-voleith feature     | ✅      |
+| Proactive resharing    | Herzberg et al. 1995 DKG key rotation    | ✅      |
 
 ## Dependency Audit
 
@@ -76,17 +89,27 @@ informational warnings (`unmaintained` / `unsound`) are documented in
    `specter-fold::accumulator`.
 2. **Hash-based VDF is ASIC-accelerable.** Marked `#[deprecated]`;
    production should use `specter-offline::vdf_rsa` (Wesolowski over
-   RSA-2048).
+   RSA-2048). `evaluate()` is now capped at `MAX_RSA_VDF_ITERATIONS`.
 3. **`mlock` is best-effort.** Falls back to zeroize-on-drop when the
    operating system denies lock (e.g., `RLIMIT_MEMLOCK` too low).
 4. **Distributed nullifier set is not network-partition tested.** The
    BFT consensus layer has the primitives (signed votes, view-change,
    equivocation detection) but has not been stress-tested against
    long-running partitions.
-5. **Quantum.** All elliptic-curve primitives (Ristretto255, Schnorr,
-   Pedersen, Nova, SIGMA-I) are vulnerable to Shor's algorithm in a
-   post-quantum world. Symmetric primitives (Argon2id, ChaCha20-Poly1305,
-   SHAKE-256) remain post-quantum sound at 128-bit security.
+5. **Post-quantum.** Classical EC primitives (Ristretto255, Schnorr,
+   Pedersen) are vulnerable to Shor's algorithm. **Mitigations**:
+   - Hybrid ML-KEM-768 handshake (specter-cli, `pq-handshake` feature)
+   - Hybrid ML-DSA-65 consensus votes (specter-net, `pq-consensus` feature)
+   - SBT OPRF construction designed for lattice-OPRF swap-in when
+     Rust ecosystem matures (Leap OPRF, Eurocrypt 2025)
+   - `PqReadiness::detect()` runtime check + `compile_error!` gate on
+     `pq-voleith` feature prevents premature PQ claims
+   - Symmetric primitives (Argon2id, ChaCha20-Poly1305, SHAKE-256)
+     remain PQ-sound at 128-bit security.
+6. **SEV-SNP fixture test pending.** The portable verification path
+   (`sev_snp_verify.rs`) compiles and links on Windows via `crypto_nossl`
+   but has not been tested against captured AMD cert chains from real
+   hardware. Requires Azure CVM access for fixture generation.
 
 ## Build-Time Checks
 

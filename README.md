@@ -38,17 +38,19 @@ Each of these is grounded in peer-reviewed cryptographic literature (see [Refere
 
 ## Architecture
 
-The implementation is organized as a Rust workspace with 8 crates:
+The implementation is organized as a Rust workspace with 10 crates:
 
 ```
-specter-primitives       Pedersen commitments, Shamir secret sharing, scalar utilities
-specter-blind-sig        Schnorr blind signatures (standard + clause) + threshold (t-of-n) + DKG
-specter-fold             Proof accumulation via Fiat-Shamir transcripts + Nova IVC (feature-gated)
+specter-primitives       Pedersen commitments, Shamir, scalar blinding, range proofs
+specter-blind-sig        Schnorr blind signatures + threshold (t-of-n) + DKG + proactive resharing
+specter-fold             Proof accumulation via signed transfer chain + Nova IVC (feature-gated)
 specter-credential       Anonymous credentials with selective disclosure + revocation
-specter-core             PCT lifecycle: mint, transfer, verify, wallet, serialization, nullifiers
+specter-core             PCT lifecycle: mint, transfer, verify, wallet, nullifiers, WalletSigner
 specter-offline          VDF time-locks (SHA-256 + RSA Wesolowski) + reputation bonds
-specter-net              Authenticated gossip + BFT consensus + social attestation chains
-specter-cli              Demo, benchmarks, encrypted wallet, ECDH P2P transfer
+specter-net              Authenticated gossip + BFT consensus + hybrid ML-DSA-65 votes
+specter-cli              Demo, benchmarks, encrypted wallet, hybrid X25519+ML-KEM-768 handshake
+specter-tee              AMD SEV-SNP confidential VM attestation (pure Rust, cross-platform verify)
+specter-sbt              Symmetric Blind Tokens — threshold DH-OPRF + Chaum-Pedersen NIZK (PQ-ready)
 ```
 
 ### Dependency Graph
@@ -56,15 +58,17 @@ specter-cli              Demo, benchmarks, encrypted wallet, ECDH P2P transfer
 ```
 specter-primitives             (foundation — no internal dependencies)
     |
-    +-- specter-blind-sig      (blind signatures, threshold signing, DKG)
+    +-- specter-blind-sig      (blind signatures, threshold signing, DKG, proactive resharing)
     +-- specter-fold           (proof accumulation, Fiat-Shamir transcripts)
     +-- specter-credential     (anonymous credentials, selective disclosure)
     +-- specter-offline        (VDF time-locks, reputation bonds)
-    +-- specter-net            (BFT consensus, gossip, attestation chains)
+    +-- specter-net            (BFT consensus, gossip, hybrid PQ votes)
+    +-- specter-tee            (AMD SEV-SNP attestation, TCB policy enforcement)
+    +-- specter-sbt            (threshold OPRF blind tokens, Chaum-Pedersen NIZK)
     |
     +-- specter-core           (depends on all above — full token lifecycle)
     |
-    +-- specter-cli            (binary — demo, benchmarks, wallet management)
+    +-- specter-cli            (binary — demo, benchmarks, wallet, hybrid handshake)
 ```
 
 ### Cryptographic Primitives
@@ -79,9 +83,17 @@ specter-primitives             (foundation — no internal dependencies)
 | Recursive proof | Nova IVC (optional, feature-gated) | Kothapalli et al. (2022) |
 | Credential | Schnorr signature over Pedersen vector commitment | Brands (1993) |
 | VDF | RSA repeated squaring + Wesolowski proof | Wesolowski (2019) |
-| Nullifier | SHAKE-256(secret || token_id) | Standard construction |
+| OPRF | 2HashDH threshold DH-OPRF over Ristretto255 | Jarecki-Krawczyk-Xu (2014) |
+| DDH-equality proof | Chaum-Pedersen NIZK (session + trustee bound) | Chaum-Pedersen (1993) |
+| Nullifier | SHAKE-256(secret &#124;&#124; token_id) + SbtNullifier newtype | Standard construction |
 | Encryption | ChaCha20-Poly1305 | RFC 8439 |
 | KDF | Argon2id (128 MB, 4 iterations) | RFC 9106 |
+| Scalar blinding | DPA-resistant blinded scalar mul | Side-channel hardening |
+| Range proof | 64-bit bit-decomposition Chaum-Pedersen OR | Standard construction |
+| Hybrid handshake | X25519 + ML-KEM-768 (FIPS 203) | NIST PQ Round 3 |
+| Hybrid consensus | Schnorr + ML-DSA-65 (FIPS 204) | NIST PQ Round 3 |
+| TEE attestation | AMD SEV-SNP via virtee/sev (pure Rust crypto_nossl) | AMD SEV-SNP ABI |
+| TCB policy | Component-wise version floor + measurement pinning | AMD SEV-SNP best practice |
 
 ---
 
@@ -91,7 +103,7 @@ specter-primitives             (foundation — no internal dependencies)
 # Build all crates
 cargo build --workspace
 
-# Run all 240 tests
+# Run all 403 tests
 cargo test --workspace
 
 # Run the protocol demo
@@ -180,7 +192,7 @@ All Specter numbers measured in release mode on a desktop. External numbers from
 ### Honest Limitations
 
 - **Token size ~6x larger than Cashu** (413-1,039 B vs ~65 B) — the extra bytes carry fold proof, credentials, and VDF that Cashu does not have
-- **Not deployed** — this is a research prototype with 240 tests, not production software
+- **Not deployed** — this is a research prototype with 403 tests, not production software
 - **Current benchmarks use classical curves** — PQ migration to lattice primitives will increase sizes significantly (estimated 300-600 KB per token with LatticeFold+)
 
 ---
@@ -191,7 +203,7 @@ All Specter numbers measured in release mode on a desktop. External numbers from
 |---------|---------|--------|-------|-------|----------|---------|
 | Decentralized | Yes | Yes | Yes | No | Partial | **Yes (threshold)** |
 | Private | No | Yes | Yes | Yes | Yes | **Yes** |
-| Post-quantum ready | No | No | No | No | No | **Yes** |
+| Post-quantum ready | No | No | No | No | No | **Yes (hybrid ML-KEM + ML-DSA + SBT OPRF path)** |
 | Compliance embedded | No | No | No | No | No | **Yes** |
 | Offline transfer | No | No | No | No | Partial | **Yes (with bonds)** |
 | Constant-size transfer | N/A | N/A | N/A | N/A | N/A | **Yes** |

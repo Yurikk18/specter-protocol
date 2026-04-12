@@ -5,7 +5,74 @@ This file tracks the audit cycles, their findings, and the resulting
 patches so that external reviewers can follow the full history without
 grep'ing commit bodies.
 
-## [unreleased] — Signed transfer chain (fundamental fold proof fix)
+## [unreleased] — SBT + SEV-SNP + full hardening (zero residuals)
+
+This cycle adds two new crates (specter-sbt, specter-tee), resolves all
+residual security items, and brings the test count from 240 to 403 with
+10+ iterative audit passes on the novel SBT construction.
+
+### Added
+
+- **`specter-sbt`** — Symmetric Blind Tokens: novel threshold DH-OPRF +
+  Chaum-Pedersen NIZK composition for PQ-ready blind-token mint flow.
+  68+ tests, 10 iterative security audits (clean bill of health).
+  - Threshold 2HashDH OPRF with Feldman VSS share evaluation
+  - Per-trustee DDH-equality proofs (rogue-share defense)
+  - Schnorr TokenProof binding aggregate public key Y into transcript
+  - `verify_token` returns `TagOriginCheckRequired` without held key
+  - `verify_tag_threshold()` for decentralized spend-time verification
+  - Deterministic nullifiers via HKDF(client_secret, payload)
+  - `SbtNullifier` newtype for namespace separation from PCT nullifiers
+  - `PqReadiness` module with compile-time gate on `pq-voleith` feature
+  - `BlindSignatureScheme` trait abstraction for future PQ swap-in
+- **`specter-tee`** — AMD SEV-SNP confidential VM attestation:
+  - virtee/sev 6.3.1 with pure-Rust `crypto_nossl` backend
+  - `sev_snp_verify.rs`: platform-independent verification (works on Windows)
+  - `PortableSnpVerifier` implementing `AttestationProvider` on any OS
+  - `TcbPolicy` with component-wise TCB floor, measurement allow-list, max VMPL
+  - `user_data_from_pubkey_and_nonce()` for replay prevention
+  - `MockAttestationProvider` behind `mock-attestation` feature for dev
+- **`specter-primitives::hardened`** — scalar blinding for DPA resistance
+- **`specter-primitives::range_proof`** — 64-bit bit-decomposition range proof
+- **`specter-core::signer`** — `WalletSigner` trait + `SoftwareSigner` default impl
+- **`specter-net::pq_consensus`** — hybrid ML-DSA-65 consensus vote verification
+- **`specter-cli` hybrid handshake** — X25519 + ML-KEM-768 (FIPS 203)
+- **`specter-blind-sig::dkg::proactive_reshare`** — Herzberg et al. 1995
+- **CI workflow** — cargo check, clippy, test, audit, deny, fuzz-build
+- **`deny.toml`** — cargo-deny config with allowed licenses
+- **Fuzz targets** — 3 new SBT deserialization fuzzers (SpendToken, SbtRequest, OprfEvaluation)
+- **Benchmarks** — Criterion benchmarks for all SBT crypto hot paths
+- **E2E integration tests** — full mint→spend→double-spend lifecycle
+
+### Changed
+
+- `AttestationProvider::verify_report` now REQUIRES `&TcbPolicy` parameter
+- `specter-fold::accumulator`: `TransferStep::Debug` redacts `sig_s`,
+  Schnorr verify uses constant-time `ct_eq`
+- `specter-offline::vdf_rsa`: `evaluate()` capped at `MAX_RSA_VDF_ITERATIONS`,
+  `default_2048()` uses `unreachable!` instead of `expect`
+- `specter-offline::bonds`: withdrawal timestamp uses `checked_add`
+
+### Security — Closed
+
+- Identity-point injection on all SBT wire types (10+ entry points hardened)
+- Zero-nonce edge case in sigma protocol provers (re-draw loop)
+- Session-id replay across mint/spend contexts (session binding + ct_eq)
+- Aggregate public key trust bypass (disjoint-quorum cross-check)
+- Payload-leaking deterministic commitment (client_secret mixing)
+- Error-step leakage in `verify_token` (collapsed into single variant)
+- u32→u64 length-prefix truncation in SHAKE-256 transcripts
+- Variable-time Schnorr verify in specter-fold (switched to ct_eq)
+- Uncapped VDF iterations in specter-offline (DoS vector)
+- Timestamp overflow in bond withdrawal arithmetic (checked_add)
+
+### Test Count
+
+**403 tests across 10 crates, zero failures.**
+
+---
+
+## [eaab68f] — Signed transfer chain (fundamental fold proof fix)
 
 This cycle replaces the unsound Schnorr accumulator with a signed
 transfer chain, completing the residual item left open by the 15-pass

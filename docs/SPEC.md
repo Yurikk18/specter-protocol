@@ -130,7 +130,38 @@ Nullifier-only BFT consensus:
 | Encryption | ChaCha20-Poly1305 | IND-CCA2 |
 | KDF | Argon2id (128 MB, 4 iterations) | Memory-hard |
 
-## 10. Specter Security Framework
+## 10. Symmetric Blind Tokens (SBT)
+
+An alternative issuance path using threshold DH-OPRF (specter-sbt):
+
+1. Client picks payload, derives `(s, r) = HKDF(client_secret, payload)`
+2. Commits `C = g*s + h*r` (Pedersen with NUMS generators)
+3. Blinds `B = H2C(C) * alpha` (alpha random), sends B to mint
+4. Each trustee i computes `B_i = B * k_i` + Chaum-Pedersen DDH proof
+5. Client verifies DDH proofs, Lagrange-combines to get `B*k`, unblinds to `T = P*k`
+6. Client builds TokenProof (Schnorr PoK of commitment opening, bound to aggregate key Y)
+7. Token = `(C, T, proof, session_id)`, nullifier = `SbtNullifier(SHAKE-256("SPECTER-SBT-NULL-v1/" || T))`
+
+**Spend-time verification** (threshold, no pairings):
+- Each validator re-evaluates `T'_i = H2C(C) * k_i` + DDH proof under a fresh spend_session_id
+- Combine to get `T'`, check `T' == T` in constant time
+
+**Security**: unlinkable (random alpha), unforgeable (Gap-CDH), double-spend resistant (deterministic nullifier).
+
+## 10b. AMD SEV-SNP Attestation (specter-tee)
+
+Hardware attestation for validators in confidential VMs:
+
+1. Validator requests report: `Firmware::get_ext_report(user_data = SHA-512(pubkey))`
+2. AMD PSP signs report body with VCEK (ECDSA-P384)
+3. Host returns report + cert table (ARK, ASK, VCEK)
+4. Peer verifies: chain self-check → report signature → user_data binding → TCB policy
+
+**TCB Policy** enforces: minimum firmware version (component-wise), measurement allow-list (SHA-384), max VMPL.
+
+**Platform independence**: `PortableSnpVerifier` uses pure-Rust `crypto_nossl` backend, works on Windows/macOS/Linux.
+
+## 11. Specter Security Framework
 
 ### Deterrence Theorem
 For any adversary with bond B > token value V: E[profit] = V - B - reputation_cost < 0. Double-spending is economically irrational. This is formally stronger than TEE-based prevention, which relies on hardware trust assumptions that have been broken (Spectre, Plundervolt, SGAxe).

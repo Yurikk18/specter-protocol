@@ -2,11 +2,20 @@
 
 ## Overview
 
-The Specter Protocol has undergone multiple rounds of automated Purple Team security auditing covering all 8 crates, every cryptographic operation, and every dependency. This document summarizes the findings and the mitigations applied.
+The Specter Protocol has undergone multiple rounds of automated Purple Team security auditing covering all 10 crates, every cryptographic operation, and every dependency. This document summarizes the findings and the mitigations applied.
 
 **Audit scope**: Full codebase (all `.rs` files, all `Cargo.toml`, all dependencies)
-**Methodology**: Iterative attack-fix-revalidate cycles with parallel Red Team analysis covering cryptographic primitives, proof systems, protocol logic, network layer, credentials, and infrastructure
-**Final state**: 240 tests passing, 0 failures, clean `cargo build --workspace`
+**Methodology**: Iterative attack-fix-revalidate cycles with parallel Red Team analysis covering cryptographic primitives, proof systems, protocol logic, network layer, credentials, TEE attestation, OPRF construction, and infrastructure
+**Final state**: 403 tests passing, 0 failures, 10+ iterative audit passes on specter-sbt (clean), clean `cargo build --workspace`
+
+### Additional Audited Components (2026-04-11/12)
+
+| Component | Audit Passes | Findings Fixed | Status |
+|-----------|-------------|----------------|--------|
+| specter-sbt (Symmetric Blind Tokens) | 10 | 15+ (CRITICAL to INFO) | Clean |
+| specter-tee (AMD SEV-SNP attestation) | 2 | 5 (MEDIUM to LOW) | Clean |
+| specter-fold (signed transfer chain) | 1 (re-audit) | 2 (MEDIUM) | Clean |
+| specter-offline (VDF + bonds) | 1 (re-audit) | 3 (HIGH to MEDIUM) | Clean |
 
 ## Dependency Security Status
 
@@ -23,6 +32,12 @@ The Specter Protocol has undergone multiple rounds of automated Purple Team secu
 | borsh | 1.6.1 | Patched (RUSTSEC-2023-0033 fix included) |
 | num-bigint | 0.4.6 | Patched (GHSA-v935-pqmr-g8v9 fix included) |
 | nova-snark | 0.29 | **Outdated** — optional feature flag, recommend upgrade to 0.71+ |
+| sev (virtee) | 6.3.1 | No known advisories (crypto_nossl backend) |
+| ml-kem | 0.2.1 | No known advisories (FIPS 203 ML-KEM-768) |
+| ml-dsa | 0.1.0-rc.8 | Pre-release (FIPS 204 ML-DSA-65) |
+| p384 | 0.13.1 | No known advisories (SEV-SNP ECDSA verification) |
+| subtle | 2.6.1 | No known advisories (constant-time ops) |
+| bincode | 1.3.3 | No known advisories (SEV-SNP wire format) |
 
 ## Security Architecture
 

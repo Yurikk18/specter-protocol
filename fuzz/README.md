@@ -13,6 +13,9 @@ point that accepts untrusted bytes.
 | `fuzz_wallet_decrypt`        | ChaCha20-Poly1305 AEAD tag verification path  |
 | `fuzz_nullifier_insert`      | HashSet invariants under adversarial input    |
 | `fuzz_verify_presentation`   | anonymous credential presentation verifier    |
+| `fuzz_sbt_spend_token`       | SBT SpendToken bincode deser + validate + nullifier |
+| `fuzz_sbt_request`           | SBT SbtRequest bincode deser + validate       |
+| `fuzz_sbt_evaluation`        | SBT OprfEvaluation bincode deser + validate   |
 
 ## Running
 
@@ -25,6 +28,9 @@ cargo +nightly fuzz run fuzz_ristretto_decompress
 cargo +nightly fuzz run fuzz_wallet_decrypt
 cargo +nightly fuzz run fuzz_nullifier_insert
 cargo +nightly fuzz run fuzz_verify_presentation
+cargo +nightly fuzz run fuzz_sbt_spend_token
+cargo +nightly fuzz run fuzz_sbt_request
+cargo +nightly fuzz run fuzz_sbt_evaluation
 ```
 
 libFuzzer is not supported on Windows — run these on Linux or macOS in CI.
