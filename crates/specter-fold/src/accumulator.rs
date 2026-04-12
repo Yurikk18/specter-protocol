@@ -173,20 +173,20 @@ pub fn owner_pk_hash(pk: &RistrettoPoint) -> [u8; 32] {
 // ─── Chain construction ────────────────────────────────────────────────
 
 /// Create the initial accumulated proof for a freshly minted token.
+///
+/// # Deprecated
+///
+/// This function silently falls back to the identity point if the
+/// `owner_hash` cannot be decompressed as a Ristretto point. The
+/// identity point has discrete log 0, which would make the chain
+/// trivially forgeable. Use [`create_initial_proof_with_pk`] instead,
+/// which takes the genesis owner's public key directly and cannot
+/// produce this dangerous fallback.
+#[deprecated(
+    since = "0.4.0",
+    note = "Use create_initial_proof_with_pk — this function can fall back to identity point (sk=0)."
+)]
 pub fn create_initial_proof(genesis_state: &TransferState) -> AccumulatedProof {
-    // Reconstruct the genesis owner public key from the owner_hash in
-    // the genesis state. For prototyping, the genesis_state carries the
-    // owner_pk bytes directly via owner_hash — see `mint::issue_full`.
-    //
-    // For the initial proof there are no transfer steps to sign yet; the
-    // chain starts empty and the verifier anchors it to `genesis_owner_pk`.
-    //
-    // NOTE: genesis_state.owner_hash is the 32-byte hash of the pk.
-    //       The verifier will compare against `owner_pk_hash(genesis_pk)`.
-    //
-    // For callers that need to supply the pk directly, use
-    // `create_initial_proof_with_pk`.
-    let _ = random_scalar(); // reserve an RNG call so tests don't drift
     AccumulatedProof {
         genesis_owner_pk: genesis_state_owner_pk_or_identity(genesis_state),
         steps_chain: Vec::new(),
@@ -250,8 +250,11 @@ pub fn fold_transfer_signed(
     let prev_owner_pk = prev_owner_signing_sk * G;
 
     // Check: the previous owner must be the current chain tip.
+    // Constant-time comparison for consistency with the verification path.
     let expected_prev = current_proof.current_owner_pk();
-    if prev_owner_pk != expected_prev {
+    if !bool::from(prev_owner_pk.compress().as_bytes()
+        .ct_eq(expected_prev.compress().as_bytes()))
+    {
         return Err(FoldError::PrevOwnerMismatch);
     }
 
@@ -321,18 +324,17 @@ pub fn verify_accumulated_proof(
     // 1. Anchor check: the proof's genesis pk must hash to the anchor
     //    supplied by the caller (in practice the mint signed message).
     let expected_anchor = owner_pk_hash(&proof.genesis_owner_pk);
-    if !bool::from(expected_anchor.ct_eq(&genesis_state.owner_hash)) {
-        return false;
-    }
+    let mut valid = expected_anchor.ct_eq(&genesis_state.owner_hash);
 
-    // 2. Step count consistency.
-    if proof.steps as usize != proof.steps_chain.len() {
-        return false;
-    }
+    // 2. Step count consistency.  Converted to constant-time: compute
+    //    both u8 values and ct_eq them so the branch doesn't leak the
+    //    step-count comparison result via timing.
+    let steps_match: u8 = if proof.steps as usize == proof.steps_chain.len() { 1 } else { 0 };
+    valid &= subtle::Choice::from(steps_match);
 
-    // 3. Walk the chain, verifying each step's Schnorr signature under
-    //    the PREVIOUS owner's public key. The verifier tracks the
-    //    rolling "current pk" from genesis down to the final step.
+    // 3. Walk the chain, verifying EVERY step's Schnorr signature.
+    //    All steps are checked unconditionally — no early return — so
+    //    an attacker cannot learn which step failed from timing.
     let mut current_pk = proof.genesis_owner_pk;
     for (i, step) in proof.steps_chain.iter().enumerate() {
         let step_number = (i as u32) + 1;
@@ -340,12 +342,10 @@ pub fn verify_accumulated_proof(
         let e = transfer_challenge(&step.sig_r, &current_pk, &msg);
         let lhs = step.sig_s * G;
         let rhs = step.sig_r + e * current_pk;
-        if lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).unwrap_u8() == 0 {
-            return false;
-        }
+        valid &= lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes());
         current_pk = step.new_owner_pk;
     }
-    true
+    valid.into()
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────
@@ -379,7 +379,10 @@ fn transfer_challenge(
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
 }
 
 /// Errors during fold operations.

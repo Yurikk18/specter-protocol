@@ -61,11 +61,23 @@ impl NetworkedNode {
     }
 
     /// Transfer a token and publish the nullifier to the network.
+    ///
+    /// Automatically refreshes the credential with fresh blinding so
+    /// successive presentations are cryptographically unlinkable. This
+    /// is safe because the mint's credential issuer is available to
+    /// online nodes.
     pub fn transfer_token(
         &mut self,
         token: ProofCarryingToken,
     ) -> Result<TransferResult, String> {
-        let result = transfer::transfer(token, &mut self.nullifier_set).map_err(|e| e.to_string())?;
+        let mut result = transfer::transfer(token, &mut self.nullifier_set).map_err(|e| e.to_string())?;
+
+        // Re-issue credential with fresh blinding to break
+        // presentation linkability (M2 fix — PASS 2 audit).
+        transfer::refresh_credential(
+            &mut result.token,
+            &self.mint.credential_issuer,
+        );
 
         // Broadcast nullifier via gossip
         self.network.submit_nullifier(result.spent_nullifier);

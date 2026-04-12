@@ -89,10 +89,11 @@ pub trait WalletSigner: Send + Sync {
 /// Stateless Schnorr verification. Exposed as a free function so it
 /// can be reused without instantiating a signer.
 pub fn verify_schnorr(pk: &RistrettoPoint, msg: &[u8], sig: &SchnorrSig) -> bool {
+    use subtle::ConstantTimeEq;
     let e = challenge(&sig.r, pk, msg);
     let lhs = sig.s * G;
     let rhs = sig.r + e * pk;
-    lhs == rhs
+    lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).into()
 }
 
 fn challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8]) -> Scalar {
@@ -105,7 +106,10 @@ fn challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8]) -> Scalar {
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
 }
 
 // ────────────────────────────────────────────────────────────────────

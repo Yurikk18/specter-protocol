@@ -203,6 +203,25 @@ impl Mint {
         // WITHOUT revealing the blinding factor)
         let value_proof = self.pedersen.prove_value(&scalar_from_u64(value), &blinding);
 
+        // Pre-generate credential pool for offline unlinkability.
+        // Each entry uses a fresh blinding factor so successive offline
+        // transfers produce unlinkable presentations.
+        let credential_pool = if let Some(attrs) = attributes {
+            let mut pool = Vec::with_capacity(self.recursion_bound as usize);
+            for _ in 0..self.recursion_bound {
+                let fresh_cred = self.credential_issuer.issue(attrs);
+                let fresh_pres = presentation::create_presentation(
+                    &fresh_cred,
+                    &[presentation::ATTR_KYC_PASSED, presentation::ATTR_NOT_SANCTIONED],
+                    &self.credential_issuer.pedersen,
+                );
+                pool.push((fresh_cred, fresh_pres));
+            }
+            pool
+        } else {
+            Vec::new()
+        };
+
         Ok(ProofCarryingToken {
             token_id,
             value,
@@ -219,6 +238,7 @@ impl Mint {
             presentation: pres,
             vdf_proof,
             bond_owner_id,
+            credential_pool,
         })
     }
 

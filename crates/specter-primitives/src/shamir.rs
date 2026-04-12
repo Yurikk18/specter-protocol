@@ -68,6 +68,14 @@ pub fn split_secret(secret: &Scalar, t: usize, n: usize) -> Result<Vec<Share>, S
             Share { x, y }
         })
         .collect();
+
+    // Zeroize the polynomial coefficients — they are strictly more
+    // sensitive than individual shares (knowing them reconstructs all
+    // shares). The secret itself is coefficients[0].
+    for coeff in &mut coefficients {
+        coeff.zeroize();
+    }
+
     Ok(shares)
 }
 

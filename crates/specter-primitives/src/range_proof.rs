@@ -271,6 +271,7 @@ fn or_challenge(
     a0: &RistrettoPoint,
     a1: &RistrettoPoint,
 ) -> Scalar {
+    use zeroize::Zeroize;
     let hash = Sha512::new()
         .chain_update(b"specter-range-bit-or:")
         .chain_update(commitment.compress().as_bytes())
@@ -279,7 +280,9 @@ fn or_challenge(
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    wide.zeroize();
+    s
 }
 
 #[cfg(test)]

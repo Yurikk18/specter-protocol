@@ -154,6 +154,7 @@ impl Wallet {
         group_public_key: &curve25519_dalek::RistrettoPoint,
         pedersen: &specter_primitives::pedersen::PedersenParams,
         credential_pedersen: &specter_primitives::pedersen::PedersenParams,
+        current_time: u64,
     ) -> Result<Self, WalletError> {
         if data.len() < 36 || &data[0..4] != b"SWLT" {
             return Err(WalletError::InvalidFormat);
@@ -207,13 +208,14 @@ impl Wallet {
             let token = crate::serde_token::deserialize_token(&payload[offset..offset + len])
                 .map_err(|e| WalletError::TokenError(e.to_string()))?;
 
-            // Verify the token before accepting it into the wallet
+            // Verify the token before accepting it into the wallet.
+            // Pass current_time so expired credentials are caught at load.
             let vr = crate::verify::verify_token(
                 &token,
                 group_public_key,
                 pedersen,
                 credential_pedersen,
-                0,
+                current_time,
             );
             if !vr.all_valid() {
                 return Err(WalletError::TokenVerificationFailed);
@@ -404,7 +406,7 @@ mod tests {
     // ─── Save/Load tests ────────────────────────────────────────────
 
     fn load_wallet(mint: &Mint, data: &[u8], pass: &[u8]) -> Result<Wallet, WalletError> {
-        Wallet::load(data, pass, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen)
+        Wallet::load(data, pass, &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0)
     }
 
     #[test]

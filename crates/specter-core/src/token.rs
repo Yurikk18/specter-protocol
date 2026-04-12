@@ -75,6 +75,11 @@ pub struct ProofCarryingToken {
     /// Bond owner ID (hash of the staker's public key).
     /// If present, the token's offline spending is backed by a bond.
     pub bond_owner_id: Option<[u8; 32]>,
+
+    /// Pre-generated credential pool for offline unlinkability.
+    /// Each offline transfer consumes one entry. When empty, the token
+    /// must go online (refresh_credential or renewal) for fresh credentials.
+    pub credential_pool: Vec<(specter_credential::credential::Credential, specter_credential::presentation::Presentation)>,
 }
 
 impl std::fmt::Debug for ProofCarryingToken {
@@ -89,6 +94,7 @@ impl std::fmt::Debug for ProofCarryingToken {
             .field("has_credential", &self.credential.is_some())
             .field("has_vdf", &self.vdf_proof.is_some())
             .field("has_bond", &self.bond_owner_id.is_some())
+            .field("credential_pool_size", &self.credential_pool.len())
             .finish()
     }
 }
@@ -107,7 +113,9 @@ impl ProofCarryingToken {
         let pres = if self.presentation.is_some() { 512 } else { 0 };
         let vdf = if self.vdf_proof.is_some() { 32 + 8 + 32 } else { 0 }; // seed + iterations + output
         let bond = if self.bond_owner_id.is_some() { 32 } else { 0 };
-        base + fold + cred + pres + vdf + bond
+        // Each pool entry: credential (~256 bytes) + presentation (~512 bytes)
+        let pool = 2 + self.credential_pool.len() * (256 + 512);
+        base + fold + cred + pres + vdf + bond + pool
     }
 
     /// Check if the VDF time-lock has expired.
@@ -130,17 +138,26 @@ impl ProofCarryingToken {
         crate::nullifier::compute_nullifier(&self.owner_secret, &self.token_id)
     }
 
-    /// Compute what was signed by the mint: H(token_id || value_commitment).
+    /// Compute what was signed by the mint.
+    ///
+    /// The signed message binds token_id, value_commitment, AND the genesis
+    /// owner's public-key hash (the anchor for the signed transfer chain).
     pub fn signed_message(&self) -> Vec<u8> {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&self.token_id);
-        msg.extend_from_slice(self.value_commitment.compress().as_bytes());
-        msg
+        crate::mint::build_signed_message(
+            &self.token_id,
+            &self.value_commitment,
+            &self.genesis_owner_hash,
+        )
     }
 
     /// Check if the token has a compliance credential attached.
     pub fn has_credential(&self) -> bool {
         self.credential.is_some()
+    }
+
+    /// Returns true if pre-generated offline credentials are available.
+    pub fn has_offline_credentials(&self) -> bool {
+        !self.credential_pool.is_empty()
     }
 }
 
@@ -214,6 +231,7 @@ mod tests {
             presentation: None,
             vdf_proof: None,
             bond_owner_id: None,
+            credential_pool: Vec::new(),
         }
     }
 

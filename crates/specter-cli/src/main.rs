@@ -1136,6 +1136,10 @@ fn load_or_create_wallet(mint: &Mint) -> Wallet {
                 &mint.group_public_key(),
                 &mint.pedersen,
                 &mint.credential_issuer.pedersen,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
             ).unwrap_or_else(|_| {
                 println!("  (Could not load wallet, creating new)");
                 Wallet::new()
@@ -1276,7 +1280,7 @@ fn run_benchmark() {
     println!("Wallet save (50 tokens):       {:?} ({} bytes)", start.elapsed(), saved.len());
 
     let start = Instant::now();
-    let _ = Wallet::load(&saved, b"bench-passphrase-ok", &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen);
+    let _ = Wallet::load(&saved, b"bench-passphrase-ok", &mint.group_public_key(), &mint.pedersen, &mint.credential_issuer.pedersen, 0);
     println!("Wallet load (50 tokens):       {:?}", start.elapsed());
 
     println!("\nToken size (no cred):          {} bytes", serde_token::serialized_size(&tokens[0]));

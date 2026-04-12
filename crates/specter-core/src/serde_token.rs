@@ -162,6 +162,42 @@ pub fn serialize_token(token: &ProofCarryingToken) -> Vec<u8> {
         None => buf.push(0),
     }
 
+    // Credential pool: u16 count, then each entry as credential + presentation blob.
+    let pool_len = token.credential_pool.len() as u16;
+    buf.extend_from_slice(&pool_len.to_le_bytes());
+    for (cred, pres) in &token.credential_pool {
+        // Credential
+        write_point(&mut buf, &cred.commitment);
+        write_scalar(&mut buf, &cred.blinding);
+        buf.push(cred.attributes.kyc_passed as u8);
+        buf.push(cred.attributes.not_sanctioned as u8);
+        let jur = cred.attributes.jurisdiction.as_bytes();
+        buf.push(jur.len() as u8);
+        buf.extend_from_slice(jur);
+        buf.push(cred.attributes.age_over_18 as u8);
+        buf.extend_from_slice(&cred.attributes.expires_at.to_le_bytes());
+        write_scalar(&mut buf, &cred.signature_s);
+        write_scalar(&mut buf, &cred.signature_e);
+        write_point(&mut buf, &cred.issuer_pk);
+
+        // Presentation
+        write_point(&mut buf, &pres.commitment);
+        write_point(&mut buf, &pres.issuer_pk);
+        write_scalar(&mut buf, &pres.cred_signature_s);
+        write_scalar(&mut buf, &pres.cred_signature_e);
+        buf.push(pres.disclosed.len() as u8);
+        for (idx, val) in &pres.disclosed {
+            buf.push(*idx as u8);
+            write_scalar(&mut buf, val);
+        }
+        write_point(&mut buf, &pres.proof_commitment);
+        buf.push(pres.proof_response.len() as u8);
+        for r in &pres.proof_response {
+            write_scalar(&mut buf, r);
+        }
+        write_scalar(&mut buf, &pres.proof_challenge);
+    }
+
     buf
 }
 
@@ -316,6 +352,86 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         None
     };
 
+    // Credential pool: u16 count, then each entry.
+    let credential_pool = if pos + 2 <= data.len() {
+        let pool_count = read_u16(data, &mut pos)? as usize;
+        const MAX_POOL: usize = 10_000;
+        if pool_count > MAX_POOL {
+            return Err(SerdeError::Io(format!(
+                "credential pool count {} exceeds cap {}",
+                pool_count, MAX_POOL
+            )));
+        }
+        let mut pool = Vec::with_capacity(pool_count);
+        for _ in 0..pool_count {
+            // Credential
+            let commitment = read_point(data, &mut pos)?;
+            let blinding = read_scalar(data, &mut pos)?;
+            let kyc_passed = read_u8(data, &mut pos)? != 0;
+            let not_sanctioned = read_u8(data, &mut pos)? != 0;
+            let jur_len = read_u8(data, &mut pos)? as usize;
+            let jur_bytes = read_bytes(data, &mut pos, jur_len)?;
+            let jurisdiction = String::from_utf8_lossy(jur_bytes).to_string();
+            let age_over_18 = read_u8(data, &mut pos)? != 0;
+            let expires_at = read_u64(data, &mut pos)?;
+            let signature_s = read_scalar(data, &mut pos)?;
+            let signature_e = read_scalar(data, &mut pos)?;
+            let issuer_pk = read_point(data, &mut pos)?;
+
+            let cred = Credential {
+                commitment,
+                blinding,
+                attributes: Attributes {
+                    kyc_passed,
+                    not_sanctioned,
+                    jurisdiction,
+                    age_over_18,
+                    expires_at,
+                },
+                signature_s,
+                signature_e,
+                issuer_pk,
+            };
+
+            // Presentation
+            let p_commitment = read_point(data, &mut pos)?;
+            let p_issuer_pk = read_point(data, &mut pos)?;
+            let p_cred_signature_s = read_scalar(data, &mut pos)?;
+            let p_cred_signature_e = read_scalar(data, &mut pos)?;
+            let p_n_disclosed = read_u8(data, &mut pos)? as usize;
+            let mut p_disclosed = Vec::with_capacity(p_n_disclosed);
+            for _ in 0..p_n_disclosed {
+                let idx = read_u8(data, &mut pos)? as usize;
+                let val = read_scalar(data, &mut pos)?;
+                p_disclosed.push((idx, val));
+            }
+            let p_proof_commitment = read_point(data, &mut pos)?;
+            let p_n_responses = read_u8(data, &mut pos)? as usize;
+            let mut p_proof_response = Vec::with_capacity(p_n_responses);
+            for _ in 0..p_n_responses {
+                p_proof_response.push(read_scalar(data, &mut pos)?);
+            }
+            let p_proof_challenge = read_scalar(data, &mut pos)?;
+
+            let pres = Presentation {
+                commitment: p_commitment,
+                issuer_pk: p_issuer_pk,
+                cred_signature_s: p_cred_signature_s,
+                cred_signature_e: p_cred_signature_e,
+                disclosed: p_disclosed,
+                proof_commitment: p_proof_commitment,
+                proof_response: p_proof_response,
+                proof_challenge: p_proof_challenge,
+            };
+
+            pool.push((cred, pres));
+        }
+        pool
+    } else {
+        // Backward compatibility: old format without credential pool.
+        Vec::new()
+    };
+
     Ok(ProofCarryingToken {
         token_id,
         value,
@@ -339,6 +455,7 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
         presentation,
         vdf_proof,
         bond_owner_id,
+        credential_pool,
     })
 }
 
@@ -349,15 +466,14 @@ pub fn deserialize_token(data: &[u8]) -> Result<ProofCarryingToken, SerdeError> 
 /// transfer protocol. This avoids cloning the token (which is deliberately
 /// non-Clone as a bearer instrument).
 ///
-/// Offsets are derived from the `serialize_token` layout — keep these
-/// constants in sync with any change to the wire format. A previous version
-/// of this function computed CRED_FLAG_OFFSET incorrectly (missing
-/// fold.genesis_state_hash and token.genesis_owner_hash) which left the
-/// credential blinding factor un-redacted.
+/// Credential flag offset is computed DYNAMICALLY from the actual fold
+/// chain length rather than using a hardcoded constant.  The signed
+/// transfer chain has variable length (96 bytes per step), so any fixed
+/// offset is wrong for all but one specific step count.
 pub fn serialize_token_public(token: &ProofCarryingToken) -> Vec<u8> {
     let mut buf = serialize_token(token);
 
-    // Layout (byte offsets):
+    // Layout (byte offsets) — fixed prefix:
     //   0    MAGIC(4)
     //   4    VERSION(1)
     //   5    token_id(32)
@@ -371,36 +487,34 @@ pub fn serialize_token_public(token: &ProofCarryingToken) -> Vec<u8> {
     //   237  hash_chain_head(32)
     //   269  transfer_count(4)
     //   273  recursion_bound(4)
-    //   277  fold_s(32)
-    //   309  fold_e(32)
-    //   341  fold_r(32)
-    //   373  fold_pk(32)
-    //   405  fold_state_hash(32)
-    //   437  fold_pk_chain_hash(32)
-    //   469  fold_genesis_state_hash(32)
-    //   501  fold_current_owner_hash(32)   <-- new in v3 schema
-    //   533  fold_steps(4)
-    //   537  genesis_owner_hash(32)
-    //   569  credential_flag(1)            <-- CRED_FLAG_OFFSET
-    //   570  credential.commitment(32) (if flag == 1)
-    //   602  credential.blinding(32) (if flag == 1)  <-- zeroed
+    // --- variable-length fold section ---
+    //   277  genesis_owner_pk(32)
+    //   309  fold_steps(4)
+    //   313  N * (new_owner_pk(32) + sig_r(32) + sig_s(32))  [96 per step]
+    //   313 + N*96  genesis_owner_hash(32)
+    //   345 + N*96  credential_flag(1)     <-- dynamic CRED_FLAG_OFFSET
+    //   346 + N*96  credential.commitment(32) (if flag == 1)
+    //   378 + N*96  credential.blinding(32) (if flag == 1)  <-- zeroed
     const OWNER_SECRET_OFFSET: usize = 4 + 1 + 32 + 8 + 32 + 32 + 32 + 32 + 32;
-    debug_assert_eq!(OWNER_SECRET_OFFSET, 205);
+    assert_eq!(OWNER_SECRET_OFFSET, 205);
     if buf.len() >= OWNER_SECRET_OFFSET + 32 {
         buf[OWNER_SECRET_OFFSET..OWNER_SECRET_OFFSET + 32].fill(0);
     }
-    // From OWNER_SECRET_OFFSET to credential flag:
-    // owner_secret(32) + hash_chain_head(32) + transfer_count(4) + recursion_bound(4)
-    // + fold_s(32) + fold_e(32) + fold_r(32) + fold_pk(32) + fold_state_hash(32)
-    // + fold_pk_chain_hash(32) + fold_genesis_state_hash(32)
-    // + fold_current_owner_hash(32) + fold_steps(4) + genesis_owner_hash(32)
-    // = 364
-    const CRED_FLAG_OFFSET: usize = OWNER_SECRET_OFFSET
-        + 32 + 32 + 4 + 4
-        + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 4 + 32;
-    debug_assert_eq!(CRED_FLAG_OFFSET, 569);
-    if buf.len() > CRED_FLAG_OFFSET && buf[CRED_FLAG_OFFSET] == 1 {
-        let blinding_offset = CRED_FLAG_OFFSET + 1 + 32; // skip flag + commitment
+
+    // Compute credential flag offset dynamically based on actual fold chain length.
+    let fold_steps = token.fold_proof.steps as usize;
+    let cred_flag_offset: usize = OWNER_SECRET_OFFSET
+        + 32  // owner_secret (already zeroed above)
+        + 32  // hash_chain_head
+        + 4   // transfer_count
+        + 4   // recursion_bound
+        + 32  // genesis_owner_pk
+        + 4   // fold_steps (u32)
+        + fold_steps * 96  // per-step: new_owner_pk(32) + sig_r(32) + sig_s(32)
+        + 32; // genesis_owner_hash
+
+    if buf.len() > cred_flag_offset && buf[cred_flag_offset] == 1 {
+        let blinding_offset = cred_flag_offset + 1 + 32; // skip flag + commitment
         if buf.len() >= blinding_offset + 32 {
             buf[blinding_offset..blinding_offset + 32].fill(0);
         }
@@ -438,6 +552,11 @@ fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8
 fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8, SerdeError> {
     let bytes = read_bytes(data, pos, 1)?;
     Ok(bytes[0])
+}
+
+fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16, SerdeError> {
+    let bytes = read_bytes(data, pos, 2)?;
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, SerdeError> {
@@ -702,18 +821,23 @@ mod tests {
         println!("Basic token size: {} bytes", basic_size);
         assert!(basic_size > 300 && basic_size < 800, "basic size = {}", basic_size);
 
-        // Full token (credential + VDF + bond)
+        // Full token (credential + VDF + bond + pre-generated credential pool)
+        // The credential pool contains `recursion_bound` (20) pre-generated
+        // credential+presentation pairs for offline unlinkability, adding
+        // ~560 bytes per entry.
         let full = mint
             .issue_full(1000, &[1, 2], Some(&test_attrs()), Some(50), Some([1u8; 32]))
             .unwrap();
         let full_size = serialized_size(&full);
         println!("Full token size:  {} bytes", full_size);
-        assert!(full_size > basic_size && full_size < 2200);
+        assert!(full_size > basic_size && full_size < 15000, "full size = {}", full_size);
 
-        // After 10 transfers: each transfer adds PER_STEP_BYTES.
+        // After 10 transfers: each transfer adds PER_STEP_BYTES to the fold
+        // chain but also consumes one credential_pool entry (reducing size).
+        // Use a no-credential token to isolate fold growth measurement.
         let mut ns = crate::nullifier::NullifierSet::new();
         let mut transferred = mint
-            .issue_full(1000, &[1, 2], Some(&test_attrs()), Some(50), Some([1u8; 32]))
+            .issue_full(1000, &[1, 2], None, Some(50), Some([1u8; 32]))
             .unwrap();
         let start_size = serialized_size(&transferred);
         for _ in 0..10 {

@@ -106,7 +106,10 @@ fn hash_credential_challenge(
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
 }
 
 #[cfg(test)]

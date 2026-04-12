@@ -81,11 +81,19 @@ impl RsaVdfParams {
 /// Evaluate the RSA VDF: compute y = x^(2^T) mod N by repeated squaring.
 ///
 /// This is intentionally sequential and cannot be parallelized.
-pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> RsaVdfProof {
-    assert!(
-        iterations <= MAX_RSA_VDF_ITERATIONS,
-        "evaluate: iterations ({iterations}) exceeds cap ({MAX_RSA_VDF_ITERATIONS})"
-    );
+pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> Result<RsaVdfProof, VdfRsaError> {
+    if iterations == 0 {
+        return Err(VdfRsaError::ZeroIterations);
+    }
+    if iterations > MAX_RSA_VDF_ITERATIONS {
+        return Err(VdfRsaError::IterationsExceeded {
+            requested: iterations,
+            max: MAX_RSA_VDF_ITERATIONS,
+        });
+    }
+    if input <= &BigUint::from(1u64) {
+        return Err(VdfRsaError::DegenerateInput);
+    }
     let n = &params.modulus;
 
     // Compute y = x^(2^T) mod N
@@ -101,17 +109,30 @@ pub fn evaluate(params: &RsaVdfParams, input: &BigUint, iterations: u64) -> RsaV
     // We compute this by tracking the quotient during repeated squaring
     let pi = compute_wesolowski_proof(params, input, iterations, &challenge_l);
 
-    RsaVdfProof {
+    Ok(RsaVdfProof {
         input: input.clone(),
         output: y,
         iterations,
         proof_pi: pi,
         challenge_l,
-    }
+    })
 }
 
 /// Maximum allowed iterations for RSA VDF verification.
 pub const MAX_RSA_VDF_ITERATIONS: u64 = 10_000_000;
+
+/// Errors for RSA VDF operations.
+#[derive(Debug, thiserror::Error)]
+pub enum VdfRsaError {
+    #[error("iterations ({requested}) exceeds maximum ({max})")]
+    IterationsExceeded { requested: u64, max: u64 },
+
+    #[error("zero iterations provide no time-lock guarantee")]
+    ZeroIterations,
+
+    #[error("degenerate input (0 or 1) has trivially known output")]
+    DegenerateInput,
+}
 
 /// Verify a VDF proof using Wesolowski's verification.
 ///
@@ -295,7 +316,7 @@ mod tests {
     fn test_rsa_vdf_evaluate_and_verify() {
         let params = small_params();
         let input = BigUint::from(42u64);
-        let proof = evaluate(&params, &input, 100);
+        let proof = evaluate(&params, &input, 100).unwrap();
         assert!(verify(&params, &proof));
     }
 
@@ -303,16 +324,16 @@ mod tests {
     fn test_rsa_vdf_deterministic() {
         let params = small_params();
         let input = BigUint::from(42u64);
-        let p1 = evaluate(&params, &input, 50);
-        let p2 = evaluate(&params, &input, 50);
+        let p1 = evaluate(&params, &input, 50).unwrap();
+        let p2 = evaluate(&params, &input, 50).unwrap();
         assert_eq!(p1.output, p2.output);
     }
 
     #[test]
     fn test_rsa_vdf_different_inputs() {
         let params = small_params();
-        let p1 = evaluate(&params, &BigUint::from(10u64), 50);
-        let p2 = evaluate(&params, &BigUint::from(20u64), 50);
+        let p1 = evaluate(&params, &BigUint::from(10u64), 50).unwrap();
+        let p2 = evaluate(&params, &BigUint::from(20u64), 50).unwrap();
         assert_ne!(p1.output, p2.output);
     }
 
@@ -320,7 +341,7 @@ mod tests {
     fn test_rsa_vdf_tampered_output_fails() {
         let params = small_params();
         let input = BigUint::from(42u64);
-        let mut proof = evaluate(&params, &input, 50);
+        let mut proof = evaluate(&params, &input, 50).unwrap();
         proof.output += BigUint::one();
         assert!(!verify(&params, &proof));
     }
@@ -329,7 +350,7 @@ mod tests {
     fn test_rsa_vdf_tampered_proof_fails() {
         let params = small_params();
         let input = BigUint::from(42u64);
-        let mut proof = evaluate(&params, &input, 50);
+        let mut proof = evaluate(&params, &input, 50).unwrap();
         proof.proof_pi += BigUint::one();
         assert!(!verify(&params, &proof));
     }
@@ -345,7 +366,7 @@ mod tests {
         let x4 = (&x2 * &x2) % n;
         let x8 = (&x4 * &x4) % n;
 
-        let proof = evaluate(&params, &input, 3);
+        let proof = evaluate(&params, &input, 3).unwrap();
         assert_eq!(proof.output, x8);
     }
 
@@ -354,7 +375,7 @@ mod tests {
         // Verify should be much faster than evaluate for large T
         let params = small_params();
         let input = BigUint::from(42u64);
-        let proof = evaluate(&params, &input, 1000);
+        let proof = evaluate(&params, &input, 1000).unwrap();
         // Verification doesn't repeat 1000 squarings - it's O(log T)
         assert!(verify(&params, &proof));
     }

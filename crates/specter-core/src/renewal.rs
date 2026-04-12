@@ -27,7 +27,7 @@ pub struct RenewalResult {
 /// 3. Issues a fresh token with the same value
 /// 4. Returns the new token and the old nullifier for publication
 pub fn renew_token(
-    old_token: &ProofCarryingToken,
+    old_token: ProofCarryingToken,
     mint: &Mint,
     signers: &[SignerId],
     nullifier_set: &mut NullifierSet,
@@ -41,7 +41,7 @@ pub fn renew_token(
     // secret, fold proof, credential) could be substituted. Enforce all
     // integrity checks before issuing a replacement.
     let vr = verify::verify_token(
-        old_token,
+        &old_token,
         &mint.group_public_key(),
         &mint.pedersen,
         &mint.credential_issuer.pedersen,
@@ -137,9 +137,9 @@ mod tests {
         }
         assert!(current.needs_renewal());
 
-        // Renew
+        // Renew (consumes the token by value — move semantics)
         let mut nullifier_set = NullifierSet::new();
-        let result = renew_token(&current, &mint, &[1, 2], &mut nullifier_set).unwrap();
+        let result = renew_token(current, &mint, &[1, 2], &mut nullifier_set).unwrap();
 
         // New token has reset transfer count
         assert_eq!(result.new_token.transfer_count, 0);
@@ -162,7 +162,7 @@ mod tests {
         }
 
         let mut renew_ns = NullifierSet::new();
-        let result = renew_token(&current, &mint, &[1, 3], &mut renew_ns).unwrap();
+        let result = renew_token(current, &mint, &[1, 3], &mut renew_ns).unwrap();
 
         // Can transfer the renewed token
         let mut transfer_ns = NullifierSet::new();
@@ -181,11 +181,16 @@ mod tests {
             current = transfer::transfer(current, &mut transfer_ns).unwrap().token;
         }
 
-        let mut ns = NullifierSet::new();
-        renew_token(&current, &mint, &[1, 2], &mut ns).unwrap();
+        // Serialize before first renewal so we can simulate a copy attempt
+        let serialized = crate::serde_token::serialize_token(&current);
 
-        // Second renewal of the same token should fail
-        let result = renew_token(&current, &mint, &[1, 2], &mut ns);
+        let mut ns = NullifierSet::new();
+        renew_token(current, &mint, &[1, 2], &mut ns).unwrap();
+
+        // Deserialize the "copy" and attempt a second renewal — must fail
+        // because the nullifier was already inserted by the first renewal.
+        let copy = crate::serde_token::deserialize_token(&serialized).unwrap();
+        let result = renew_token(copy, &mint, &[1, 2], &mut ns);
         assert!(result.is_err());
     }
 
@@ -201,7 +206,7 @@ mod tests {
         }
 
         let mut ns = NullifierSet::new();
-        let result = renew_token(&current, &mint, &[1, 2], &mut ns).unwrap();
+        let result = renew_token(current, &mint, &[1, 2], &mut ns).unwrap();
 
         let vr = verify::verify_token(
             &result.new_token,

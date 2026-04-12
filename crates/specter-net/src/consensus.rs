@@ -130,21 +130,33 @@ impl Drop for ValidatorKey {
 /// vote in view M. Previously this defaulted to view=0, making the
 /// anti-replay binding a no-op.
 pub fn verify_vote_signature(vote: &Vote, voter_pubkey: &RistrettoPoint) -> bool {
+    use subtle::ConstantTimeEq;
     let msg = vote_message(vote.voter, vote.block_height, &vote.block_hash, vote.approve, vote.view);
     let e = vote_challenge(&vote.signature.r, voter_pubkey, &msg);
     let lhs = vote.signature.s * G;
     let rhs = vote.signature.r + e * voter_pubkey;
-    lhs == rhs
+    lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).into()
+}
+
+/// Canonical vote byte construction shared by both the classical Schnorr
+/// path and the post-quantum hybrid path (`pq_consensus`).
+///
+/// The domain tag `b"specter-hybrid-vote:"` is included so that classical
+/// and hybrid signatures cover identical bytes, preventing an attacker from
+/// reusing a classical signature for a different logical vote.
+pub fn canonical_vote_bytes(voter: NodeId, height: u64, hash: &[u8; 32], approve: bool, view: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8 + 8 + 8 + 32 + 1 + 20);
+    msg.extend_from_slice(b"specter-hybrid-vote:");
+    msg.extend_from_slice(&voter.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(&view.to_le_bytes());
+    msg.extend_from_slice(hash);
+    msg.push(if approve { 1 } else { 0 });
+    msg
 }
 
 fn vote_message(voter: NodeId, height: u64, hash: &[u8; 32], approve: bool, view: u64) -> Vec<u8> {
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&voter.to_le_bytes());
-    msg.extend_from_slice(&height.to_le_bytes());
-    msg.extend_from_slice(hash);
-    msg.push(if approve { 1 } else { 0 });
-    msg.extend_from_slice(&view.to_le_bytes()); // prevent cross-view replay
-    msg
+    canonical_vote_bytes(voter, height, hash, approve, view)
 }
 
 fn vote_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8]) -> Scalar {
@@ -156,7 +168,20 @@ fn vote_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8]) -> Scalar
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
+}
+
+/// Controls whether the consensus layer enforces production-grade
+/// BFT requirements (n >= 4) or allows relaxed testing configurations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsensusMode {
+    /// Enforces n >= 4 validators (BFT fault tolerance).
+    Production,
+    /// Allows any validator count (for tests and local dev).
+    Test,
 }
 
 /// The consensus state machine.
@@ -180,16 +205,23 @@ pub struct ConsensusState {
 
 impl ConsensusState {
     /// Create a new consensus state.
+    ///
+    /// In [`ConsensusMode::Production`], at least 4 validators are required
+    /// for BFT fault tolerance (n >= 3f+1 with f >= 1).
+    /// In [`ConsensusMode::Test`], any validator count >= 1 is accepted.
     pub fn new(
         node_id: NodeId,
         validators: Vec<NodeId>,
         validator_keys: HashMap<NodeId, RistrettoPoint>,
+        mode: ConsensusMode,
     ) -> Result<Self, ConsensusError> {
         let n = validators.len();
         // BFT requires n >= 3f+1 with f >= 1, so minimum n = 4 for any fault tolerance.
-        // n < 4 is allowed for testing but provides ZERO fault tolerance (logged as warning).
         if n < 1 {
-            return Err(ConsensusError::InsufficientValidators { min: 1, got: 0 });
+            return Err(ConsensusError::InsufficientValidators { min: 4, got: 0 });
+        }
+        if mode == ConsensusMode::Production && n < 4 {
+            return Err(ConsensusError::InsufficientValidators { min: 4, got: n });
         }
         let max_faults = (n - 1) / 3;
         let quorum_size = if n < 4 {
@@ -398,14 +430,14 @@ mod tests {
     #[test]
     fn test_leader_rotation() {
         let (_, ids, pks) = setup_validators();
-        let state = ConsensusState::new(1, ids, pks).unwrap();
+        let state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         assert_eq!(state.current_leader(), 1);
     }
 
     #[test]
     fn test_quorum_size() {
         let (_, ids, pks) = setup_validators();
-        let state = ConsensusState::new(1, ids, pks).unwrap();
+        let state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         assert_eq!(state.total_validators, 4);
         assert_eq!(state.quorum_size, 3);
     }
@@ -413,7 +445,7 @@ mod tests {
     #[test]
     fn test_propose_as_leader() {
         let (_, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         state.submit_nullifier([42u8; 32]);
         let block = state.propose_block().unwrap();
         assert_eq!(block.height, 0);
@@ -423,14 +455,14 @@ mod tests {
     #[test]
     fn test_propose_as_non_leader_fails() {
         let (_, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(2, ids, pks).unwrap();
+        let mut state = ConsensusState::new(2, ids, pks, ConsensusMode::Test).unwrap();
         assert!(state.propose_block().is_err());
     }
 
     #[test]
     fn test_authenticated_vote_and_commit() {
         let (keys, ids, pks) = setup_validators();
-        let mut node1 = ConsensusState::new(1, ids, pks).unwrap();
+        let mut node1 = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
 
         node1.submit_nullifier([42u8; 32]);
         let block = node1.propose_block().unwrap();
@@ -454,7 +486,7 @@ mod tests {
     #[test]
     fn test_forged_vote_rejected() {
         let (_, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
 
         // Forge a vote with a random key (not a registered validator's key)
         let fake_key = ValidatorKey::generate(99);
@@ -467,7 +499,7 @@ mod tests {
     #[test]
     fn test_tampered_vote_rejected() {
         let (keys, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
 
         let mut vote = keys[0].sign_vote(0, &[0u8; 32], true, state.view);
         // Tamper with the approve flag
@@ -480,7 +512,7 @@ mod tests {
     #[test]
     fn test_duplicate_vote_rejected() {
         let (keys, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
 
         state.submit_nullifier([42u8; 32]);
         let block = state.propose_block().unwrap();
@@ -496,7 +528,7 @@ mod tests {
     #[test]
     fn test_insufficient_votes_no_commit() {
         let (keys, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
 
         state.submit_nullifier([42u8; 32]);
         let block = state.propose_block().unwrap();
@@ -512,7 +544,7 @@ mod tests {
     fn test_cross_view_vote_rejected() {
         // A vote signed for view 0 must NOT be accepted after a view change.
         let (keys, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         state.submit_nullifier([42u8; 32]);
         let block = state.propose_block().unwrap();
 
@@ -538,7 +570,7 @@ mod tests {
     #[test]
     fn test_equivocation_detected() {
         let (_, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         let block_a = NullifierBlock::new(0, 1, vec![[1u8; 32]], [0u8; 32]);
         let block_b = NullifierBlock::new(0, 1, vec![[2u8; 32]], [0u8; 32]);
 
@@ -555,7 +587,7 @@ mod tests {
     #[test]
     fn test_view_change_resets_votes() {
         let (keys, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         state.submit_nullifier([9u8; 32]);
         let block = state.propose_block().unwrap();
 
@@ -577,7 +609,7 @@ mod tests {
     #[test]
     fn test_block_hash_integrity_enforced() {
         let (_, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         let mut block = NullifierBlock::new(0, 1, vec![[3u8; 32]], [0u8; 32]);
         block.hash[0] ^= 0x01; // tamper
         let err = state.try_commit(&block).unwrap_err();
@@ -590,7 +622,7 @@ mod tests {
     #[test]
     fn test_view_change() {
         let (_, ids, pks) = setup_validators();
-        let mut state = ConsensusState::new(1, ids, pks).unwrap();
+        let mut state = ConsensusState::new(1, ids, pks, ConsensusMode::Test).unwrap();
         assert_eq!(state.current_leader(), 1);
 
         state.trigger_view_change();

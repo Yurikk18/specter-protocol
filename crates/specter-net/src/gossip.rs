@@ -81,8 +81,8 @@ pub fn verify_nullifier_broadcast(
     let e = nullifier_sig_challenge(&r, public_key, nullifier, sender);
     let lhs = s * G;
     let rhs = r + e * public_key;
-    // RistrettoPoint PartialEq in dalek 4.x delegates to ConstantTimeEq
-    lhs == rhs
+    use subtle::ConstantTimeEq;
+    lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).into()
 }
 
 /// Hash function for nullifier broadcast challenge.
@@ -101,7 +101,10 @@ fn nullifier_sig_challenge(
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
 }
 
 /// A gossip layer that propagates authenticated nullifiers across the network.
@@ -202,10 +205,12 @@ impl GossipProtocol {
             return Ok(false); // already known
         }
 
-        // Re-broadcast to peers except the sender
+        // Re-broadcast to peers except the sender.
+        // Preserve the ORIGINAL sender ID so downstream peers can verify
+        // the signature (the sig was computed by `from`, not by us).
         let msg = Message::NullifierBroadcast {
             nullifier,
-            sender: self.node_id,
+            sender: from,
             signature_r: *signature_r,
             signature_s: *signature_s,
         };

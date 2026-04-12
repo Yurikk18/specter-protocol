@@ -46,9 +46,35 @@ impl Drop for SignerSession {
 /// Standard blind Schnorr is vulnerable to the Wagner/ROS attack when
 /// multiple sessions are open concurrently. This wrapper ensures only
 /// one session can be active at a time, closing the attack surface.
+///
+/// The session lifecycle is tied to a [`SessionGuard`] RAII handle.
+/// While the guard is alive, the borrow checker prevents opening a
+/// second session (the guard holds `&mut self`). When the guard is
+/// dropped (by explicit drop, scope exit, or panic unwind), the
+/// session is automatically marked inactive.
 pub struct RateLimitedSigner {
     keypair: SignerKeypair,
     session_active: bool,
+}
+
+/// RAII guard that automatically releases the session on drop.
+///
+/// Holds a mutable borrow on the [`RateLimitedSigner`], so the Rust
+/// borrow checker prevents opening a second session while this guard
+/// is alive. Dropping the guard (explicitly or via scope exit/panic)
+/// marks the session as inactive.
+pub struct SessionGuard<'a> {
+    signer: &'a mut RateLimitedSigner,
+    /// The session state (contains the secret nonce k).
+    pub session: SignerSession,
+    /// The signer's nonce commitment R = k * G (sent to the requester).
+    pub commitment: RistrettoPoint,
+}
+
+impl<'a> Drop for SessionGuard<'a> {
+    fn drop(&mut self) {
+        self.signer.session_active = false;
+    }
 }
 
 impl RateLimitedSigner {
@@ -58,17 +84,28 @@ impl RateLimitedSigner {
     }
 
     /// Start a new session. Returns None if a session is already active.
-    pub fn new_session(&mut self) -> Option<(SignerSession, RistrettoPoint)> {
+    ///
+    /// The returned [`SessionGuard`] holds `&mut self`, so the borrow
+    /// checker prevents a second call while the guard exists. The guard
+    /// automatically releases the session on drop.
+    pub fn new_session(&mut self) -> Option<SessionGuard<'_>> {
         if self.session_active {
             return None; // ROS protection: only one session at a time
         }
         self.session_active = true;
         let k = random_scalar();
         let r = k * G;
-        Some((SignerSession { k }, r))
+        Some(SessionGuard {
+            signer: self,
+            session: SignerSession { k },
+            commitment: r,
+        })
     }
 
     /// Complete the session (must be called after respond).
+    ///
+    /// Prefer dropping the [`SessionGuard`] instead of calling this
+    /// directly. This method exists for backward compatibility.
     pub fn end_session(&mut self) {
         self.session_active = false;
     }
@@ -225,6 +262,7 @@ pub fn verify(pk: &RistrettoPoint, message: &[u8], sig: &BlindSignature) -> bool
 /// an adversary forges PK' such that a valid signature for PK also
 /// verifies under PK'. This is critical in multi-issuer deployments.
 fn hash_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, message: &[u8]) -> Scalar {
+    use zeroize::Zeroize;
     let hash = Sha512::new()
         .chain_update(b"specter-blind-sig-challenge:")
         .chain_update(r.compress().as_bytes())
@@ -234,7 +272,9 @@ fn hash_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, message: &[u8]) -> Sc
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    wide.zeroize();
+    s
 }
 
 #[cfg(test)]
@@ -365,22 +405,21 @@ mod tests {
         let kp = SignerKeypair::generate();
         let mut signer = RateLimitedSigner::new(kp);
 
-        // First session opens.
-        let first = signer.new_session();
-        assert!(first.is_some(), "first session must succeed");
+        {
+            // First session opens.
+            let first = signer.new_session();
+            assert!(first.is_some(), "first session must succeed");
+            // SessionGuard holds &mut signer — second session cannot even
+            // be attempted while the guard is alive (borrow checker).
+            // Drop the guard to release the session.
+        }
 
-        // Second concurrent session must be rejected.
+        // After guard drop, a new session is allowed.
         let second = signer.new_session();
-        assert!(second.is_none(), "concurrent session must be rejected");
-
-        // Close first — third session now allowed.
-        drop(first);
-        signer.end_session();
-        let third = signer.new_session();
-        assert!(third.is_some(), "session after end_session must succeed");
+        assert!(second.is_some(), "session after guard drop must succeed");
     }
 
-    /// Many sequential sessions interleaved with end_session all succeed.
+    /// Many sequential sessions via RAII guards all succeed.
     /// This locks in the "one at a time, but no artificial limit on the
     /// total" invariant.
     #[test]
@@ -390,14 +429,14 @@ mod tests {
         for _ in 0..100 {
             let s = signer.new_session();
             assert!(s.is_some());
-            drop(s);
-            signer.end_session();
+            // Guard drops at end of loop iteration → session released.
         }
     }
 
-    /// Thread-based concurrency test: two threads race to open a session.
-    /// Exactly one must win any given round. We use an `Arc<Mutex<>>`
-    /// wrapper since RateLimitedSigner itself is `&mut`-based.
+    /// Thread-based concurrency test: threads race to acquire + release
+    /// the signer session via Mutex + RAII guard. Each thread opens a
+    /// session, uses it, and lets the guard drop — proving that the
+    /// RAII cleanup works correctly under contention.
     #[test]
     fn test_rate_limited_signer_parallel_contention() {
         use std::sync::{Arc, Mutex};
@@ -406,29 +445,22 @@ mod tests {
         let kp = SignerKeypair::generate();
         let signer = Arc::new(Mutex::new(RateLimitedSigner::new(kp)));
 
-        // Open the single session.
-        let _session = {
-            let mut g = signer.lock().unwrap();
-            g.new_session().unwrap()
-        };
-
-        // Spawn contenders — all must observe the "busy" state and get
-        // None back.
+        // Spawn contenders — each acquires the Mutex, opens a session
+        // (guard drops at end of block → session released), and yields.
+        // All must succeed because the guard auto-releases.
         let mut handles = Vec::new();
         for _ in 0..8 {
             let s = Arc::clone(&signer);
             handles.push(thread::spawn(move || {
                 let mut g = s.lock().unwrap();
-                g.new_session().is_none()
+                let guard = g.new_session();
+                assert!(guard.is_some(), "session must succeed under mutex");
+                // guard drops here → session_active = false
             }));
         }
 
-        let all_blocked = handles
-            .into_iter()
-            .all(|h| h.join().unwrap());
-        assert!(
-            all_blocked,
-            "all contending threads must be blocked while a session is open"
-        );
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

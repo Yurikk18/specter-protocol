@@ -2192,6 +2192,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "sha3 0.10.8",
+ "subtle",
  "thiserror 2.0.18",
  "zeroize",
 ]

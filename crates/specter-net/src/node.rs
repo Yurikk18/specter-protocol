@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::consensus::{ConsensusState, ValidatorKey, Vote};
+use crate::consensus::{ConsensusMode, ConsensusState, ValidatorKey, Vote};
 use crate::gossip::GossipProtocol;
 use crate::protocol::NodeId;
 
@@ -29,7 +29,7 @@ impl NetworkNode {
         Self {
             id,
             gossip: GossipProtocol::new(id, peers),
-            consensus: ConsensusState::new(id, all_validators, all_pubkeys)
+            consensus: ConsensusState::new(id, all_validators, all_pubkeys, ConsensusMode::Test)
                 .expect("valid consensus params"),
             validator_key: own_key,
         }

@@ -822,6 +822,7 @@ pub const SBT_KDF_TAG: &[u8] = b"SPECTER-SBT-KDF-v2/";
 /// property: without it, `(s, r)` and thus `C` would be a public
 /// function of the payload alone, defeating hiding.
 fn derive_scalar(domain: &'static [u8], client_secret: &[u8; 32], payload: &[u8]) -> Scalar {
+    use zeroize::Zeroize;
     let mut h = Shake256::default();
     h.update(SBT_KDF_TAG);
     h.update(&(domain.len() as u64).to_be_bytes());
@@ -832,7 +833,9 @@ fn derive_scalar(domain: &'static [u8], client_secret: &[u8; 32], payload: &[u8]
     h.update(payload);
     let mut buf = [0u8; 64];
     h.finalize_xof().read(&mut buf);
-    Scalar::from_bytes_mod_order_wide(&buf)
+    let s = Scalar::from_bytes_mod_order_wide(&buf);
+    buf.zeroize();
+    s
 }
 
 #[cfg(test)]

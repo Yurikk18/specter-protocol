@@ -152,6 +152,7 @@ pub fn verify_presentation(
     let r_prime = presentation.cred_signature_s * G
         - presentation.cred_signature_e * presentation.issuer_pk;
     let expected_e = {
+        use zeroize::Zeroize;
         let hash = Sha512::new()
             .chain_update(b"specter-credential-sig:")
             .chain_update(r_prime.compress().as_bytes())
@@ -160,7 +161,9 @@ pub fn verify_presentation(
             .finalize();
         let mut wide = [0u8; 64];
         wide.copy_from_slice(&hash);
-        Scalar::from_bytes_mod_order_wide(&wide)
+        let s = Scalar::from_bytes_mod_order_wide(&wide);
+        wide.zeroize();
+        s
     };
     if !bool::from(expected_e.as_bytes().ct_eq(presentation.cred_signature_e.as_bytes())) {
         return false;
@@ -236,7 +239,10 @@ fn hash_presentation_challenge(
     let hash = hasher.finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    use zeroize::Zeroize;
+    wide.zeroize();
+    s
 }
 
 #[cfg(test)]

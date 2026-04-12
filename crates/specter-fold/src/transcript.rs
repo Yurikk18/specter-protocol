@@ -38,6 +38,7 @@ impl Transcript {
     /// Squeeze a scalar challenge from the transcript.
     pub fn challenge(&mut self, label: &[u8]) -> Scalar {
         self.hasher.update(b"challenge:");
+        self.hasher.update(&(label.len() as u64).to_le_bytes());
         self.hasher.update(label);
         // Clone the state so we can continue absorbing after squeezing
         let mut reader = self.hasher.clone().finalize_xof();
@@ -51,6 +52,7 @@ impl Transcript {
     /// Squeeze raw bytes from the transcript.
     pub fn squeeze_bytes(&mut self, label: &[u8], output: &mut [u8]) {
         self.hasher.update(b"squeeze:");
+        self.hasher.update(&(label.len() as u64).to_le_bytes());
         self.hasher.update(label);
         let mut reader = self.hasher.clone().finalize_xof();
         reader.read(output);

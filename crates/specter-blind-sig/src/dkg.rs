@@ -100,10 +100,11 @@ pub fn verify_pok(
     commitment_0: &RistrettoPoint,
     pok: &ProofOfKnowledge,
 ) -> bool {
+    use subtle::ConstantTimeEq;
     let e = hash_dkg_pok(id, commitment_0, &pok.r);
     let lhs = pok.s * G;
     let rhs = pok.r + e * commitment_0;
-    lhs == rhs
+    lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).into()
 }
 
 /// Round 2: Each participant computes shares for every other participant.
@@ -173,10 +174,13 @@ pub fn dkg_round3(
         }
 
         // Expected: share * G == sum(x_i^k * C_{sender,k})
+        use subtle::ConstantTimeEq;
         let expected = evaluate_poly_points(sender_commitments, &x_i);
         let actual = share * G;
 
-        if actual != expected {
+        if !bool::from(actual.compress().as_bytes()
+            .ct_eq(expected.compress().as_bytes()))
+        {
             return Err(DkgError::InvalidShare {
                 from: sender_id,
                 to: participant.id,
@@ -450,6 +454,7 @@ pub fn run_dkg(
 /// Computes `e = H(domain || id || C_0 || R)` using SHA-512 with
 /// domain separation to produce a scalar challenge.
 fn hash_dkg_pok(id: SignerId, commitment: &RistrettoPoint, r: &RistrettoPoint) -> Scalar {
+    use zeroize::Zeroize;
     let hash = Sha512::new()
         .chain_update(b"specter-dkg-pok:")
         .chain_update(id.to_le_bytes())
@@ -458,7 +463,9 @@ fn hash_dkg_pok(id: SignerId, commitment: &RistrettoPoint, r: &RistrettoPoint) -
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    wide.zeroize();
+    s
 }
 
 fn evaluate_poly(coeffs: &[Scalar], x: &Scalar) -> Scalar {

@@ -112,7 +112,7 @@ impl Attestation {
         let challenge = Self::sig_challenge(&self.signature.r, &self.sender_pubkey, &self.hash);
         let lhs = self.signature.s * G;
         let rhs = self.signature.r + challenge * self.sender_pubkey;
-        lhs == rhs
+        bool::from(lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()))
     }
 
     fn sig_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8; 32]) -> Scalar {
@@ -124,7 +124,10 @@ impl Attestation {
             .finalize();
         let mut wide = [0u8; 64];
         wide.copy_from_slice(&hash);
-        Scalar::from_bytes_mod_order_wide(&wide)
+        let s = Scalar::from_bytes_mod_order_wide(&wide);
+        use zeroize::Zeroize;
+        wide.zeroize();
+        s
     }
 
     fn compute_hash(

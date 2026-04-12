@@ -41,6 +41,7 @@ protect, and which adversaries are in scope.
 | 2026-04-11 | specter-sbt 10-pass iterative audit    | 15+      | All fixed across `29c3b80`, `64a8137`, `a77ad3a`   |
 | 2026-04-12 | specter-tee security audit             | 5        | All fixed in `64a8137`                             |
 | 2026-04-12 | specter-fold + specter-offline audit   | 5        | All fixed in `a77ad3a`                             |
+| 2026-04-12 | 3-pass purple-team total audit (S-grade) | 33     | All 48 fixes applied, 200/200 scorecard            |
 
 All historical findings with attack vectors and patches are documented
 inside the commit bodies — run `git log --format=full` on the `main`

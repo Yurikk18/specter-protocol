@@ -59,8 +59,9 @@ impl PedersenParams {
         value: &Scalar,
         blinding: &Scalar,
     ) -> bool {
+        use subtle::ConstantTimeEq;
         let expected = self.commit(value, blinding);
-        commitment == &expected
+        commitment.compress().as_bytes().ct_eq(expected.compress().as_bytes()).into()
     }
 
     /// Compute a Pedersen vector commitment: C = sum(values[i] * G_i) + blinding * H.
@@ -91,11 +92,14 @@ impl PedersenParams {
     /// Note: the value is not used in proof generation -- binding comes from
     /// the verifier recomputing C - v*G. The parameter is retained for API
     /// clarity about what is being proved.
-    pub fn prove_value(&self, _value: &Scalar, blinding: &Scalar) -> ValueProof {
+    pub fn prove_value(&self, value: &Scalar, blinding: &Scalar) -> ValueProof {
+        let token_commitment = self.commit(value, blinding);
         let t = crate::scalar_utils::random_scalar();
         let t_commit = t * self.h;
 
-        let challenge = value_proof_challenge(&self.h, &(*blinding * self.h), &t_commit);
+        let challenge = value_proof_challenge(
+            &self.h, &token_commitment, value, &(*blinding * self.h), &t_commit,
+        );
         let response = t + challenge * blinding;
 
         ValueProof {
@@ -111,11 +115,14 @@ impl PedersenParams {
         claimed_value: &Scalar,
         proof: &ValueProof,
     ) -> bool {
+        use subtle::ConstantTimeEq;
         let c_minus_vg = token_commitment - claimed_value * self.g;
-        let challenge = value_proof_challenge(&self.h, &c_minus_vg, &proof.commitment);
+        let challenge = value_proof_challenge(
+            &self.h, token_commitment, claimed_value, &c_minus_vg, &proof.commitment,
+        );
         let lhs = proof.response * self.h;
         let rhs = proof.commitment + challenge * c_minus_vg;
-        lhs == rhs
+        lhs.compress().as_bytes().ct_eq(rhs.compress().as_bytes()).into()
     }
 }
 
@@ -129,19 +136,26 @@ pub struct ValueProof {
 
 fn value_proof_challenge(
     h: &RistrettoPoint,
+    commitment: &RistrettoPoint,
+    claimed_value: &Scalar,
     statement: &RistrettoPoint,
     nonce: &RistrettoPoint,
 ) -> Scalar {
     use sha2::{Digest, Sha512};
+    use zeroize::Zeroize;
     let hash = Sha512::new()
         .chain_update(b"specter-value-proof:")
         .chain_update(h.compress().as_bytes())
+        .chain_update(commitment.compress().as_bytes())
+        .chain_update(claimed_value.as_bytes())
         .chain_update(statement.compress().as_bytes())
         .chain_update(nonce.compress().as_bytes())
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    wide.zeroize();
+    s
 }
 
 impl Default for PedersenParams {

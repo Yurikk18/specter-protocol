@@ -113,19 +113,18 @@ pub fn parse_pq_verifying_key(
     Some(VerifyingKey::<MlDsa65>::decode(&arr))
 }
 
-/// Canonical bytes that BOTH signatures must cover. MUST be kept in
-/// sync with the classical Schnorr `vote_message` construction —
-/// any divergence would allow an attacker to reuse a classical
-/// signature for a different logical vote.
+/// Canonical bytes that BOTH signatures must cover.
+///
+/// Delegates to [`crate::consensus::canonical_vote_bytes`] so that the
+/// classical and hybrid paths always produce identical bytes.
 pub fn canonical_vote_message(vote: &Vote) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(8 + 8 + 8 + 32 + 1 + 20);
-    msg.extend_from_slice(b"specter-hybrid-vote:");
-    msg.extend_from_slice(&vote.voter.to_le_bytes());
-    msg.extend_from_slice(&vote.block_height.to_le_bytes());
-    msg.extend_from_slice(&vote.view.to_le_bytes());
-    msg.extend_from_slice(&vote.block_hash);
-    msg.push(if vote.approve { 1 } else { 0 });
-    msg
+    crate::consensus::canonical_vote_bytes(
+        vote.voter,
+        vote.block_height,
+        &vote.block_hash,
+        vote.approve,
+        vote.view,
+    )
 }
 
 // Re-export the canonical type aliases.

@@ -243,6 +243,7 @@ fn test_wallet_wrong_passphrase_fails_gracefully() {
         &mint.group_public_key(),
         &mint.pedersen,
         &mint.credential_issuer.pedersen,
+        0,
     );
     assert!(res.is_err(), "wrong passphrase must return Err, not panic");
 }

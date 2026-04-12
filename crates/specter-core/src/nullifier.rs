@@ -43,6 +43,22 @@ pub fn compute_nullifier(secret: &[u8; 32], token_id: &[u8; 32]) -> [u8; 32] {
 pub struct NullifierSet {
     nullifiers: HashSet<[u8; 32]>,
     file: Option<File>,
+    /// Companion lock file that prevents concurrent access from other
+    /// OS processes. Created as `<path>.lock` when file-backed. The
+    /// lock is held for the lifetime of the `NullifierSet` instance
+    /// and removed on Drop.
+    lock_file: Option<File>,
+    lock_path: Option<std::path::PathBuf>,
+}
+
+impl Drop for NullifierSet {
+    fn drop(&mut self) {
+        // Release the lock file so other processes can acquire it.
+        drop(self.lock_file.take());
+        if let Some(path) = self.lock_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl NullifierSet {
@@ -51,6 +67,8 @@ impl NullifierSet {
         Self {
             nullifiers: HashSet::new(),
             file: None,
+            lock_file: None,
+            lock_path: None,
         }
     }
 
@@ -76,6 +94,28 @@ impl NullifierSet {
                 ));
             }
         }
+
+        // Acquire an exclusive lock file to prevent concurrent access
+        // from other OS processes sharing the same nullifier file.
+        // The lock is held for the lifetime of this NullifierSet.
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "nullifier file is locked by another process ({})",
+                            lock_path.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
 
         // Open for reading + appending, creating if it does not exist.
         let mut file = OpenOptions::new()
@@ -118,6 +158,8 @@ impl NullifierSet {
         Ok(Self {
             nullifiers,
             file: Some(file),
+            lock_file: Some(lock_file),
+            lock_path: Some(lock_path),
         })
     }
 
@@ -364,9 +406,10 @@ mod tests {
         p
     }
 
-    /// Clean up a temp file (best-effort).
+    /// Clean up a temp file and its lock companion (best-effort).
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
     }
 
     #[test]

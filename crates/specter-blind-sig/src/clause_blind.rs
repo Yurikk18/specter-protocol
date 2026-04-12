@@ -160,6 +160,7 @@ pub fn verify(pk: &RistrettoPoint, message: &[u8], sig: &BlindSignature) -> bool
 }
 
 fn hash_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, message: &[u8]) -> Scalar {
+    use zeroize::Zeroize;
     let hash = Sha512::new()
         .chain_update(b"specter-clause-blind-challenge:")
         .chain_update(r.compress().as_bytes())
@@ -169,7 +170,9 @@ fn hash_challenge(r: &RistrettoPoint, pk: &RistrettoPoint, message: &[u8]) -> Sc
         .finalize();
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&hash);
-    Scalar::from_bytes_mod_order_wide(&wide)
+    let s = Scalar::from_bytes_mod_order_wide(&wide);
+    wide.zeroize();
+    s
 }
 
 #[cfg(test)]

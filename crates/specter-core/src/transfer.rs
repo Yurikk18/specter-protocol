@@ -71,6 +71,16 @@ pub fn transfer(
     )
     .map_err(|e| TransferError::FoldFailed(e.to_string()))?;
 
+    // If the credential pool is non-empty, pop the first entry and use it
+    // as the token's credential + presentation instead of cloning the old ones.
+    let mut pool = token.credential_pool.clone();
+    let (cred, pres) = if !pool.is_empty() {
+        let (c, p) = pool.remove(0);
+        (Some(c), Some(p))
+    } else {
+        (token.credential.clone(), token.presentation.clone())
+    };
+
     let new_token = ProofCarryingToken {
         token_id: token.token_id,
         value: token.value,
@@ -83,10 +93,11 @@ pub fn transfer(
         recursion_bound: token.recursion_bound,
         fold_proof: new_fold_proof,
         genesis_owner_hash: token.genesis_owner_hash,
-        credential: token.credential.clone(),
-        presentation: token.presentation.clone(),
+        credential: cred,
+        presentation: pres,
         vdf_proof: token.vdf_proof.clone(),
         bond_owner_id: token.bond_owner_id,
+        credential_pool: pool,
     };
 
     Ok(TransferResult {
@@ -166,6 +177,55 @@ pub fn check_double_spend(
         });
     }
     Ok(())
+}
+
+/// Re-issue the token's credential with fresh blinding, breaking
+/// presentation linkability.
+///
+/// Call this after [`transfer`] or [`transfer_checked`] when the
+/// credential issuer is available (online transfers). For offline
+/// transfers where the issuer is unreachable, skip this step — the
+/// credential remains linkable within the offline epoch until the
+/// next renewal (which always re-issues credentials).
+///
+/// # Why this is needed
+///
+/// The Schnorr-based credential signature binds to a specific Pedersen
+/// commitment `C`. Without re-issuance, every presentation of the same
+/// credential carries the identical `(C, sig_s, sig_e)`, allowing
+/// verifiers to correlate presentations to the same holder.
+///
+/// Re-issuance picks a fresh blinding factor `r'`, producing a new
+/// commitment `C'` with a fresh Schnorr signature. Successive
+/// presentations are therefore cryptographically unlinkable.
+pub fn refresh_credential(
+    token: &mut ProofCarryingToken,
+    issuer: &specter_credential::issuer::Issuer,
+) {
+    if let Some(old_cred) = &token.credential {
+        let attrs = old_cred.attributes.clone();
+        let new_cred = issuer.issue(&attrs);
+
+        // Preserve the same disclosure indices from the existing
+        // presentation (if any). Fall back to the two standard
+        // compliance attributes if no presentation exists.
+        let disclose_indices: Vec<usize> = token
+            .presentation
+            .as_ref()
+            .map(|p| p.disclosed.iter().map(|(i, _)| *i).collect())
+            .unwrap_or_else(|| vec![
+                specter_credential::presentation::ATTR_KYC_PASSED,
+                specter_credential::presentation::ATTR_NOT_SANCTIONED,
+            ]);
+
+        let new_pres = specter_credential::presentation::create_presentation(
+            &new_cred,
+            &disclose_indices,
+            &issuer.pedersen,
+        );
+        token.credential = Some(new_cred);
+        token.presentation = Some(new_pres);
+    }
 }
 
 /// Errors during transfer.
@@ -318,5 +378,113 @@ mod tests {
             !vr.all_valid(),
             "cloned token must be rejected by full verification"
         );
+    }
+
+    // ── Credential unlinkability tests ────────────────────────────────
+
+    /// After refresh_credential, the presentation commitment and
+    /// signature must differ from the original — making successive
+    /// presentations cryptographically unlinkable.
+    #[test]
+    fn test_refresh_credential_produces_unlinkable_presentation() {
+        let mint = Mint::setup(MintConfig {
+            threshold: 2,
+            total_signers: 3,
+            recursion_bound: 20,
+        });
+        let attrs = specter_credential::credential::Attributes {
+            kyc_passed: true,
+            not_sanctioned: true,
+            jurisdiction: "EU".to_string(),
+            age_over_18: true,
+            expires_at: 0,
+        };
+        let token = mint.issue(500, &[1, 2], Some(&attrs)).unwrap();
+        let mut ns = NullifierSet::new();
+        let mut result = transfer(token, &mut ns).unwrap();
+
+        // Before refresh: capture the linkable fields.
+        let old_commitment = result.token.presentation.as_ref().unwrap().commitment;
+        let old_sig_s = result.token.presentation.as_ref().unwrap().cred_signature_s;
+        let old_sig_e = result.token.presentation.as_ref().unwrap().cred_signature_e;
+
+        // Refresh the credential with fresh blinding.
+        refresh_credential(&mut result.token, &mint.credential_issuer);
+
+        // After refresh: all three linkable fields must differ.
+        let new_pres = result.token.presentation.as_ref().unwrap();
+        assert_ne!(
+            old_commitment, new_pres.commitment,
+            "commitment must change after refresh (different blinding)"
+        );
+        assert_ne!(
+            old_sig_s, new_pres.cred_signature_s,
+            "signature s must change after refresh (different commitment signed)"
+        );
+        assert_ne!(
+            old_sig_e, new_pres.cred_signature_e,
+            "signature e must change after refresh (different R || C in hash)"
+        );
+
+        // The refreshed token must still verify.
+        let vr = crate::verify::verify_token(
+            &result.token,
+            &mint.group_public_key(),
+            &mint.pedersen,
+            &mint.credential_issuer.pedersen,
+            0,
+        );
+        assert!(vr.all_valid(), "refreshed token must pass full verification");
+        assert_eq!(
+            vr.credential_valid,
+            Some(true),
+            "refreshed credential must verify"
+        );
+    }
+
+    /// Two successive refreshes produce different commitments —
+    /// even the refresh operation itself is unlinkable across calls.
+    #[test]
+    fn test_double_refresh_unlinkable() {
+        let mint = Mint::setup(MintConfig {
+            threshold: 2,
+            total_signers: 3,
+            recursion_bound: 20,
+        });
+        let attrs = specter_credential::credential::Attributes {
+            kyc_passed: true,
+            not_sanctioned: true,
+            jurisdiction: "EU".to_string(),
+            age_over_18: true,
+            expires_at: 0,
+        };
+        let mut token = mint.issue(500, &[1, 2], Some(&attrs)).unwrap();
+
+        refresh_credential(&mut token, &mint.credential_issuer);
+        let c1 = token.presentation.as_ref().unwrap().commitment;
+
+        refresh_credential(&mut token, &mint.credential_issuer);
+        let c2 = token.presentation.as_ref().unwrap().commitment;
+
+        assert_ne!(c1, c2, "two refreshes must produce different commitments");
+
+        // Still verifies
+        let vr = crate::verify::verify_token(
+            &token,
+            &mint.group_public_key(),
+            &mint.pedersen,
+            &mint.credential_issuer.pedersen,
+            0,
+        );
+        assert!(vr.all_valid());
+    }
+
+    /// refresh_credential is a no-op when the token has no credential.
+    #[test]
+    fn test_refresh_credential_noop_without_credential() {
+        let (mint, mut token) = setup();
+        assert!(token.credential.is_none());
+        refresh_credential(&mut token, &mint.credential_issuer);
+        assert!(token.credential.is_none());
     }
 }
