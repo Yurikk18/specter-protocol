@@ -103,7 +103,7 @@ specter-primitives             (foundation — no internal dependencies)
 # Build all crates
 cargo build --workspace
 
-# Run all 403 tests
+# Run all 410 tests
 cargo test --workspace
 
 # Run the protocol demo
@@ -192,7 +192,7 @@ All Specter numbers measured in release mode on a desktop. External numbers from
 ### Honest Limitations
 
 - **Token size ~6x larger than Cashu** (413-1,039 B vs ~65 B) — the extra bytes carry fold proof, credentials, and VDF that Cashu does not have
-- **Not deployed** — this is a research prototype with 403 tests, not production software
+- **Not deployed** — this is a research prototype with 410 tests, not production software
 - **Current benchmarks use classical curves** — PQ migration to lattice primitives will increase sizes significantly (estimated 300-600 KB per token with LatticeFold+)
 
 ---
