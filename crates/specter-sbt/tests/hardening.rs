@@ -364,6 +364,179 @@ fn blind_never_panics_on_valid_rng() {
 }
 
 #[test]
+fn threshold_tag_verification_roundtrip() {
+    let (scheme, shares, _k) = build_scheme_3_of_5();
+    let (state, req) = scheme.prepare(&mut OsRng, b"payload").unwrap();
+    let responses: Vec<_> = (0..3)
+        .map(|i| {
+            evaluate_server(
+                &mut OsRng,
+                &shares[i],
+                &scheme.commits()[i],
+                &req.blinded,
+                scheme.session_id(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let token = scheme.finalize(&mut OsRng, state, &req, &responses).unwrap();
+
+    // At spend time: validators re-evaluate over the UNBLINDED H2C point.
+    let spend_sid = b"spend-session-id-unique";
+    let spend_evals: Vec<_> = (0..3)
+        .map(|i| {
+            SbtScheme::evaluate_for_spend(
+                &mut OsRng,
+                &token,
+                &shares[i],
+                &scheme.commits()[i],
+                scheme.h2c_domain(),
+                spend_sid,
+            )
+            .unwrap()
+        })
+        .collect();
+
+    scheme.verify_tag_threshold(&token, &spend_evals, spend_sid).unwrap();
+}
+
+#[test]
+fn threshold_tag_verification_different_quorums_agree() {
+    let (scheme, shares, _k) = build_scheme_3_of_5();
+    let (state, req) = scheme.prepare(&mut OsRng, b"payload").unwrap();
+    let responses: Vec<_> = (0..3)
+        .map(|i| {
+            evaluate_server(
+                &mut OsRng,
+                &shares[i],
+                &scheme.commits()[i],
+                &req.blinded,
+                scheme.session_id(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let token = scheme.finalize(&mut OsRng, state, &req, &responses).unwrap();
+
+    let sid = b"spend-session-quorum-check";
+    let eval_set_a: Vec<_> = [0, 1, 2]
+        .iter()
+        .map(|&i| {
+            SbtScheme::evaluate_for_spend(
+                &mut OsRng, &token, &shares[i], &scheme.commits()[i],
+                scheme.h2c_domain(), sid,
+            ).unwrap()
+        })
+        .collect();
+    let eval_set_b: Vec<_> = [0, 2, 4]
+        .iter()
+        .map(|&i| {
+            SbtScheme::evaluate_for_spend(
+                &mut OsRng, &token, &shares[i], &scheme.commits()[i],
+                scheme.h2c_domain(), sid,
+            ).unwrap()
+        })
+        .collect();
+
+    scheme.verify_tag_threshold(&token, &eval_set_a, sid).unwrap();
+    scheme.verify_tag_threshold(&token, &eval_set_b, sid).unwrap();
+}
+
+#[test]
+fn threshold_tag_verification_rejects_tampered_tag() {
+    let (scheme, shares, _k) = build_scheme_3_of_5();
+    let (state, req) = scheme.prepare(&mut OsRng, b"payload").unwrap();
+    let responses: Vec<_> = (0..3)
+        .map(|i| {
+            evaluate_server(
+                &mut OsRng,
+                &shares[i],
+                &scheme.commits()[i],
+                &req.blinded,
+                scheme.session_id(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut token = scheme.finalize(&mut OsRng, state, &req, &responses).unwrap();
+    token.tag = G * Scalar::random(&mut OsRng); // tamper
+
+    let sid = b"spend-session-tampered";
+    let evals: Vec<_> = (0..3)
+        .map(|i| {
+            SbtScheme::evaluate_for_spend(
+                &mut OsRng, &token, &shares[i], &scheme.commits()[i],
+                scheme.h2c_domain(), sid,
+            ).unwrap()
+        })
+        .collect();
+
+    let res = scheme.verify_tag_threshold(&token, &evals, sid);
+    // Client proof will fail because the tag is tampered — it's in
+    // the transcript. But the tag-origin check would also catch it.
+    assert!(res.is_err());
+}
+
+#[test]
+fn threshold_tag_verification_rejects_mint_session_replay() {
+    let (scheme, shares, _k) = build_scheme_3_of_5();
+    let (state, req) = scheme.prepare(&mut OsRng, b"payload").unwrap();
+    let responses: Vec<_> = (0..3)
+        .map(|i| {
+            evaluate_server(
+                &mut OsRng,
+                &shares[i],
+                &scheme.commits()[i],
+                &req.blinded,
+                scheme.session_id(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let token = scheme.finalize(&mut OsRng, state, &req, &responses).unwrap();
+
+    // Try to reuse MINT-TIME evaluations as spend-time evaluations.
+    // Must fail because the DDH proofs are bound to a different
+    // session (mint-time session != spend-time session).
+    let res = scheme.verify_tag_threshold(
+        &token,
+        &responses,
+        b"spend-session-distinct",
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn threshold_tag_spend_session_must_differ_from_mint() {
+    let (scheme, shares, _k) = build_scheme_3_of_5();
+    let (state, req) = scheme.prepare(&mut OsRng, b"payload").unwrap();
+    let responses: Vec<_> = (0..3)
+        .map(|i| {
+            evaluate_server(
+                &mut OsRng,
+                &shares[i],
+                &scheme.commits()[i],
+                &req.blinded,
+                scheme.session_id(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let token = scheme.finalize(&mut OsRng, state, &req, &responses).unwrap();
+
+    // Using the SAME session_id as the mint must be rejected.
+    let res = scheme.verify_tag_threshold(&token, &responses, scheme.session_id());
+    assert!(matches!(res, Err(SbtError::SessionMismatch)));
+}
+
+#[test]
+fn pq_readiness_not_ready() {
+    let r = specter_sbt::pq_readiness::PqReadiness::detect();
+    assert!(!r.is_fully_pq_ready());
+    assert!(r.summary().contains("NOT READY"));
+}
+
+#[test]
 fn kdf_and_transcript_tags_are_independently_versioned() {
     // Regression test: any future accidental re-alignment of the
     // two crate-wide domain tags should be caught. These are

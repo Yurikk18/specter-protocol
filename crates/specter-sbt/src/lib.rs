@@ -94,6 +94,7 @@
 #![warn(missing_docs)]
 
 pub mod oprf;
+pub mod pq_readiness;
 pub mod proof;
 pub mod scheme;
 pub mod transcript;

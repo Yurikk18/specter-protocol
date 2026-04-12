@@ -40,7 +40,7 @@
 
 use crate::oprf::{
     blind, combine_evaluations, hash_to_curve, unblind, OprfBlinding, OprfEvaluation,
-    OprfPublicKey, OprfServerCommit,
+    OprfPublicKey, OprfSecretShare, OprfServerCommit,
 };
 use crate::proof::TokenProof;
 use crate::SbtError;
@@ -716,6 +716,93 @@ impl SbtScheme {
             return Err(SbtError::TagOriginMismatch);
         }
         Ok(())
+    }
+
+    /// Verify tag-origin via threshold re-evaluation at spend time.
+    ///
+    /// Each validator calls [`evaluate_for_spend`](Self::evaluate_for_spend)
+    /// on `P = H2C(C)` (the UNBLINDED commitment hash) with its
+    /// share `k_i`, producing `T'_i = P·k_i` plus a DDH proof. The
+    /// caller collects a quorum of these evaluations and passes them
+    /// here. This function:
+    ///   1. Calls `combine_evaluations` over the unblinded base `P`.
+    ///   2. Compares the result `T'` to `token.tag` in constant time.
+    ///   3. Also runs `verify_client_proof` on the token.
+    ///
+    /// The `spend_session_id` MUST be distinct from the mint-time
+    /// `session_id` to prevent cross-protocol replay of mint-time
+    /// DDH proofs. It must also be at least `MIN_SESSION_ID_LEN`
+    /// bytes.
+    pub fn verify_tag_threshold(
+        &self,
+        token: &SpendToken,
+        evaluations: &[OprfEvaluation],
+        spend_session_id: &[u8],
+    ) -> Result<(), SbtError> {
+        token.validate()?;
+        if spend_session_id.len() < MIN_SESSION_ID_LEN {
+            return Err(SbtError::SessionTooShort);
+        }
+        // Prevent accidental reuse of mint-time session.
+        if spend_session_id == self.inner.session_id.as_slice() {
+            return Err(SbtError::SessionMismatch);
+        }
+
+        // Verify client proof first.
+        if token.session_id.ct_eq(&self.inner.session_id).unwrap_u8() == 0 {
+            return Err(SbtError::SessionMismatch);
+        }
+        self.verify_client_proof_internal(token)?;
+
+        // Recompute P = H2C(C) — the UNBLINDED base point.
+        let p = hash_to_curve(
+            &self.inner.h2c_domain,
+            &token.commitment.compress().to_bytes(),
+        );
+        if p == RistrettoPoint::default() {
+            return Err(SbtError::IdentityPoint);
+        }
+
+        // Combine the threshold evaluations. The spend-time session
+        // binds each DDH proof to this specific verification round.
+        let t_prime = combine_evaluations(
+            self.inner.threshold,
+            &self.inner.commits,
+            evaluations,
+            &p,
+            spend_session_id,
+        )?;
+
+        // Constant-time compare.
+        if t_prime
+            .compress()
+            .as_bytes()
+            .ct_eq(token.tag.compress().as_bytes())
+            .unwrap_u8()
+            == 0
+        {
+            return Err(SbtError::TagOriginMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validator helper: compute a spend-time OPRF evaluation on the
+    /// unblinded `H2C(C)` point. Called by each validator holding a
+    /// share `(k_i, Y_i)`. The returned `OprfEvaluation` is sent to
+    /// the spend verifier who calls [`verify_tag_threshold`](Self::verify_tag_threshold).
+    pub fn evaluate_for_spend<R: CryptoRng + RngCore>(
+        rng: &mut R,
+        token: &SpendToken,
+        share: &OprfSecretShare,
+        commit: &OprfServerCommit,
+        h2c_domain: &[u8],
+        spend_session_id: &[u8],
+    ) -> Result<OprfEvaluation, SbtError> {
+        let p = hash_to_curve(h2c_domain, &token.commitment.compress().to_bytes());
+        if p == RistrettoPoint::default() {
+            return Err(SbtError::IdentityPoint);
+        }
+        crate::oprf::evaluate_server(rng, share, commit, &p, spend_session_id)
     }
 }
 

@@ -12,7 +12,7 @@
 
 #![cfg(feature = "mock-attestation")]
 
-use crate::{Attestation, AttestationError, AttestationProvider, Platform};
+use crate::{Attestation, AttestationError, AttestationProvider, Platform, TcbPolicy};
 
 /// A mock provider that produces unsigned attestations and
 /// trivially "verifies" them. See module docs for safety warnings.
@@ -49,6 +49,7 @@ impl AttestationProvider for MockAttestationProvider {
         &self,
         attestation: &Attestation,
         expected_user_data: &[u8; 64],
+        _policy: &TcbPolicy,
     ) -> Result<(), AttestationError> {
         if attestation.platform != Platform::None {
             return Err(AttestationError::VerifyError(
@@ -82,14 +83,15 @@ impl AttestationProvider for MockAttestationProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::user_data_from_pubkey;
+    use crate::{user_data_from_pubkey, TcbPolicy};
 
     #[test]
     fn mock_roundtrip() {
         let p = MockAttestationProvider::new();
         let user_data = user_data_from_pubkey(&[42u8; 32]);
         let attestation = p.request_report(&user_data).unwrap();
-        p.verify_report(&attestation, &user_data).unwrap();
+        p.verify_report(&attestation, &user_data, &TcbPolicy::permissive())
+            .unwrap();
     }
 
     #[test]
@@ -98,7 +100,9 @@ mod tests {
         let u1 = user_data_from_pubkey(&[1u8; 32]);
         let u2 = user_data_from_pubkey(&[2u8; 32]);
         let attestation = p.request_report(&u1).unwrap();
-        assert!(p.verify_report(&attestation, &u2).is_err());
+        assert!(p
+            .verify_report(&attestation, &u2, &TcbPolicy::permissive())
+            .is_err());
     }
 
     #[test]
@@ -106,8 +110,9 @@ mod tests {
         let p = MockAttestationProvider::new();
         let user_data = user_data_from_pubkey(&[42u8; 32]);
         let mut attestation = p.request_report(&user_data).unwrap();
-        // Flip a byte in the magic.
         attestation.report[0] ^= 0xFF;
-        assert!(p.verify_report(&attestation, &user_data).is_err());
+        assert!(p
+            .verify_report(&attestation, &user_data, &TcbPolicy::permissive())
+            .is_err());
     }
 }

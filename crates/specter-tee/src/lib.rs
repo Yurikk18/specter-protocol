@@ -47,6 +47,17 @@
 
 use thiserror::Error;
 
+pub mod tcb_policy;
+pub use tcb_policy::{TcbPolicy, TcbPolicyViolation};
+
+/// Platform-independent SEV-SNP attestation **verification**. Works
+/// on Windows, macOS, and Linux via the pure-Rust `crypto_nossl`
+/// backend. Only the `sev-snp` feature is required — no Linux kernel.
+#[cfg(feature = "sev-snp")]
+pub mod sev_snp_verify;
+
+/// Linux-only SEV-SNP attestation **request** backend. Needs
+/// `/dev/sev-guest` exposed by kernel 5.19+.
 #[cfg(all(target_os = "linux", feature = "sev-snp"))]
 pub mod sev_snp;
 
@@ -103,6 +114,9 @@ pub enum AttestationError {
 
     #[error("attestation verification failed: {0}")]
     VerifyError(String),
+
+    #[error("TCB policy violation: {0}")]
+    TcbPolicyViolation(#[from] TcbPolicyViolation),
 }
 
 /// A backend that produces and verifies attestation reports.
@@ -115,11 +129,13 @@ pub trait AttestationProvider {
 
     /// Verify a peer's attestation report. Returns `Ok(())` if the
     /// report was signed by the expected hardware root of trust AND
-    /// binds the expected user_data.
+    /// binds the expected user_data AND passes the TCB policy checks
+    /// (minimum firmware version, allowed measurements, max VMPL).
     fn verify_report(
         &self,
         attestation: &Attestation,
         expected_user_data: &[u8; 64],
+        policy: &TcbPolicy,
     ) -> Result<(), AttestationError>;
 }
 
@@ -137,6 +153,7 @@ impl AttestationProvider for NullAttestationProvider {
         &self,
         _attestation: &Attestation,
         _expected_user_data: &[u8; 64],
+        _policy: &TcbPolicy,
     ) -> Result<(), AttestationError> {
         Err(AttestationError::PlatformUnavailable)
     }
@@ -184,6 +201,32 @@ pub fn user_data_from_pubkey_and_nonce(
     out.copy_from_slice(&hash);
     out
 }
+
+/// A verifier-only provider that can verify SEV-SNP attestation
+/// reports on **any platform** but cannot request new reports (no
+/// `/dev/sev-guest`). Use this in validator nodes running outside a
+/// confidential VM, or on Windows / macOS CI.
+#[cfg(feature = "sev-snp")]
+pub struct PortableSnpVerifier;
+
+#[cfg(feature = "sev-snp")]
+impl AttestationProvider for PortableSnpVerifier {
+    fn request_report(&self, _: &[u8; 64]) -> Result<Attestation, AttestationError> {
+        Err(AttestationError::PlatformUnavailable)
+    }
+
+    fn verify_report(
+        &self,
+        attestation: &Attestation,
+        expected_user_data: &[u8; 64],
+        policy: &TcbPolicy,
+    ) -> Result<(), AttestationError> {
+        sev_snp_verify::verify_snp_report(attestation, expected_user_data, policy)
+    }
+}
+
+#[cfg(feature = "sev-snp")]
+pub use sev_snp_verify::verify_snp_report;
 
 #[cfg(feature = "mock-attestation")]
 pub mod mock;

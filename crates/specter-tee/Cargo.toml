@@ -6,28 +6,27 @@ description = "AMD SEV-SNP / Intel TDX confidential-VM attestation and key seali
 
 [features]
 default = []
-# Enable the AMD SEV-SNP backend (Linux-only, requires the
-# /dev/sev-guest device exposed by kernel 5.19+). Uses the pure-Rust
-# `crypto_nossl` backend of virtee/sev, so no OpenSSL dependency is
-# introduced.
+# Enable the AMD SEV-SNP backend. On Linux this enables both
+# request_report (via /dev/sev-guest) and verify_report (pure Rust).
+# On other platforms, request_report is unavailable but the
+# verification path works via the pure-Rust `crypto_nossl` backend.
 sev-snp = ["dep:sev", "dep:bincode", "dep:serde"]
-# A mock attestation provider that produces deterministic, unsigned
-# attestations for local Windows / CI development. NEVER enable in
-# production — the mock's `verify_report` always returns Ok for
-# anything that round-trips, by design.
+# A mock attestation provider for dev / CI on any platform.
 mock-attestation = []
 
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true, optional = true }
 
-# SEV-SNP guest API via virtee/sev (Linux-only). We pin 6.3.1 (latest
-# in the 6.x series) with the pure-Rust verification backend so there
-# is no OpenSSL C dependency.
-[target.'cfg(target_os = "linux")'.dependencies]
+# SEV-SNP types and pure-Rust verification. The sev crate with
+# crypto_nossl uses p384 + rsa + x509-cert, all pure Rust, so it
+# compiles on any target. Only the firmware::guest module (which
+# does ioctls on /dev/sev-guest) is Linux-specific — and we gate
+# its usage in sev_snp.rs behind #[cfg(target_os = "linux")].
 sev = { version = "=6.3.1", default-features = false, features = ["snp", "crypto_nossl"], optional = true }
 bincode = { version = "1.3", optional = true }
