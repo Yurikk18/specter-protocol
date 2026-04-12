@@ -408,6 +408,7 @@ impl Drop for NodeIdentity {
 /// Session key = SHA-256("specter-sigma-key:" || shared_dh || transcript).
 ///
 /// Returns the 32-byte session key on success.
+#[cfg(not(feature = "pq-handshake"))]
 fn authenticated_handshake(
     stream: &mut std::net::TcpStream,
     my_identity: &NodeIdentity,
@@ -595,6 +596,294 @@ fn authenticated_handshake(
     Some(session_key)
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Post-quantum hybrid handshake layer (feature = "pq-handshake")
+// ────────────────────────────────────────────────────────────────────
+//
+// Wraps the SIGMA-I handshake with an ML-KEM-768 (FIPS 203) layer so
+// the derived session key depends on BOTH the classical Ristretto
+// ECDH secret AND the ML-KEM shared secret. Breaking the session key
+// requires breaking both schemes simultaneously.
+//
+// Design (asymmetric, 1-round):
+//
+//   Initiator I:
+//     - generates ephemeral Kyber decapsulation key (dk_I)
+//     - sends (id_pk, ristretto_ephem_pk, kyber_ek_I)
+//   Responder R:
+//     - receives I's kyber_ek_I
+//     - encapsulates a random shared secret to I's kyber_ek_I,
+//       producing (kyber_ct, kyber_ss)
+//     - sends (id_pk, ristretto_ephem_pk, kyber_ct)
+//   Initiator I:
+//     - decapsulates kyber_ct with dk_I to obtain the same kyber_ss
+//
+// Combined session key:
+//   session_key = HKDF-SHA3(
+//     "specter-hybrid-key:",
+//     ristretto_shared || kyber_shared || transcript
+//   )
+//
+// Wire format note: we do NOT negotiate the PQ layer — a peer
+// compiled with `pq-handshake` ONLY talks to peers also compiled
+// with it. The wire format is intentionally different so that a
+// classical peer sees garbage bytes and aborts.
+
+#[cfg(feature = "pq-handshake")]
+fn hybrid_authenticated_handshake(
+    stream: &mut std::net::TcpStream,
+    my_identity: &NodeIdentity,
+    expected_peer_pk: Option<curve25519_dalek::RistrettoPoint>,
+    is_initiator: bool,
+) -> Option<[u8; 32]> {
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::{RistrettoPoint, Scalar};
+    use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+    use ml_kem::kem::{Decapsulate, Encapsulate};
+    use sha2::Sha512;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    use zeroize::Zeroize;
+
+    // Concrete ml-kem type aliases pinned to MlKem768.
+    type Ek = <MlKem768 as KemCore>::EncapsulationKey;
+    type Dk = <MlKem768 as KemCore>::DecapsulationKey;
+
+    // Network timeouts to prevent slow-peer DoS.
+    let timeout = Some(Duration::from_secs(30));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+
+    // Ristretto ephemeral keypair (classical leg).
+    let mut ephem_sk = specter_primitives::scalar_utils::random_scalar();
+    let ephem_pk = (ephem_sk * G).compress();
+
+    let my_id_bytes = my_identity.public.compress();
+
+    // ML-KEM-768 ephemeral decap key (only the initiator generates one;
+    // the responder encapsulates TO this key).
+    let mut rng = rand_core::OsRng;
+    let kyber_dk_pair: Option<(Dk, Ek)> = if is_initiator {
+        Some(MlKem768::generate(&mut rng))
+    } else {
+        None
+    };
+    let kyber_ek_bytes_opt: Option<Vec<u8>> = kyber_dk_pair
+        .as_ref()
+        .map(|(_dk, ek)| ek.as_bytes().to_vec());
+
+    const KYBER_EK_LEN: usize = 1184; // ML-KEM-768 encap key size
+    const KYBER_CT_LEN: usize = 1088; // ML-KEM-768 ciphertext size
+
+    // --- HELLO exchange ---
+    if is_initiator {
+        stream.write_all(my_id_bytes.as_bytes()).ok()?;
+        stream.write_all(ephem_pk.as_bytes()).ok()?;
+        stream.write_all(kyber_ek_bytes_opt.as_ref().unwrap()).ok()?;
+        stream.flush().ok()?;
+    }
+
+    let mut their_id_bytes = [0u8; 32];
+    let mut their_ephem_bytes = [0u8; 32];
+    stream.read_exact(&mut their_id_bytes).ok()?;
+    stream.read_exact(&mut their_ephem_bytes).ok()?;
+
+    // Depending on role, read either kyber_ek (responder sees
+    // initiator's ek) or kyber_ct (initiator sees responder's ct).
+    let (maybe_their_ek_bytes, maybe_their_ct_bytes) = if is_initiator {
+        let mut ct_buf = vec![0u8; KYBER_CT_LEN];
+        stream.read_exact(&mut ct_buf).ok()?;
+        (None, Some(ct_buf))
+    } else {
+        let mut ek_buf = vec![0u8; KYBER_EK_LEN];
+        stream.read_exact(&mut ek_buf).ok()?;
+        (Some(ek_buf), None)
+    };
+
+    if !is_initiator {
+        // Responder writes its hello before producing the ciphertext.
+        stream.write_all(my_id_bytes.as_bytes()).ok()?;
+        stream.write_all(ephem_pk.as_bytes()).ok()?;
+    }
+
+    // Decompose the SIGMA-I anti-MitM logic.
+    let their_id_pk: RistrettoPoint =
+        CompressedRistretto(their_id_bytes).decompress()?;
+    let their_ephem_pk: RistrettoPoint =
+        CompressedRistretto(their_ephem_bytes).decompress()?;
+
+    if let Some(expected) = expected_peer_pk {
+        use subtle::ConstantTimeEq;
+        let ours = their_id_pk.compress();
+        let want = expected.compress();
+        if !bool::from(ours.as_bytes().ct_eq(want.as_bytes())) {
+            ephem_sk.zeroize();
+            eprintln!(
+                "Hybrid SIGMA-I: peer identity mismatch (expected {}, got {})",
+                hex::encode(want.as_bytes()),
+                hex::encode(ours.as_bytes())
+            );
+            return None;
+        }
+    }
+
+    // ML-KEM leg — use explicit type aliases for the encap/decap key
+    // types because the ml-kem 0.2 crate exposes them as associated
+    // types of the KemCore trait rather than as bare types.
+    let kyber_shared: [u8; 32] = if is_initiator {
+        let their_ct_bytes = maybe_their_ct_bytes.as_ref()?;
+        if their_ct_bytes.len() != KYBER_CT_LEN {
+            return None;
+        }
+        let ct_arr =
+            ml_kem::Ciphertext::<MlKem768>::try_from(their_ct_bytes.as_slice()).ok()?;
+        let (dk, _ek) = kyber_dk_pair.as_ref()?;
+        let ss = dk.decapsulate(&ct_arr).ok()?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&ss);
+        out
+    } else {
+        let their_ek_bytes = maybe_their_ek_bytes.as_ref()?;
+        if their_ek_bytes.len() != KYBER_EK_LEN {
+            return None;
+        }
+        // Parse the encap key from wire bytes via the EncodedSizeUser
+        // conversion on the associated type.
+        let encoded = ml_kem::Encoded::<Ek>::try_from(their_ek_bytes.as_slice()).ok()?;
+        let their_ek = Ek::from_bytes(&encoded);
+        let (ct, ss) = their_ek.encapsulate(&mut rng).ok()?;
+        // Send the ciphertext to the initiator.
+        stream.write_all(ct.as_slice()).ok()?;
+        stream.flush().ok()?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&ss);
+        out
+    };
+
+    // Classical Ristretto ECDH shared secret (forward secrecy leg 1).
+    let ristretto_shared = ephem_sk * their_ephem_pk;
+    let ristretto_shared_bytes = ristretto_shared.compress();
+
+    // Canonicalized transcript (same rule as classical handshake).
+    let (id_a, id_b, ephem_a, ephem_b) = {
+        let mine_id: [u8; 32] = *my_id_bytes.as_bytes();
+        let mine_e: [u8; 32] = *ephem_pk.as_bytes();
+        let theirs_id: [u8; 32] = their_id_bytes;
+        let theirs_e: [u8; 32] = their_ephem_bytes;
+        if mine_id < theirs_id {
+            (mine_id, theirs_id, mine_e, theirs_e)
+        } else {
+            (theirs_id, mine_id, theirs_e, mine_e)
+        }
+    };
+
+    let transcript_msg = {
+        let mut h = Sha512::new();
+        h.update(b"specter-hybrid-sigma-transcript:");
+        h.update(id_a);
+        h.update(id_b);
+        h.update(ephem_a);
+        h.update(ephem_b);
+        h.update(ristretto_shared_bytes.as_bytes());
+        h.update(kyber_shared);
+        let out = h.finalize();
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&out[..32]);
+        buf
+    };
+
+    // SIGMA-I Schnorr signature over the hybrid transcript.
+    let sig_challenge = |r: &RistrettoPoint, pk: &RistrettoPoint, msg: &[u8; 32]| -> Scalar {
+        let hash = Sha512::new()
+            .chain_update(b"specter-hybrid-sigma-sig:")
+            .chain_update(r.compress().as_bytes())
+            .chain_update(pk.compress().as_bytes())
+            .chain_update(msg)
+            .finalize();
+        let mut wide = [0u8; 64];
+        wide.copy_from_slice(&hash);
+        Scalar::from_bytes_mod_order_wide(&wide)
+    };
+
+    let mut k = specter_primitives::scalar_utils::random_scalar();
+    let r_point = k * G;
+    let e = sig_challenge(&r_point, &my_identity.public, &transcript_msg);
+    let s = k + e * my_identity.secret;
+    k.zeroize();
+    let r_bytes = r_point.compress();
+    let s_bytes: [u8; 32] = *s.as_bytes();
+
+    // Exchange signatures.
+    let mut their_r = [0u8; 32];
+    let mut their_s = [0u8; 32];
+    if is_initiator {
+        stream.write_all(r_bytes.as_bytes()).ok()?;
+        stream.write_all(&s_bytes).ok()?;
+        stream.flush().ok()?;
+        stream.read_exact(&mut their_r).ok()?;
+        stream.read_exact(&mut their_s).ok()?;
+    } else {
+        stream.read_exact(&mut their_r).ok()?;
+        stream.read_exact(&mut their_s).ok()?;
+        stream.write_all(r_bytes.as_bytes()).ok()?;
+        stream.write_all(&s_bytes).ok()?;
+        stream.flush().ok()?;
+    }
+
+    let their_r_point = CompressedRistretto(their_r).decompress()?;
+    let their_s_scalar = {
+        let opt: Option<Scalar> = Scalar::from_canonical_bytes(their_s).into();
+        opt?
+    };
+    let expected_e = sig_challenge(&their_r_point, &their_id_pk, &transcript_msg);
+    let lhs = their_s_scalar * G;
+    let rhs = their_r_point + expected_e * their_id_pk;
+    if lhs != rhs {
+        ephem_sk.zeroize();
+        eprintln!("Hybrid SIGMA-I: peer signature verification failed");
+        return None;
+    }
+
+    // Derive the session key from BOTH shared secrets + transcript.
+    // HKDF-style via SHA-512: if EITHER of the two shared secrets is
+    // broken the session key still has the other one's entropy. This
+    // is the "hybrid pattern" used by Chrome X25519MLKEM768, Signal
+    // PQXDH, and the TLS 1.3 hybrid design.
+    let session_key = {
+        let mut h = Sha512::new();
+        h.update(b"specter-hybrid-sigma-key:");
+        h.update(ristretto_shared_bytes.as_bytes());
+        h.update(kyber_shared);
+        h.update(transcript_msg);
+        let out = h.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&out[..32]);
+        key
+    };
+
+    ephem_sk.zeroize();
+    Some(session_key)
+}
+
+/// Dispatch helper: picks the classical or hybrid handshake depending
+/// on whether the `pq-handshake` feature is compiled in.
+fn handshake_dispatch(
+    stream: &mut std::net::TcpStream,
+    my_identity: &NodeIdentity,
+    expected_peer_pk: Option<curve25519_dalek::RistrettoPoint>,
+    is_initiator: bool,
+) -> Option<[u8; 32]> {
+    #[cfg(feature = "pq-handshake")]
+    {
+        hybrid_authenticated_handshake(stream, my_identity, expected_peer_pk, is_initiator)
+    }
+    #[cfg(not(feature = "pq-handshake"))]
+    {
+        authenticated_handshake(stream, my_identity, expected_peer_pk, is_initiator)
+    }
+}
+
 /// Parse a hex-encoded Ristretto pubkey from a CLI argument.
 fn parse_peer_pk(s: &str) -> Option<curve25519_dalek::RistrettoPoint> {
     let bytes = hex::decode(s.trim()).ok()?;
@@ -714,8 +1003,10 @@ fn cmd_send(args: &[String]) {
             use std::io::Write;
 
             // SIGMA-I authenticated handshake (sender is initiator).
+            // Uses the hybrid classical+PQ variant when the
+            // `pq-handshake` feature is compiled in.
             let mut shared_key =
-                match authenticated_handshake(&mut stream, &my_identity, expected_peer, true) {
+                match handshake_dispatch(&mut stream, &my_identity, expected_peer, true) {
                     Some(k) => k,
                     None => {
                         eprintln!("Authenticated handshake failed with {}", addr);
@@ -793,7 +1084,7 @@ fn cmd_receive(args: &[String]) {
             // peer is accepted, and the subsequent verify_token step
             // validates the TOKEN itself against the mint.
             let mut shared_key =
-                match authenticated_handshake(&mut stream, &my_identity, None, false) {
+                match handshake_dispatch(&mut stream, &my_identity, None, false) {
                     Some(k) => k,
                     None => {
                         eprintln!("Authenticated handshake failed with {}", peer);

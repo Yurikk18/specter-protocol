@@ -6,6 +6,7 @@ pub mod renewal;
 pub mod nullifier;
 pub mod secure_store;
 pub mod serde_token;
+pub mod signer;
 pub mod token;
 pub mod transfer;
 pub mod verify;

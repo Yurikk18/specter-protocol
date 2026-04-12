@@ -1,0 +1,28 @@
+[package]
+name = "specter-sbt"
+version = "0.1.0"
+edition = "2021"
+description = "Symmetric Blind Tokens — threshold OPRF + NIZK blind-signature replacement for the Specter Protocol (post-quantum-ready)"
+
+[features]
+default = []
+# Future-proof switch. When generic VOLEitH ZK lands in pure Rust we
+# swap the Schnorr NIZK for a VOLEitH circuit and enable this flag. The
+# external trait surface stays the same.
+pq-voleith = []
+
+[dependencies]
+specter-primitives = { path = "../specter-primitives" }
+curve25519-dalek = { workspace = true, features = ["digest"] }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+proptest = { workspace = true }

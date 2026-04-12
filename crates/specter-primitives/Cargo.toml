@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "Cryptographic primitives for the Specter protocol"
 
+[features]
+default = []
+# Enable hardware side-channel hardening (scalar blinding, dummy ops).
+# Imposes a ~2x cost on signing-path scalar multiplications.
+hardened = []
+# Enable the bit-decomposition 64-bit range proof primitive for
+# confidential transactions. Adds ~8 KB per commitment.
+confidential-tx = []
+
 [dependencies]
 curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }

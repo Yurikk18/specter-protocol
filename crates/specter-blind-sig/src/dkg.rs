@@ -231,6 +231,141 @@ pub fn dkg_round3(
     })
 }
 
+/// Proactive resharing of an existing threshold keyset.
+///
+/// Re-randomizes every participant's Shamir share without changing the
+/// group public key. After a successful reshare, any attacker who had
+/// compromised some (but fewer than `t`) old shares must start over
+/// from scratch — old shares are useless once the new polynomial is in
+/// place.
+///
+/// # Protocol
+///
+/// Based on Herzberg et al., "Proactive Secret Sharing Or: How to Cope
+/// With Perpetual Leakage" (CRYPTO 1995). Each participant `i`:
+///
+/// 1. Generates a random polynomial `g_i(x)` of degree `t-1` with
+///    `g_i(0) == 0` (so adding it to the current group polynomial
+///    `f(x)` preserves the constant term, i.e., the group secret).
+/// 2. Distributes `g_i(j)` to every other participant `j`.
+/// 3. Every participant `j` updates their share:
+///    `y'_j = y_j + sum_i g_i(j)`.
+///
+/// In a real deployment this requires an interactive multi-round
+/// protocol with verification (Feldman VSS) of each contribution.
+/// This function runs the whole thing locally as a simulation — it
+/// takes ownership of the current keyset and returns the re-randomized
+/// keyset. A production interactive version would live behind a
+/// network protocol on top of this helper.
+///
+/// # Guarantees
+///
+/// - `group_public` is unchanged (verified at the end of the function).
+/// - Every returned share verifies against the same group public key
+///   as the input keyset.
+/// - Old shares inside the input keyset are zeroized on drop (the
+///   caller's copy of `old` is consumed by this call).
+///
+/// # Errors
+///
+/// Returns [`DkgError::InvalidShareReshare`] if the resulting group
+/// public key does not match the input — an internal consistency
+/// check that should never fire under honest participants but is kept
+/// as a defensive guard against future bug introductions.
+pub fn proactive_reshare(
+    old: ThresholdKeyset,
+) -> Result<ThresholdKeyset, DkgError> {
+    let t = old.threshold;
+    let ids: Vec<SignerId> = old.shares.keys().copied().collect();
+
+    // Step 1: each participant i generates a random polynomial
+    // g_i(x) of degree t-1 with g_i(0) = 0. We store the coefficients
+    // a_1..a_{t-1}; the constant term a_0 is implicitly 0.
+    let mut update_polys: HashMap<SignerId, Vec<Scalar>> = HashMap::new();
+    for &i in &ids {
+        // t-1 random coefficients (skipping a_0 = 0).
+        let coeffs: Vec<Scalar> = (0..t.saturating_sub(1)).map(|_| random_scalar()).collect();
+        update_polys.insert(i, coeffs);
+    }
+
+    // Step 2: compute updated shares y'_j = y_j + sum_i g_i(j).
+    //
+    // g_i(j) = a_{i,1} * j + a_{i,2} * j^2 + ... + a_{i,t-1} * j^{t-1}
+    // (no constant term).
+    let mut new_shares: HashMap<SignerId, Share> = HashMap::new();
+    for &j in &ids {
+        let xj = Scalar::from(j);
+        // Start with the current share for participant j.
+        let current_y = old.shares[&j].y;
+        let mut new_y = current_y;
+
+        for (&_i, coeffs) in &update_polys {
+            // Evaluate g_i at xj, with implicit constant term 0.
+            let mut x_power = xj;
+            for coeff in coeffs {
+                new_y += coeff * x_power;
+                x_power *= xj;
+            }
+        }
+
+        new_shares.insert(
+            j,
+            Share {
+                x: xj,
+                y: new_y,
+            },
+        );
+    }
+
+    // Step 3: derive the new public shares and the group public key.
+    // The group public key should be identical to the input; we
+    // reconstruct it from the new shares and verify.
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as BP_G;
+    let mut new_public_shares: HashMap<SignerId, RistrettoPoint> = HashMap::new();
+    for (&id, share) in &new_shares {
+        new_public_shares.insert(id, share.y * BP_G);
+    }
+
+    // Reconstruct the group public key via Lagrange interpolation at
+    // x = 0. If the proactive reshare preserved the constant term,
+    // this equals `old.group_public`.
+    //
+    // We use any `t` points — pick the first t participants.
+    let subset: Vec<SignerId> = ids.iter().copied().take(t).collect();
+    let reconstructed = {
+        let mut acc = RistrettoPoint::default();
+        for &i in &subset {
+            let xi = Scalar::from(i);
+            let pk_i = new_public_shares[&i];
+            // Lagrange basis at 0: L_i(0) = product_{j != i} (-x_j) / (x_i - x_j)
+            let mut lambda = Scalar::ONE;
+            for &j in &subset {
+                if i == j {
+                    continue;
+                }
+                let xj = Scalar::from(j);
+                lambda *= (-xj) * (xi - xj).invert();
+            }
+            acc += lambda * pk_i;
+        }
+        acc
+    };
+
+    if reconstructed != old.group_public {
+        return Err(DkgError::InvalidShareReshare);
+    }
+
+    Ok(ThresholdKeyset {
+        group_public: old.group_public,
+        threshold: t,
+        total: old.total,
+        shares: new_shares,
+        public_shares: new_public_shares,
+    })
+    // `old` is consumed by the function call; its Drop impl
+    // zeroizes every y-coordinate of the old shares.
+}
+
 /// Run a complete DKG among all participants (convenience function).
 ///
 /// Simulates the 3-round protocol and returns a keyset for each participant.
@@ -366,6 +501,9 @@ pub enum DkgError {
 
     #[error("invalid commitment vector length from participant {from}: expected {expected}, got {got}")]
     InvalidCommitmentLength { from: SignerId, expected: usize, got: usize },
+
+    #[error("proactive reshare produced a different group public key — internal consistency failure")]
+    InvalidShareReshare,
 }
 
 #[cfg(test)]
@@ -511,6 +649,68 @@ mod tests {
         );
         // Also verify the PoK still works against the correct commitment
         assert!(verify_pok(1, &participant_a.commitments[0], &pok_a));
+    }
+
+    // ── Proactive resharing tests ─────────────────────────────────────
+
+    #[test]
+    fn test_proactive_reshare_preserves_group_pk() {
+        use crate::threshold;
+        let keyset = threshold::dealer_keygen(2, 3);
+        let original_pk = keyset.group_public;
+        let original_shares: Vec<(SignerId, Scalar)> = keyset
+            .shares
+            .iter()
+            .map(|(id, s)| (*id, s.y))
+            .collect();
+
+        let reshared = proactive_reshare(keyset).unwrap();
+        assert_eq!(reshared.group_public, original_pk);
+
+        // The individual shares must have changed — this is the core
+        // guarantee of proactive resharing. An attacker who leaked
+        // shares before the reshare cannot combine them with new
+        // shares.
+        for (id, old_y) in original_shares {
+            let new_y = reshared.shares[&id].y;
+            assert_ne!(new_y, old_y, "share {} was not re-randomized", id);
+        }
+    }
+
+    #[test]
+    fn test_proactive_reshare_new_shares_still_sign() {
+        use crate::{schnorr_blind, threshold};
+        let keyset = threshold::dealer_keygen(2, 3);
+        let reshared = proactive_reshare(keyset).unwrap();
+
+        // The re-randomized keyset must still produce valid threshold
+        // signatures.
+        let msg = b"post-reshare message";
+        let sig = threshold::threshold_blind_sign(&reshared, &[1, 2], msg).unwrap();
+        assert!(schnorr_blind::verify(&reshared.group_public, msg, &sig));
+    }
+
+    #[test]
+    fn test_proactive_reshare_chained() {
+        use crate::{schnorr_blind, threshold};
+        // Run three reshare rounds back to back. Every round must
+        // preserve the group pk AND produce fresh shares.
+        let mut keyset = threshold::dealer_keygen(2, 3);
+        let initial_pk = keyset.group_public;
+        for round in 0..3 {
+            let reshared = proactive_reshare(keyset).unwrap();
+            assert_eq!(reshared.group_public, initial_pk);
+            // After each round, a threshold sig still works.
+            let msg = format!("round-{}", round);
+            let sig =
+                threshold::threshold_blind_sign(&reshared, &[1, 2], msg.as_bytes()).unwrap();
+            assert!(schnorr_blind::verify(
+                &reshared.group_public,
+                msg.as_bytes(),
+                &sig
+            ));
+            keyset = reshared;
+        }
     }
 
     #[test]

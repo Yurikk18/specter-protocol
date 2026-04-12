@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "P2P network protocol and BFT consensus for Specter"
 
+[features]
+default = []
+# Attach ML-DSA-65 signatures to every consensus vote alongside the
+# classical Schnorr signature. Verifier requires BOTH. Grows each
+# Vote struct by ~3.3 KB.
+pq-consensus = ["ml-dsa"]
+
 [dependencies]
 specter-primitives = { path = "../specter-primitives" }
 curve25519-dalek = { workspace = true }
@@ -15,3 +22,4 @@ rand_core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 subtle = { workspace = true }
+ml-dsa = { version = "=0.1.0-rc.8", optional = true }

@@ -9,6 +9,8 @@ members = [
     "crates/specter-offline",
     "crates/specter-net",
     "crates/specter-cli",
+    "crates/specter-tee",
+    "crates/specter-sbt",
 ]
 exclude = ["fuzz"]
 
