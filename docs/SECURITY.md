@@ -63,15 +63,22 @@ Every type holding secret material implements `Drop` with `zeroize`:
 | Argon2 derived key | specter-core | `key [u8; 32]` | Yes (explicit) |
 | ECDH shared key | specter-cli | `shared_key [u8; 32]` | Yes (explicit) |
 | ECDH ephemeral secret | specter-cli | `my_sk` | Yes (explicit) |
+| `SbtClientState` | specter-sbt | `s`, `r`, `alpha`, `alpha_inv` | Yes (manual impl + Drop) |
+| `SbtSchemeInner` | specter-sbt | `client_secret`, `secret_key` | Yes (manual Drop) |
+| `OprfBlinding` | specter-sbt | `alpha`, `alpha_inv` | Yes (ZeroizeOnDrop) |
+| `OprfSecretShare` | specter-sbt | `scalar` (share value) | Yes (ZeroizeOnDrop) |
 
 ### Custom Debug Redaction
 
-Types with secret fields use custom `Debug` impls that print `[REDACTED]`:
+Types with secret fields use custom `Debug` impls that print `[REDACTED]` or `<redacted>`:
 
 - `ProofCarryingToken` — redacts `owner_secret`
 - `SignerKeypair` — redacts `secret`
 - `Share` — redacts `y`
 - `Credential` — redacts `blinding`
+- `OprfBlinding` — redacts `alpha`
+- `OprfSecretShare` — redacts `scalar`
+- `TransferStep` — redacts `sig_s`
 
 ### Non-Clone Security Types
 
@@ -85,11 +92,18 @@ These types deliberately do not implement `Clone` to prevent secret duplication:
 
 ### Fiat-Shamir Transcript Security
 
-The `Transcript` type (SHAKE-256 based) provides:
+**specter-fold Transcript** (SHAKE-256):
 - **Length-prefixed labels**: Both label and data are length-prefixed to prevent cross-field ambiguity
 - **Challenge chaining**: After squeezing a challenge, the 64-byte output is re-absorbed into the transcript
 - **Domain separation**: Every transcript starts with `b"specter-transcript:" || domain`
 - **Full-width challenges**: 64 bytes squeezed, reduced to scalar via `from_bytes_mod_order_wide`
+
+**specter-sbt Transcript** (SHAKE-256, independent):
+- **u64 length prefixes**: All appends use 8-byte big-endian length prefixes (not u32) to prevent truncation on 64-bit hosts with adversarial inputs
+- **Re-absorption with length**: Squeezed bytes are re-absorbed with `__cs_mix__` / `__cb_mix__` tags + length prefix to differentiate sequential challenges
+- **Domain separation**: Global tag `SPECTER-SBT-TRANSCRIPT-v1/` + per-proof labels (`sbt-ddh-eq`, `sbt-token-pok-v2`)
+- **Session + trustee binding**: DDH proofs bind `session_id` and `trustee_index` before public inputs
+- **Public key binding**: TokenProof binds aggregate OPRF public key `Y` before commitment `C`
 
 ### Wallet Encryption
 
@@ -108,18 +122,42 @@ The `Transcript` type (SHAKE-256 based) provides:
 - **Size limit**: 320 MB / 10M nullifiers maximum
 - **Graceful degradation**: I/O errors logged, nullifier kept in memory
 
-### Blind Signature Security
+### Blind Signature Security (Schnorr blind — specter-blind-sig)
 
 - **ROS attack**: `RateLimitedSigner` enforces max 1 concurrent session for standard blind Schnorr. Clause blind variant (Abe 2001) available for concurrent use
 - **Blinding factors**: Generated via `random_scalar()` (OsRng CSPRNG, uniform over group order)
 - **DKG**: Includes Schnorr proof-of-knowledge per participant to prevent rogue-key attacks
 - **Share verification**: Feldman VSS verification against polynomial commitments
 - **Message-length prefix**: Both `schnorr_blind` and `clause_blind` hash challenges include message length to prevent concatenation attacks
+- **Proactive resharing**: Herzberg et al. 1995 protocol for DKG key rotation without invalidating shares
+
+### Symmetric Blind Token Security (DH-OPRF — specter-sbt)
+
+- **OPRF blinding**: Client uses random `alpha` per interaction; mint sees only `B = H2C(C) * alpha` which is uniformly distributed. Alpha is re-drawn if zero (prevents `invert()` panic).
+- **DDH-equality NIZK**: Each trustee proves `log_G(Y_i) = log_B(B_i)` via Chaum-Pedersen. Session ID + trustee index bound into transcript prevents cross-session and cross-trustee replay.
+- **Identity rejection**: All verifiers reject identity-point inputs (G, H, A, B, T_G, T_H, commitment, tag) to prevent zero-witness forgeries.
+- **Index-0 rejection**: Shamir secret coordinate x=0 is never accepted as a trustee index.
+- **Quorum strictness**: `combine_evaluations` requires exactly `threshold` evaluations (no silent truncation).
+- **Aggregate key validation**: `SbtScheme::new` cross-checks two disjoint quorums (when available) or requires `expected_public_key` pin.
+- **Nullifier namespace separation**: `SbtNullifier` newtype prevents cross-feeding with `specter-core::nullifier::compute_nullifier` output.
+- **Deterministic commitment with client_secret**: `(s, r) = HKDF(client_secret, payload)` — hiding requires the secret; same payload always gives same nullifier.
+- **Error-step collapse**: `verify_token` runs all checks unconditionally and collapses into single error variant to prevent oracle attacks.
+- **Tag-origin enforcement**: `verify_token` returns `TagOriginCheckRequired` without a held secret key. Threshold verification via `verify_tag_threshold()` uses a fresh spend-time session.
+
+### TEE Attestation Security (specter-tee)
+
+- **Full chain verification**: ARK self-sig → ARK→ASK → ASK→VCEK → report body (ECDSA-P384) via pure-Rust `crypto_nossl` backend.
+- **TCB policy enforcement**: `TcbPolicy` with component-wise minimum firmware floor (bootloader, tee, snp, microcode), measurement allow-list (SHA-384 with constant-time comparison), max VMPL.
+- **Replay prevention**: `user_data_from_pubkey_and_nonce()` mixes a verifier-issued nonce into the 64-byte user_data field.
+- **Envelope DoS cap**: bincode deserialization capped at 1 MiB for report + cert table.
+- **Platform portability**: `PortableSnpVerifier` works on any OS (Windows, macOS, Linux). Only `request_report` requires `/dev/sev-guest` on Linux.
+- **Cert table integrity**: `OTHER(uuid)` variants use UUID-namespaced labels to prevent collisions.
 
 ### Consensus Security
 
 - **BFT threshold**: Standard 2f+1 quorum for n >= 4. Warning emitted for n < 4 (zero fault tolerance)
 - **Vote authentication**: Schnorr signatures on every vote, verified against registered public keys
+- **Hybrid PQ votes**: `HybridVote` bundles classical Schnorr + ML-DSA-65 (FIPS 204) signatures; both must verify (behind `pq-consensus` feature)
 - **View replay prevention**: Vote messages include view number in the signed payload
 - **Equivocation detection**: Tracks seen proposals per (height, leader) pair
 - **Nullifier DoS protection**: `pending_nullifiers` uses `HashSet` (O(1) lookup), capped at 100K
@@ -134,31 +172,32 @@ The `Transcript` type (SHAKE-256 based) provides:
 - **Dual revocation**: By commitment hash (specific credential) or by holder ID (all credentials for a user)
 - **Blinding zeroization**: `Credential.blinding` is zeroized on drop, redacted in Debug
 
-### Bond Security
-
-- **Evidence-based slashing**: `slash()` requires two distinct conflicting nullifiers as proof
-- **Lock period**: Withdrawal requires waiting period (default 7 days) during which bonds can still be slashed
-- **Exposure tracking**: Offline spending tracked with overflow-safe arithmetic
-- **Duplicate prevention**: `deposit()` returns error if owner already has active bond
-
 ### RSA VDF Security
 
 - **Zero iterations rejected**: Both SHA-256 and RSA VDF verifiers reject T=0
 - **Degenerate inputs rejected**: RSA VDF rejects input <= 1 (trivially known outputs)
-- **Iteration cap**: MAX_VDF_ITERATIONS = 10,000,000 for both variants
-- **RSA-2048 modulus**: Uses the RSA Factoring Challenge number (unknown factorization)
+- **Iteration cap**: `MAX_RSA_VDF_ITERATIONS = 10,000,000` enforced in BOTH `evaluate()` and `verify()` (DoS protection)
+- **RSA-2048 modulus**: Uses the RSA Factoring Challenge number (unknown factorization). Parse uses `unreachable!()` on hardcoded value (not `expect`).
 - **Miller-Rabin**: 20 rounds with deterministic witnesses (correctly rejects Carmichael numbers)
 - **Wesolowski proof**: O(log T) verification instead of O(T) recomputation
 
+### Bond Security
+
+- **Evidence-based slashing**: `slash()` requires two distinct conflicting nullifiers as proof
+- **Lock period**: Withdrawal requires waiting period (default 7 days) during which bonds can still be slashed
+- **Overflow-safe arithmetic**: Withdrawal timestamp uses `checked_add` to prevent u64 overflow
+- **Exposure tracking**: Offline spending tracked with overflow-safe arithmetic
+- **Duplicate prevention**: `deposit()` returns error if owner already has active bond
+
 ## Known Limitations
 
-### Fold Proof at step > 0
+### Fold Proof — Signed Transfer Chain (RESOLVED)
 
-The Schnorr-based fold proof system provides full verification at genesis (step 0) but has a known theoretical limitation at step > 0: an attacker who generates their own keypair can construct a valid-looking proof without performing actual transfers. This is inherent to constant-size Schnorr proofs without recursive SNARKs.
+The original Schnorr-based fold proof had a known theoretical limitation at step > 0 where an attacker could construct a valid-looking proof. **This was RESOLVED** by replacing the Schnorr accumulator with a signed transfer chain (`specter-fold::accumulator`). Each transfer step is now a Schnorr signature by the previous owner's derived signing key over `(token_id, step, new_owner_pk)`, anchored at step 0 by the mint-signed `H(genesis_owner_pk)`. Verification uses constant-time `ct_eq` for Schnorr check. Forgery requires breaking ECDLP to recover the previous owner's key.
 
-**Mitigation**: The fold proof is NOT the security boundary. Token authenticity relies on the mint's threshold blind signature (unforgeable without t-of-n signers) and the nullifier set (prevents double-spend). The fold proof provides structural integrity and transfer counting.
+**Trade-off**: Proof size grows linearly (~96 bytes per step) instead of constant, bounded by `recursion_bound` (typically 20-50).
 
-**Resolution path**: Nova IVC (feature-gated behind `nova`) provides true recursive SNARK verification where each step constrains the actual transfer data. The Nova circuit currently only constrains step counting and needs to be extended to constrain `new_owner_data`.
+**Optional enhancement**: Nova IVC (feature-gated behind `nova`) provides true recursive SNARK verification for constant-size proofs.
 
 ### Nova IVC Status
 
