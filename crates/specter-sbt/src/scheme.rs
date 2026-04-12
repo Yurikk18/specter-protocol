@@ -1016,7 +1016,7 @@ mod tests {
                     &shares[i],
                     &scheme.commits()[i],
                     &req.blinded,
-                    &scheme.session_id(),
+                    scheme.session_id(),
                 )
                 .unwrap()
             })
@@ -1045,7 +1045,7 @@ mod tests {
                     &shares[i],
                     &scheme.commits()[i],
                     &req.blinded,
-                    &scheme.session_id(),
+                    scheme.session_id(),
                 )
                 .unwrap()
             })
@@ -1074,7 +1074,7 @@ mod tests {
                         &shares[i],
                         &scheme.commits()[i],
                         &req.blinded,
-                        &scheme.session_id(),
+                        scheme.session_id(),
                     )
                     .unwrap()
                 })
@@ -1106,7 +1106,7 @@ mod tests {
                         &shares[i],
                         &scheme.commits()[i],
                         &req.blinded,
-                        &scheme.session_id(),
+                        scheme.session_id(),
                     )
                     .unwrap()
                 })
@@ -1177,7 +1177,7 @@ mod tests {
                     &shares[i],
                     &scheme.commits()[i],
                     &req.blinded,
-                    &scheme.session_id(),
+                    scheme.session_id(),
                 )
                 .unwrap()
             })
@@ -1203,7 +1203,7 @@ mod tests {
                     &shares[i],
                     &scheme.commits()[i],
                     &req.blinded,
-                    &scheme.session_id(),
+                    scheme.session_id(),
                 )
                 .unwrap()
             })
@@ -1247,7 +1247,7 @@ mod tests {
                     &shares[i],
                     &scheme.commits()[i],
                     &req.blinded,
-                    &scheme.session_id(),
+                    scheme.session_id(),
                 )
                 .unwrap()
             })

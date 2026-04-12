@@ -45,6 +45,7 @@ pub struct DdhEqualityProof {
 impl DdhEqualityProof {
     /// Prove the statement. Witness is `x`, which must satisfy
     /// `A = G·x` and `B = H·x`.
+    #[allow(clippy::too_many_arguments)]
     pub fn prove<R: CryptoRng + RngCore>(
         rng: &mut R,
         x: &Scalar,

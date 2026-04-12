@@ -422,7 +422,7 @@ mod tests {
         cleanup(&path);
 
         // Write 33 bytes (not a multiple of 32).
-        std::fs::write(&path, &[0u8; 33]).unwrap();
+        std::fs::write(&path, [0u8; 33]).unwrap();
 
         let result = NullifierSet::with_file(&path);
         assert!(result.is_err());
@@ -438,7 +438,7 @@ mod tests {
         cleanup(&path);
 
         // Create an empty file first.
-        std::fs::write(&path, &[]).unwrap();
+        std::fs::write(&path, []).unwrap();
 
         let set = NullifierSet::with_file(&path).unwrap();
         assert!(set.is_empty());

@@ -895,48 +895,6 @@ fn parse_peer_pk(s: &str) -> Option<curve25519_dalek::RistrettoPoint> {
     curve25519_dalek::ristretto::CompressedRistretto(arr).decompress()
 }
 
-#[cfg(test)]
-mod identity_tests {
-    use super::*;
-
-    #[test]
-    fn test_identity_encode_decode_roundtrip() {
-        let id = NodeIdentity::generate();
-        let pub_bytes = id.public.compress();
-        let encoded = id.encode(b"strong-pass-min12");
-        let decoded = NodeIdentity::decode(&encoded, b"strong-pass-min12")
-            .expect("decode must succeed with the correct passphrase");
-        assert_eq!(decoded.public.compress(), pub_bytes);
-        // Secret scalars compare in constant time via curve25519-dalek impl.
-        assert_eq!(decoded.secret, id.secret);
-    }
-
-    #[test]
-    fn test_identity_decode_wrong_passphrase_fails() {
-        let id = NodeIdentity::generate();
-        let encoded = id.encode(b"correct-pass12");
-        assert!(NodeIdentity::decode(&encoded, b"wrong-pass123").is_none());
-    }
-
-    #[test]
-    fn test_identity_decode_tampered_magic_fails() {
-        let id = NodeIdentity::generate();
-        let mut encoded = id.encode(b"strong-pass-min12");
-        encoded[0] = b'X';
-        assert!(NodeIdentity::decode(&encoded, b"strong-pass-min12").is_none());
-    }
-
-    #[test]
-    fn test_parse_peer_pk() {
-        let id = NodeIdentity::generate();
-        let hex_str = id.public_hex();
-        let parsed = parse_peer_pk(&hex_str).unwrap();
-        assert_eq!(parsed, id.public);
-        assert!(parse_peer_pk("notahex").is_none());
-        assert!(parse_peer_pk("deadbeef").is_none()); // wrong length
-    }
-}
-
 /// Encrypt bytes with a shared key using ChaCha20-Poly1305.
 fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
     use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};
@@ -1324,4 +1282,46 @@ fn run_benchmark() {
     println!("\nToken size (no cred):          {} bytes", serde_token::serialized_size(&tokens[0]));
     println!("Token size (with cred):        {} bytes (constant after transfers)", serde_token::serialized_size(&tokens[0]));
     println!("=== Benchmark Complete ===");
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn test_identity_encode_decode_roundtrip() {
+        let id = NodeIdentity::generate();
+        let pub_bytes = id.public.compress();
+        let encoded = id.encode(b"strong-pass-min12");
+        let decoded = NodeIdentity::decode(&encoded, b"strong-pass-min12")
+            .expect("decode must succeed with the correct passphrase");
+        assert_eq!(decoded.public.compress(), pub_bytes);
+        // Secret scalars compare in constant time via curve25519-dalek impl.
+        assert_eq!(decoded.secret, id.secret);
+    }
+
+    #[test]
+    fn test_identity_decode_wrong_passphrase_fails() {
+        let id = NodeIdentity::generate();
+        let encoded = id.encode(b"correct-pass12");
+        assert!(NodeIdentity::decode(&encoded, b"wrong-pass123").is_none());
+    }
+
+    #[test]
+    fn test_identity_decode_tampered_magic_fails() {
+        let id = NodeIdentity::generate();
+        let mut encoded = id.encode(b"strong-pass-min12");
+        encoded[0] = b'X';
+        assert!(NodeIdentity::decode(&encoded, b"strong-pass-min12").is_none());
+    }
+
+    #[test]
+    fn test_parse_peer_pk() {
+        let id = NodeIdentity::generate();
+        let hex_str = id.public_hex();
+        let parsed = parse_peer_pk(&hex_str).unwrap();
+        assert_eq!(parsed, id.public);
+        assert!(parse_peer_pk("notahex").is_none());
+        assert!(parse_peer_pk("deadbeef").is_none()); // wrong length
+    }
 }

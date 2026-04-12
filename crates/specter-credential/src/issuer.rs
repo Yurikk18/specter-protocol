@@ -171,7 +171,7 @@ mod tests {
         let mut cred = issuer.issue(&test_attributes());
 
         // Tamper with commitment
-        cred.commitment = cred.commitment + G;
+        cred.commitment += G;
         assert!(!verify_credential_signature(&cred));
     }
 

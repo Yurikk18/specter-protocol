@@ -157,9 +157,9 @@ pub fn hash_to_curve(domain: &[u8], message: &[u8]) -> RistrettoPoint {
     use sha2::Digest;
     let mut h = Sha512::new();
     h.update(b"specter-sbt-h2c/");
-    h.update(&(domain.len() as u64).to_be_bytes());
+    h.update((domain.len() as u64).to_be_bytes());
     h.update(domain);
-    h.update(&(message.len() as u64).to_be_bytes());
+    h.update((message.len() as u64).to_be_bytes());
     h.update(message);
     // Two-call construction via curve25519-dalek hash_from_bytes.
     RistrettoPoint::hash_from_bytes::<Sha512>(&h.finalize())

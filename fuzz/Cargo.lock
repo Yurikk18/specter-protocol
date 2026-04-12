@@ -43,6 +43,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "blake2"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +187,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "curve25519-dalek-derive",
+ "digest",
  "fiat-crypto",
  "rand_core",
  "rustc_version",
@@ -561,6 +571,7 @@ dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
  "hex",
+ "libc",
  "rand",
  "rand_core",
  "serde",
@@ -604,19 +615,25 @@ dependencies = [
  "sha2",
  "sha3",
  "specter-primitives",
+ "subtle",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
 name = "specter-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bincode",
+ "borsh",
  "curve25519-dalek",
  "libfuzzer-sys",
+ "serde",
  "specter-core",
  "specter-credential",
  "specter-net",
  "specter-primitives",
+ "specter-sbt",
 ]
 
 [[package]]
@@ -659,6 +676,22 @@ dependencies = [
  "rand_core",
  "sha2",
  "sha3",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "specter-sbt"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
+ "rand",
+ "rand_core",
+ "serde",
+ "sha2",
+ "sha3",
+ "specter-primitives",
+ "subtle",
  "thiserror",
  "zeroize",
 ]

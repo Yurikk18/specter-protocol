@@ -387,7 +387,7 @@ mod tests {
     use super::*;
 
     fn setup_validators() -> (Vec<ValidatorKey>, Vec<NodeId>, HashMap<NodeId, RistrettoPoint>) {
-        let keys: Vec<ValidatorKey> = (1..=4).map(|id| ValidatorKey::generate(id)).collect();
+        let keys: Vec<ValidatorKey> = (1..=4).map(ValidatorKey::generate).collect();
         let ids: Vec<NodeId> = keys.iter().map(|k| k.node_id).collect();
         let pubkeys: HashMap<NodeId, RistrettoPoint> = keys.iter()
             .map(|k| (k.node_id, k.public_key))
